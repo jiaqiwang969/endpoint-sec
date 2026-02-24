@@ -1,0 +1,8 @@
+[package]
+name = "codex-es-guard"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+endpoint-sec = { path = "../endpoint-sec/endpoint-sec" }
+tokio = { version = "1.0", features = ["full"] }
