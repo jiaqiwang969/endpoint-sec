@@ -7,7 +7,7 @@ repository = "https://github.com/HarfangLab/endpoint-sec"
 rust-version = "1.76"
 
 [workspace]
-members = ["endpoint-sec/", "endpoint-sec-sys/"]
+members = ["endpoint-sec/", "endpoint-sec-sys/", "codex-es-guard/"]
 resolver = "2"
 
 [workspace.dependencies]
