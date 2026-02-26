@@ -1,6 +1,7 @@
 use endpoint_sec::{Client, Message, Event, EventRenameDestinationFile};
 use endpoint_sec::sys::{es_event_type_t, es_auth_result_t};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -14,6 +15,47 @@ use std::panic::AssertUnwindSafe;
 struct SecurityPolicy {
     protected_zones: Vec<String>,
     temporary_overrides: Vec<String>,
+
+    #[serde(default = "default_trusted_tools")]
+    trusted_tools: Vec<String>,
+
+    #[serde(default = "default_ai_agent_patterns")]
+    ai_agent_patterns: Vec<String>,
+}
+
+fn default_trusted_tools() -> Vec<String> {
+    [
+        // VCS
+        "git", "jj",
+        // Rust
+        "cargo", "rustup", "rustc",
+        // Node.js
+        "npm", "yarn", "pnpm", "bun", "node",
+        // Python
+        "pip", "pip3", "poetry", "uv", "python", "python3",
+        // Swift / Xcode
+        "swift", "swiftc", "xcodebuild", "xcrun",
+        // Nix
+        "nix", "nix-build", "nix-store", "nix-env", "nix-daemon",
+        // System / macOS
+        "brew", "launchd", "launchctl",
+        // Build systems
+        "make", "cmake", "ninja",
+        // Go
+        "go",
+        // Docker
+        "docker",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn default_ai_agent_patterns() -> Vec<String> {
+    ["codex", "claude", "claude-code"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -23,6 +65,8 @@ struct DenialRecord {
     path: String,
     dest: Option<String>,
     zone: String,
+    process: String,
+    ancestor: String,
 }
 
 impl SecurityPolicy {
@@ -32,7 +76,7 @@ impl SecurityPolicy {
             return false;
         }
 
-        let is_overridden = self.temporary_overrides.iter().any(|override_path| target_path.starts_with(override_path));
+        let is_overridden = self.temporary_overrides.iter().any(|ov| target_path.starts_with(ov));
         if is_overridden {
             return false;
         }
@@ -47,6 +91,17 @@ impl SecurityPolicy {
             .cloned()
             .unwrap_or_default()
     }
+
+    fn is_trusted_tool(&self, exe_name: &str) -> bool {
+        self.trusted_tools.iter().any(|tool| exe_name == tool.as_str())
+    }
+
+    fn matches_ai_agent(&self, exe_path: &str) -> bool {
+        let exe_name = exe_path.rsplit('/').next().unwrap_or(exe_path);
+        self.ai_agent_patterns.iter().any(|pattern| {
+            exe_name.contains(pattern.as_str())
+        })
+    }
 }
 
 fn load_policy(policy_path: &str) -> Option<SecurityPolicy> {
@@ -57,33 +112,12 @@ fn load_policy(policy_path: &str) -> Option<SecurityPolicy> {
     }
 }
 
-fn is_exempted_temp(path: &str) -> bool {
-    // System temp directories
+// Minimal system-level exemptions (no longer need tool-specific paths)
+fn is_system_temp(path: &str) -> bool {
     path.contains("/.Trash/") ||
-    path.contains("/tmp/") ||
     path.contains("/private/tmp/") ||
-    path.contains("/var/folders/") ||
     path.contains("/private/var/folders/") ||
-    // Build artifacts & dependencies
-    path.contains("/.cache/") ||
-    path.contains("/target/") ||
-    path.contains("/node_modules/") ||
-    path.contains("/result/") ||
-    path.contains("/dist/") ||
-    path.contains("/build/") ||
-    path.contains("/.build/") ||
-    // Language-specific
-    path.contains("/__pycache__/") ||
-    path.contains("/.venv/") ||
-    path.contains("/.egg-info/") ||
-    // VCS & editor
-    path.contains("/.git/") ||
-    path.ends_with(".swp") ||
-    path.ends_with("~") ||
-    path.ends_with(".tmp") ||
-    path.ends_with(".DS_Store") ||
-    // Application logs
-    path.contains("/logs/")
+    path.ends_with(".DS_Store")
 }
 
 fn now_ts() -> u64 {
@@ -101,7 +135,6 @@ fn log_denial(home: &str, record: &DenialRecord) {
         let _ = fs::create_dir_all(&dir);
     }
 
-    // Truncate if > 1MB to prevent unbounded growth
     if let Ok(meta) = fs::metadata(&log_path) {
         if meta.len() > 1_000_000 {
             let _ = fs::write(&log_path, "");
@@ -115,6 +148,131 @@ fn log_denial(home: &str, record: &DenialRecord) {
     }
 }
 
+// --- Process tree walking (macOS) ---
+
+fn get_process_path(pid: i32) -> Option<String> {
+    let mut buf = vec![0u8; 4096];
+    let ret = unsafe {
+        libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32)
+    };
+    if ret > 0 {
+        buf.truncate(ret as usize);
+        String::from_utf8(buf).ok()
+    } else {
+        None
+    }
+}
+
+fn get_parent_pid(pid: i32) -> Option<i32> {
+    // Use proc_pidinfo with PROC_PIDTBSDINFO to get parent PID.
+    // proc_bsdinfo layout: pbi_flags(4) + pbi_status(4) + pbi_xstatus(4) + pbi_pid(4) + pbi_ppid(4)
+    const PROC_PIDTBSDINFO: i32 = 3;
+    let mut buf = [0u8; 128];
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDTBSDINFO,
+            0,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len() as i32,
+        )
+    };
+    if ret > 20 {
+        // pbi_ppid is at byte offset 16
+        let ppid = u32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]) as i32;
+        if ppid > 0 && ppid != pid {
+            Some(ppid)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn exe_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Walk the process tree to find if any ancestor is an AI agent.
+/// Returns (is_ai_context, ai_ancestor_name).
+fn find_ai_ancestor(pid: i32, policy: &SecurityPolicy, cache: &mut HashMap<i32, Option<String>>) -> Option<String> {
+    let mut current = pid;
+    let mut depth = 0;
+
+    while current > 1 && depth < 30 {
+        if let Some(cached) = cache.get(&current) {
+            return cached.clone();
+        }
+
+        if let Some(exe_path) = get_process_path(current) {
+            if policy.matches_ai_agent(&exe_path) {
+                let name = exe_name(&exe_path).to_string();
+                cache.insert(current, Some(name.clone()));
+                return Some(name);
+            }
+        }
+
+        match get_parent_pid(current) {
+            Some(ppid) => current = ppid,
+            None => break,
+        }
+        depth += 1;
+    }
+
+    // Cache negative result for the original PID only
+    cache.insert(pid, None);
+    None
+}
+
+/// Check if the immediate process is a trusted tool.
+fn is_trusted_process(pid: i32, policy: &SecurityPolicy) -> bool {
+    if let Some(exe_path) = get_process_path(pid) {
+        let name = exe_name(&exe_path);
+        policy.is_trusted_tool(name)
+    } else {
+        false
+    }
+}
+
+/// Core decision: should this operation be denied?
+/// Returns Some((process_name, ancestor_name)) if denied, None if allowed.
+fn should_deny(
+    path: &str,
+    pid: i32,
+    policy: &SecurityPolicy,
+    cache: &mut HashMap<i32, Option<String>>,
+) -> Option<(String, String)> {
+    // 1. Not in protected zone → ALLOW
+    if !policy.is_protected(path) {
+        return None;
+    }
+
+    // 2. System temp paths → ALLOW
+    if is_system_temp(path) {
+        return None;
+    }
+
+    // 3. Immediate process is a trusted tool → ALLOW
+    //    (git managing .git/, cargo managing target/, etc.)
+    if is_trusted_process(pid, policy) {
+        return None;
+    }
+
+    // 4. Not in AI agent process tree → ALLOW (user operation)
+    let ai_ancestor = match find_ai_ancestor(pid, policy, cache) {
+        Some(name) => name,
+        None => return None,
+    };
+
+    // 5. In AI agent context, protected path, not trusted tool → DENY
+    let process_name = get_process_path(pid)
+        .map(|p| exe_name(&p).to_string())
+        .unwrap_or_else(|| format!("pid:{}", pid));
+
+    Some((process_name, ai_ancestor))
+}
+
 fn main() {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let policy_path = format!("{}/.codex/es_policy.json", home);
@@ -122,8 +280,13 @@ fn main() {
     let initial_policy = load_policy(&policy_path).unwrap_or_default();
     let global_policy = Arc::new(Mutex::new(initial_policy));
 
+    // Process ancestry cache (cleared on policy reload)
+    let ancestor_cache: Arc<Mutex<HashMap<i32, Option<String>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     // Policy hot-reload thread (1s polling)
     let policy_clone = global_policy.clone();
+    let cache_clone = ancestor_cache.clone();
     let path_clone = policy_path.clone();
     thread::spawn(move || {
         let mut last_mtime = SystemTime::UNIX_EPOCH;
@@ -134,7 +297,11 @@ fn main() {
                         if let Some(new_policy) = load_policy(&path_clone) {
                             if let Ok(mut lock) = policy_clone.lock() {
                                 *lock = new_policy;
-                                println!("[策略热重载] 检测到 es_policy.json 更新，规则已刷新！");
+                                // Clear cache on policy change
+                                if let Ok(mut c) = cache_clone.lock() {
+                                    c.clear();
+                                }
+                                println!("[policy] reloaded");
                                 last_mtime = mtime;
                             }
                         }
@@ -146,24 +313,29 @@ fn main() {
     });
 
     let safe_policy = AssertUnwindSafe(global_policy);
+    let safe_cache = AssertUnwindSafe(ancestor_cache);
     let home_for_handler = home.clone();
 
     let handler = move |client: &mut Client<'_>, message: Message| {
         let current_policy = safe_policy.0.lock().unwrap().clone();
+        let pid = message.process().audit_token().pid();
 
         match message.event() {
             Some(Event::AuthUnlink(unlink)) => {
                 let path = unlink.target().path().to_string_lossy();
 
-                if current_policy.is_protected(&path) && !is_exempted_temp(&path) {
+                let mut cache = safe_cache.0.lock().unwrap();
+                if let Some((proc_name, ancestor)) = should_deny(&path, pid, &current_policy, &mut cache) {
                     let zone = current_policy.matched_zone(&path);
-                    println!("[DENY] unlink: {}", path);
+                    println!("[DENY] unlink by {} (via {}): {}", proc_name, ancestor, path);
                     log_denial(&home_for_handler, &DenialRecord {
                         ts: now_ts(),
                         op: "unlink".into(),
                         path: path.to_string(),
                         dest: None,
                         zone,
+                        process: proc_name,
+                        ancestor,
                     });
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
                 } else {
@@ -180,25 +352,40 @@ fn main() {
                     None => String::new(),
                 };
 
-                if !current_policy.is_protected(&source_path) || is_exempted_temp(&source_path) {
-                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
-                }
-                else if source_path.contains(".swp") || source_path.ends_with("~") || source_path.contains(".tmp") {
-                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
-                }
-                else if !current_policy.protected_zones.iter().any(|zone| dest_path_str.starts_with(zone)) {
+                // For rename: deny if moving OUT of protected zone in AI context
+                let mut cache = safe_cache.0.lock().unwrap();
+                let deny_reason = if !current_policy.is_protected(&source_path) || is_system_temp(&source_path) {
+                    None
+                } else if is_trusted_process(pid, &current_policy) {
+                    None
+                } else if let Some(ai_ancestor) = find_ai_ancestor(pid, &current_policy, &mut cache) {
+                    // In AI context: block if destination is outside all protected zones
+                    if !current_policy.protected_zones.iter().any(|zone| dest_path_str.starts_with(zone)) {
+                        let proc_name = get_process_path(pid)
+                            .map(|p| exe_name(&p).to_string())
+                            .unwrap_or_else(|| format!("pid:{}", pid));
+                        Some((proc_name, ai_ancestor))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some((proc_name, ancestor)) = deny_reason {
                     let zone = current_policy.matched_zone(&source_path);
-                    println!("[DENY] rename: {} -> {}", source_path, dest_path_str);
+                    println!("[DENY] rename by {} (via {}): {} -> {}", proc_name, ancestor, source_path, dest_path_str);
                     log_denial(&home_for_handler, &DenialRecord {
                         ts: now_ts(),
                         op: "rename".into(),
                         path: source_path.to_string(),
-                        dest: Some(dest_path_str.clone()),
+                        dest: Some(dest_path_str),
                         zone,
+                        process: proc_name,
+                        ancestor,
                     });
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
-                }
-                else {
+                } else {
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
                 }
             }
@@ -216,7 +403,7 @@ fn main() {
         es_event_type_t::ES_EVENT_TYPE_AUTH_RENAME
     ]).expect("Failed to subscribe");
 
-    println!("Codex-ES-Guard started [default-allow mode]");
+    println!("Codex-ES-Guard started [process-aware mode]");
     println!("Policy: ~/.codex/es_policy.json");
     println!("Denial log: ~/.codex/es-guard/denials.jsonl");
 
