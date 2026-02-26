@@ -58,16 +58,32 @@ fn load_policy(policy_path: &str) -> Option<SecurityPolicy> {
 }
 
 fn is_exempted_temp(path: &str) -> bool {
+    // System temp directories
     path.contains("/.Trash/") ||
     path.contains("/tmp/") ||
     path.contains("/private/tmp/") ||
     path.contains("/var/folders/") ||
     path.contains("/private/var/folders/") ||
+    // Build artifacts & dependencies
     path.contains("/.cache/") ||
     path.contains("/target/") ||
     path.contains("/node_modules/") ||
     path.contains("/result/") ||
-    path.contains("/.git/")
+    path.contains("/dist/") ||
+    path.contains("/build/") ||
+    path.contains("/.build/") ||
+    // Language-specific
+    path.contains("/__pycache__/") ||
+    path.contains("/.venv/") ||
+    path.contains("/.egg-info/") ||
+    // VCS & editor
+    path.contains("/.git/") ||
+    path.ends_with(".swp") ||
+    path.ends_with("~") ||
+    path.ends_with(".tmp") ||
+    path.ends_with(".DS_Store") ||
+    // Application logs
+    path.contains("/logs/")
 }
 
 fn now_ts() -> u64 {
