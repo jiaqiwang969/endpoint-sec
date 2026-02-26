@@ -60,7 +60,9 @@
       darwinModules.default = { config, lib, pkgs, ... }:
         let
           cfg = config.services.codex-es-guard;
+          daemonLabel = "dev.codex-es-guard";
           signedBin = "/usr/local/bin/codex-es-guard";
+          homeDir = if pkgs.stdenv.isDarwin then "/Users/${cfg.user}" else "/home/${cfg.user}";
         in {
           options.services.codex-es-guard = {
             enable = lib.mkEnableOption "codex-es-guard file protection daemon";
@@ -73,14 +75,13 @@
 
             user = lib.mkOption {
               type = lib.types.str;
-              default = "jqwang";
               description = "The user whose home directory contains the policy file.";
             };
 
             protectedZones = lib.mkOption {
               type = lib.types.listOf lib.types.str;
               default = [];
-              example = [ "/Users/jqwang/00-nixos-config" "/Users/jqwang/01-agent" ];
+              example = [ "/Users/me/projects" "/Users/me/important" ];
               description = "Directory prefixes to protect from deletion/move.";
             };
           };
@@ -88,23 +89,22 @@
           config = lib.mkIf cfg.enable {
             launchd.daemons.codex-es-guard = {
               serviceConfig = {
-                Label = "com.jqwang.codex-es-guard";
+                Label = daemonLabel;
                 ProgramArguments = [ signedBin ];
                 RunAtLoad = true;
                 KeepAlive = true;
                 StandardOutPath = "/tmp/codex-es-guard.log";
                 StandardErrorPath = "/tmp/codex-es-guard.err";
                 EnvironmentVariables = {
-                  HOME = "/Users/${cfg.user}";
+                  HOME = homeDir;
                 };
               };
             };
 
             system.activationScripts.postActivation.text = let
-              policyJson = builtins.toJSON {
-                protected_zones = cfg.protectedZones;
-                temporary_overrides = [];
-              };
+              # Nix is the source of truth for protected_zones.
+              # temporary_overrides is runtime-only (managed by AI agent / user).
+              protectedZonesJson = builtins.toJSON cfg.protectedZones;
             in ''
               # === codex-es-guard activation ===
               ES_BIN="${cfg.package}/bin/codex-es-guard"
@@ -120,23 +120,32 @@
                 echo "codex-es-guard: signed at $SIGNED"
 
                 # Restart daemon so it picks up the freshly signed binary
-                /bin/launchctl kickstart -k system/com.jqwang.codex-es-guard 2>/dev/null || true
+                /bin/launchctl kickstart -k system/${daemonLabel} 2>/dev/null || true
                 echo "codex-es-guard: daemon restarted"
               fi
 
-              # Create default policy if not exists
-              POLICY_DIR="/Users/${cfg.user}/.codex"
+              # Sync protected_zones from Nix config (always update).
+              # Preserve existing temporary_overrides from runtime.
+              POLICY_DIR="${homeDir}/.codex"
               POLICY_FILE="$POLICY_DIR/es_policy.json"
-              if [ ! -f "$POLICY_FILE" ]; then
-                mkdir -p "$POLICY_DIR"
-                echo '${policyJson}' > "$POLICY_FILE"
-                chown ${cfg.user}:staff "$POLICY_FILE"
-                echo "codex-es-guard: created default policy at $POLICY_FILE"
+              mkdir -p "$POLICY_DIR"
+
+              EXISTING_OVERRIDES="[]"
+              if [ -f "$POLICY_FILE" ]; then
+                EXISTING_OVERRIDES=$(${pkgs.jq}/bin/jq -c '.temporary_overrides // []' "$POLICY_FILE" 2>/dev/null || echo "[]")
               fi
 
+              ${pkgs.jq}/bin/jq -n \
+                --argjson zones '${protectedZonesJson}' \
+                --argjson overrides "$EXISTING_OVERRIDES" \
+                '{protected_zones: $zones, temporary_overrides: $overrides}' \
+                > "$POLICY_FILE"
+              chown ${cfg.user}:staff "$POLICY_FILE"
+              echo "codex-es-guard: policy synced ($(echo '${protectedZonesJson}' | ${pkgs.jq}/bin/jq length) zones)"
+
               # Ensure log directory
-              mkdir -p "/Users/${cfg.user}/.codex/es-guard"
-              chown ${cfg.user}:staff "/Users/${cfg.user}/.codex/es-guard"
+              mkdir -p "${homeDir}/.codex/es-guard"
+              chown ${cfg.user}:staff "${homeDir}/.codex/es-guard"
             '';
           };
         };
