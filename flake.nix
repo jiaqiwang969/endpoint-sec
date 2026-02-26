@@ -118,6 +118,10 @@
                 chmod 755 "$SIGNED"
                 /usr/bin/codesign --entitlements "$ES_PLIST" --force -s - "$SIGNED" 2>/dev/null || true
                 echo "codex-es-guard: signed at $SIGNED"
+
+                # Restart daemon so it picks up the freshly signed binary
+                /bin/launchctl kickstart -k system/com.jqwang.codex-es-guard 2>/dev/null || true
+                echo "codex-es-guard: daemon restarted"
               fi
 
               # Create default policy if not exists
