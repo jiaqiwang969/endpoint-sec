@@ -21,10 +21,9 @@
         cargoBuildFlags = [ "-p" "codex-es-guard" ];
         doCheck = false;
 
-        buildInputs = with pkgs.darwin.apple_sdk.frameworks; [
-          Security
-          SystemConfiguration
-        ] ++ [ pkgs.libiconv ];
+        buildInputs = [ pkgs.libiconv ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+          pkgs.apple-sdk_15
+        ];
 
         nativeBuildInputs = [ pkgs.pkg-config ];
 
