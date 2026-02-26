@@ -8,27 +8,27 @@ AI 编程 Agent（如 Codex、Claude Code）在 full-access 模式下拥有完�
 
 本项目的目标是：**在不牺牲 Agent 自主性的前提下，提供内核级的文件安全防护网**。
 
-核心理念：不是禁止所有删除，而是**只拦截 AI Agent 进程发起的危险操作** —— 人类用户的操作不受影响。
+核心理念：不是禁止所有删除，而是**只拦截 AI Agent 进程发起的危险操作** —— 人类用户的操作不受影响。当 Agent 确实需要删除时，可以申请临时放行。
 
 ## 架构
 
 ```
   用户 rm file.txt ─────────────────────────→ ALLOW (非 AI 进程)
 
-  Claude Code → zsh → rm file.txt
+  AI Agent → zsh → rm file.txt
        │
        ▼
   codex-es-guard (进程树检测)
-       │  发现祖先进程 argv[0] = "claude"
+       │  发现祖先进程 argv[0] = "claude" / exe = "codex"
        │  → AI Agent 上下文 → 检查保护策略
        ▼
-  DENY + 审计日志
+  DENY + 写入 last_denial.txt
        │
        ▼
-  Agent 收到 EPERM → 理解原因 → 可申请 temporary_override
+  Agent 读取反馈 → 运行 es-guard-override → 策略热重载 → 重试成功
 ```
 
-## 进程感知防护机制
+## 进程感知防护
 
 传统的路径豁免方案（如豁免 `.git/`、`node_modules/` 等）存在安全漏洞 —— AI Agent 也可以利用这些豁免路径。
 
@@ -49,7 +49,7 @@ codex-es-guard 采用**进程感知**方案，通过遍历进程树来判断**�
     │   │
     │   ├─ 无 AI 祖先 ──→ ALLOW (人类操作)
     │   │
-    │   └─ 有 AI 祖先 ──→ DENY + 审计日志
+    │   └─ 有 AI 祖先 ──→ DENY + 反馈文件 + 审计日志
     │
     └─ 默认 ──→ ALLOW
 ```
@@ -62,7 +62,7 @@ codex-es-guard 采用**进程感知**方案，通过遍历进程树来判断**�
 |-----|------|------|
 | `proc_pidpath()` | 获取 Mach-O 二进制路径 | `/usr/local/bin/codex` |
 | `sysctl(KERN_PROCARGS2)` | 读取 argv[0]（反映 `process.title`） | `claude`（Node.js 进程） |
-| `proc_pidinfo(PROC_PIDTBSDINFO)` | 获取父进程 PID | 用于向上遍历进程树 |
+| `proc_pidinfo(PROC_PIDTBSDINFO)` | 获取父进程 PID（256 字节缓冲区） | 用于向上遍历进程树 |
 
 Claude Code 的实际二进制是 `node`，但通过 `process.title` 将 `argv[0]` 设置为 `claude`。
 因此必须同时检查 exe path 和 argv[0] 才能正确识别。
@@ -77,6 +77,57 @@ Claude Code 的实际二进制是 `node`，但通过 `process.title` 将 `argv[0
 | git 操作 `.git/objects/` | `git` (trusted tool) | ALLOW |
 | CLIProxyAPI 日志轮转 | `cli-proxy-api` (非 AI 进程) | ALLOW |
 
+## 闭环反馈：拦截 → 反馈 → 放行 → 重试
+
+当 AI Agent 被拦截后，可以通过闭环流程完成合法操作：
+
+```
+Agent 执行 rm important.rs
+    │
+    ▼
+codex-es-guard DENY → 返回 EPERM
+    │  同时写入 ~/.codex/es-guard/last_denial.txt
+    ▼
+Agent 读取 last_denial.txt，了解拦截原因
+    │
+    ▼
+Agent 运行 es-guard-override <path>
+    │  → 将路径加入 temporary_overrides
+    │  → 等待 2 秒策略热重载
+    ▼
+Agent 重试操作 → 成功
+```
+
+### 反馈文件
+
+每次拦截后，守护进程写入 `~/.codex/es-guard/last_denial.txt`：
+
+```
+[ES-GUARD DENIED]
+Operation: unlink
+Path: /Users/you/project/important.rs
+Zone: /Users/you/project
+Process: rm (via claude)
+
+To override, run: es-guard-override /Users/you/project/important.rs
+Or manually: jq --arg p '/Users/you/project/important.rs' '.temporary_overrides += [$p]' ~/.codex/es_policy.json > /tmp/p.json && mv /tmp/p.json ~/.codex/es_policy.json && sleep 2
+Then retry the operation.
+```
+
+### es-guard-override 命令
+
+```bash
+# 申请临时放行（自动等待策略热重载）
+es-guard-override /path/to/file
+
+# 放行后重试
+rm /path/to/file  # 成功
+```
+
+### Agent 集成
+
+在 `~/.claude/CLAUDE.md`（Claude Code）或 `~/.codex/instructions.md`（Codex）中添加指引，Agent 遇到 EPERM 时会自动执行闭环流程。
+
 ## 仓库结构
 
 | 目录 | 说明 |
@@ -85,9 +136,7 @@ Claude Code 的实际二进制是 `node`，但通过 `process.title` 将 `argv[0
 | `endpoint-sec-sys/` | ES 框架的底层 C→Rust FFI 绑定 |
 | `codex-es-guard/` | 文件安全守护进程（本项目的核心贡献） |
 
-## codex-es-guard
-
-### 策略文件
+## 策略文件
 
 路径：`~/.codex/es_policy.json`
 
@@ -97,9 +146,7 @@ Claude Code 的实际二进制是 `node`，但通过 `process.title` 将 `argv[0
     "/Users/you/important-project",
     "/Users/you/another-project"
   ],
-  "temporary_overrides": [
-    "/Users/you/important-project/tmp-can-delete"
-  ],
+  "temporary_overrides": [],
   "trusted_tools": ["git", "cargo", "npm", "node", "python3"],
   "ai_agent_patterns": ["codex", "claude", "claude-code"]
 }
@@ -108,22 +155,15 @@ Claude Code 的实际二进制是 `node`，但通过 `process.title` 将 `argv[0
 | 字段 | 说明 | 默认值 |
 |------|------|--------|
 | `protected_zones` | 受保护目录前缀 | `[]` |
-| `temporary_overrides` | 临时豁免的子路径 | `[]` |
-| `trusted_tools` | 受信任的工具进程名（即使在 AI 上下文中也允许） | git, cargo, npm, node 等 |
+| `temporary_overrides` | 临时豁免的子路径（运行时由 Agent 管理） | `[]` |
+| `trusted_tools` | 受信任的工具进程名 | git, jj, cargo, npm, node 等 |
 | `ai_agent_patterns` | AI Agent 进程名匹配模式（子字符串匹配） | codex, claude, claude-code |
 
 - 策略文件支持 **热重载**（1 秒轮询），修改即生效
 - `trusted_tools` 和 `ai_agent_patterns` 有内置默认值，无需在 JSON 中指定
+- `protected_zones` 由 Nix 激活脚本管理，`temporary_overrides` 由 Agent 运行时管理
 
-### 拦截日志
-
-路径：`~/.codex/es-guard/denials.jsonl`（超过 1MB 自动截断）
-
-```json
-{"ts":1718000000,"op":"unlink","path":"/Users/you/project/main.rs","dest":null,"zone":"/Users/you/project","process":"rm","ancestor":"claude"}
-```
-
-### Nix 集成
+## Nix 集成
 
 通过 flake 提供 nix-darwin 模块，开机自动启动：
 
@@ -139,51 +179,24 @@ services.codex-es-guard = {
 };
 ```
 
-激活脚本自动完成：复制二进制 → codesign → 启动 LaunchDaemon → 同步策略文件。
+激活脚本自动完成：复制二进制 → codesign → 安装 es-guard-override → 启动 LaunchDaemon → 同步策略文件。
 
-### 手动构建与运行
+## 手动构建与运行
 
 ```bash
 # 构建
 nix build .#codex-es-guard
-# 或
-cargo build --release -p codex-es-guard
 
 # 签名（需要 ES entitlement）
-codesign --entitlements codex-es-guard/es.plist --force -s - target/release/codex-es-guard
+sudo cp result/bin/codex-es-guard /usr/local/bin/
+sudo cp result/bin/es-guard-override /usr/local/bin/
+sudo codesign --entitlements codex-es-guard/es.plist --force -s - /usr/local/bin/codex-es-guard
 
 # 运行（需要 root）
-sudo target/release/codex-es-guard
+sudo /usr/local/bin/codex-es-guard
 ```
 
-## 最终愿景：与 AI Agent 的闭环集成
-
-当前守护进程是单向拦截。最终目标是实现完整的闭环：
-
-```
-AI Agent 执行 rm important.rs
-        │
-        ▼
-codex-es-guard DENY + 写入 denials.jsonl
-        │
-        ▼
-Agent Sandbox 检测到 EPERM，读取 denials.jsonl
-        │
-        ▼
-Agent 上下文收到反馈："删除被安全策略阻止，该文件在保护区内"
-        │
-        ▼
-Agent 理解原因，决定是否发起 request_security_override
-        │
-        ▼
-临时放行写入 es_policy.json 的 temporary_overrides
-        │
-        ▼
-守护进程 1s 内热重载，放行该路径
-        │
-        ▼
-Agent 重试操作，成功
-```
+## 项目进度
 
 | 阶段 | 状态 |
 |------|------|
@@ -192,8 +205,9 @@ Agent 重试操作，成功
 | 进程感知防护（进程树检测） | 已完成 |
 | 策略热重载 | 已完成 |
 | 拦截审计日志 | 已完成 |
+| 闭环反馈（反馈文件 + override 命令） | 已完成 |
 | nix-darwin 模块集成 | 已完成 |
-| Agent 闭环反馈 | 规划中 |
+| Agent 指令集成（CLAUDE.md / instructions.md） | 已完成 |
 
 ## License
 
