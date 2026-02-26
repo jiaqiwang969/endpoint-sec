@@ -158,10 +158,11 @@ fn log_denial(home: &str, record: &DenialRecord) {
          Process: {} (via {})\n\
          \n\
          To override, run: es-guard-override {}\n\
+         Or manually: jq --arg p '{}' '.temporary_overrides += [$p]' ~/.codex/es_policy.json > /tmp/p.json && mv /tmp/p.json ~/.codex/es_policy.json && sleep 2\n\
          Then retry the operation.\n",
         record.op, record.path, dest_info,
         record.zone, record.process, record.ancestor,
-        record.path
+        record.path, record.path
     );
     let _ = fs::write(&feedback_path, &feedback);
 }
