@@ -163,11 +163,49 @@ fn get_process_path(pid: i32) -> Option<String> {
     }
 }
 
-fn get_parent_pid(pid: i32) -> Option<i32> {
-    // Use proc_pidinfo with PROC_PIDTBSDINFO to get parent PID.
-    // proc_bsdinfo layout: pbi_flags(4) + pbi_status(4) + pbi_xstatus(4) + pbi_pid(4) + pbi_ppid(4)
+/// Get the process argv[0] via sysctl KERN_PROCARGS2.
+/// This reflects process.title changes (e.g., Node.js setting title to "claude").
+fn get_process_argv0(pid: i32) -> Option<String> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size: libc::size_t = 0;
+
+    // First call: get buffer size
+    let ret = unsafe {
+        libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size,
+                     std::ptr::null_mut(), 0)
+    };
+    if ret != 0 || size == 0 { return None; }
+
+    let mut buf = vec![0u8; size];
+    let ret = unsafe {
+        libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr() as *mut libc::c_void,
+                     &mut size, std::ptr::null_mut(), 0)
+    };
+    if ret != 0 || size < 8 { return None; }
+
+    // Layout: argc(i32) + exec_path + \0 + padding(\0s) + argv[0] + \0 + ...
+    let mut pos = 4; // skip argc
+    // skip exec_path
+    while pos < size && buf[pos] != 0 { pos += 1; }
+    // skip null padding
+    while pos < size && buf[pos] == 0 { pos += 1; }
+    // read argv[0]
+    let start = pos;
+    while pos < size && buf[pos] != 0 { pos += 1; }
+
+    if start < pos {
+        let argv0 = String::from_utf8_lossy(&buf[start..pos]).to_string();
+        // Extract basename
+        Some(argv0.rsplit('/').next().unwrap_or(&argv0).to_string())
+    } else {
+        None
+    }
+}
+
+/// Query proc_bsdinfo for a process. Returns (ppid, comm_name).
+fn get_process_info(pid: i32) -> Option<(i32, String)> {
     const PROC_PIDTBSDINFO: i32 = 3;
-    let mut buf = [0u8; 128];
+    let mut buf = [0u8; 256];
     let ret = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -178,13 +216,12 @@ fn get_parent_pid(pid: i32) -> Option<i32> {
         )
     };
     if ret > 20 {
-        // pbi_ppid is at byte offset 16
         let ppid = u32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]) as i32;
-        if ppid > 0 && ppid != pid {
-            Some(ppid)
-        } else {
-            None
-        }
+        let ppid = if ppid > 0 && ppid != pid { ppid } else { 0 };
+        // pbi_comm at offset 48 (16 bytes)
+        let comm_end = buf[48..64].iter().position(|&b| b == 0).unwrap_or(16);
+        let comm = String::from_utf8_lossy(&buf[48..48 + comm_end]).to_string();
+        Some((ppid, comm))
     } else {
         None
     }
@@ -205,22 +242,34 @@ fn find_ai_ancestor(pid: i32, policy: &SecurityPolicy, cache: &mut HashMap<i32, 
             return cached.clone();
         }
 
-        if let Some(exe_path) = get_process_path(current) {
-            if policy.matches_ai_agent(&exe_path) {
-                let name = exe_name(&exe_path).to_string();
-                cache.insert(current, Some(name.clone()));
-                return Some(name);
-            }
+        // Check executable path (Mach-O binary name)
+        let exe_path = get_process_path(current);
+        let exe_match = exe_path.as_ref().map(|p| policy.matches_ai_agent(p)).unwrap_or(false);
+
+        // Check argv[0] (reflects process.title, e.g. Node.js "claude")
+        let argv0 = get_process_argv0(current);
+        let argv0_match = argv0.as_ref().map(|a| {
+            policy.ai_agent_patterns.iter().any(|pat| a.contains(pat.as_str()))
+        }).unwrap_or(false);
+
+        if exe_match || argv0_match {
+            let label = if argv0_match {
+                argv0.unwrap_or_else(|| exe_path.as_ref().map(|p| exe_name(p).to_string()).unwrap_or_default())
+            } else {
+                exe_path.as_ref().map(|p| exe_name(p).to_string()).unwrap_or_default()
+            };
+            cache.insert(current, Some(label.clone()));
+            return Some(label);
         }
 
-        match get_parent_pid(current) {
-            Some(ppid) => current = ppid,
+        // Walk up to parent via proc_bsdinfo
+        match get_process_info(current).map(|(pp, _)| pp).filter(|&pp| pp > 0) {
+            Some(pp) => current = pp,
             None => break,
         }
         depth += 1;
     }
 
-    // Cache negative result for the original PID only
     cache.insert(pid, None);
     None
 }
