@@ -207,7 +207,41 @@ sudo /usr/local/bin/codex-es-guard
 | 拦截审计日志 | 已完成 |
 | 闭环反馈（反馈文件 + override 命令） | 已完成 |
 | nix-darwin 模块集成 | 已完成 |
-| Agent 指令集成（CLAUDE.md / instructions.md） | 已完成 |
+
+| Nix-Darwin 模块集成 | 已完成 |
+| Agent 指令集成 (CLAUDE.md / instructions.md) | 已完成 |
+| **MenuBar UI 应用 (ESGuard.app)** | **已完成 (全新)** |
+
+## 🖥️ ES Guard MenuBar 监控应用
+
+作为底层 Root 守护进程的完美补充，本项目包含一个完全原生的 **macOS SwiftUI 菜单栏应用**，提供极客级的视觉监控与控制闭环。
+
+> **环境要求**：macOS 13.0 (Ventura) 或更高版本。
+
+### 核心特性
+
+*   **⚡️ 零开销事件驱动 (FSEvents)**
+    不使用低效的定时轮询。底层封装 `DispatchSourceFileSystemObject` 直接与内核文件系统事件绑定。当守护进程写入拦截日志时，UI 在微秒级瞬间唤醒并更新，平时 CPU 占用严格为 `0%`。
+*   **🔔 交互式原生系统通知 (Push Notifications)**
+    当 Agent 试图越权操作被拦截时，macOS 右上角会立刻弹出原生横幅告警。你甚至不需要打开控制台，直接点击通知横幅上的 **[临时放行]** 按钮即可授权。
+*   **⏳ 智能“阅后即焚”放行策略**
+    安全的最大敌人是遗忘。通过 UI 授权的临时放行操作，应用会在后台启动一个静默倒计时（默认 3 分钟，支持偏好设置持久化修改）。时间一到，自动撤销授权，防止留下永久后门。
+*   **📊 AI 行为画像 (SwiftUI Charts)**
+    提供可视化的堆叠柱状图，精准统计是 Codex、Claude 还是 Copilot 在尝试对你的哪些文件发起 `Delete` 或 `Move` 操作。
+*   **🤖 人机协同指令生成**
+    针对全自动 Agent 的特性，专门设计了“一键生成 Prompt”按钮。点击后自动将拦截记录打包为一段带有明确上下文的英文 Prompt，直接喂给大模型纠正它的后续行为。
+
+### 构建与安装
+
+我们提供了极简的构建脚本，一键将其编译、剥离隔离属性并注册为合法的系统 App：
+
+```bash
+cd codex-es-guard/menubar-app
+make install
+```
+
+执行后，带有“系统级保险箱”图标的 `ESGuard.app` 将被静默安装至你的 `~/Applications/` 目录并自动启动。
+
 
 ## License
 

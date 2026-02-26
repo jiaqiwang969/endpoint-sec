@@ -1,1 +1,6 @@
 /target
+
+# ESGuard MenuBar App
+codex-es-guard/menubar-app/.build/
+codex-es-guard/menubar-app/ESGuard.app/
+codex-es-guard/menubar-app/.swiftpm/
