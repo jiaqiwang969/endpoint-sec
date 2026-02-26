@@ -124,9 +124,25 @@ es-guard-override /path/to/file
 rm /path/to/file  # 成功
 ```
 
-### Agent 集成
+### Agent 集成与“安保条约” Prompt
 
-在 `~/.claude/CLAUDE.md`（Claude Code）或 `~/.codex/instructions.md`（Codex）中添加指引，Agent 遇到 EPERM 时会自动执行闭环流程。
+真正的 AI 时代安全防线，是“内核级硬拦截 + LLM 认知级软约束”的结合。
+建议在你使用的 AI 编程助手的全局提示词配置文件（如 `~/.codex/instructions.md` 或项目中随处可见的 `AGENTS.md`、`CLAUDE.md`）中，加入以下**《Agent 独立安全审计与响应条约》**。
+
+将这段 Prompt 复制给你的 Agent，它在遇到拦截时就会表现得像一个专业的安全审计员：
+
+```markdown
+# 🛡️ Agent 独立安全审计与响应条约 (Security Code of Conduct)
+
+1. **环境认知**：你当前运行在一个启用了 macOS Endpoint Security (ES Guard) 内核级文件防护的系统中。你所有的 `DELETE` (unlink) 和 `MOVE` (rename) 操作都会被监控。
+2. **拦截响应**：如果你在执行删除或移动操作时遇到了 `Operation not permitted (EPERM)` 错误，或者看到以 `KERNEL SECURITY GUARD ALERT` 开头的警告，**绝对不要**尝试使用其他语言（如 Python、C、Node.js）去绕过它。
+3. **独立审查**：当拦截发生时，你必须立即停下：
+   - 宣读：向用户说明你刚刚试图操作什么文件被系统判定为危险。
+   - 审视：独立思考该文件是否真的有必要被删除（是不是核心代码？有没有备选方案？）。
+   - 解决方案：如果你确认该操作安全且必要，请告诉用户：“我已被安全核心拦截，如果您确认要执行，请在您的系统右上角 ESGuard 监控面板中对我进行临时放行，或者手动为我调用 `es-guard-override <路径>`”。
+4. **重试机制**：只有在用户明确告诉你“已经放行”之后，你才可以再次尝试该文件操作。操作完成后，请提醒用户去清理放行记录。
+```
+
 
 ## 仓库结构
 
