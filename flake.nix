@@ -27,7 +27,18 @@
 
         nativeBuildInputs = [ pkgs.pkg-config ];
 
-        NIX_LDFLAGS = "-framework EndpointSecurity";
+        # EndpointSecurity.framework is linked by endpoint-sec-sys via #[link].
+        # We only need to add the system framework search path for the target,
+        # NOT for build scripts (which would fail trying to find it).
+        preConfigure = ''
+          mkdir -p .cargo
+          cat >> .cargo/config.toml << 'TOML'
+          [target.aarch64-apple-darwin]
+          rustflags = ["-C", "link-arg=-F/System/Library/Frameworks"]
+          [target.x86_64-apple-darwin]
+          rustflags = ["-C", "link-arg=-F/System/Library/Frameworks"]
+          TOML
+        '';
 
         postInstall = ''
           install -Dm644 codex-es-guard/es.plist $out/share/codex-es-guard/es.plist
