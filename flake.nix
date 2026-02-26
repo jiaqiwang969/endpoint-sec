@@ -42,6 +42,7 @@
 
         postInstall = ''
           install -Dm644 codex-es-guard/es.plist $out/share/codex-es-guard/es.plist
+          install -Dm755 codex-es-guard/es-guard-override $out/bin/es-guard-override
         '';
 
         meta = {
@@ -118,6 +119,10 @@
                 chmod 755 "$SIGNED"
                 /usr/bin/codesign --entitlements "$ES_PLIST" --force -s - "$SIGNED" 2>/dev/null || true
                 echo "codex-es-guard: signed at $SIGNED"
+
+                # Install helper script
+                cp -f "${cfg.package}/bin/es-guard-override" /usr/local/bin/es-guard-override
+                chmod 755 /usr/local/bin/es-guard-override
 
                 # Restart daemon so it picks up the freshly signed binary
                 /bin/launchctl kickstart -k system/${daemonLabel} 2>/dev/null || true

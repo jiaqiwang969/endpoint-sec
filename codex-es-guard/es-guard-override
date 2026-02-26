@@ -1,0 +1,45 @@
+#!/bin/bash
+# es-guard-override: Request temporary file deletion/move override for ES Guard
+# Usage: es-guard-override <path>
+
+set -euo pipefail
+
+POLICY="$HOME/.codex/es_policy.json"
+FEEDBACK="$HOME/.codex/es-guard/last_denial.txt"
+
+if [ $# -lt 1 ]; then
+    echo "Usage: es-guard-override <path>"
+    echo ""
+    if [ -f "$FEEDBACK" ]; then
+        echo "Last denial:"
+        cat "$FEEDBACK"
+    fi
+    exit 1
+fi
+
+TARGET="$1"
+
+if [ ! -f "$POLICY" ]; then
+    echo "Error: Policy file not found: $POLICY"
+    exit 1
+fi
+
+if ! command -v jq &>/dev/null; then
+    echo "Error: jq is required but not found in PATH"
+    exit 1
+fi
+
+# Check if already overridden
+if jq -e --arg path "$TARGET" '.temporary_overrides | index($path)' "$POLICY" &>/dev/null; then
+    echo "Path already in temporary_overrides: $TARGET"
+    exit 0
+fi
+
+# Add to temporary_overrides
+jq --arg path "$TARGET" '.temporary_overrides += [$path]' "$POLICY" > "$POLICY.tmp" \
+    && mv "$POLICY.tmp" "$POLICY"
+
+echo "Override granted: $TARGET"
+echo "Waiting for policy reload (2s)..."
+sleep 2
+echo "Ready. You can now retry the operation."

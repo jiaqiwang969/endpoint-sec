@@ -130,6 +130,7 @@ fn now_ts() -> u64 {
 fn log_denial(home: &str, record: &DenialRecord) {
     let dir = format!("{}/.codex/es-guard", home);
     let log_path = format!("{}/denials.jsonl", dir);
+    let feedback_path = format!("{}/last_denial.txt", dir);
 
     if !Path::new(&dir).exists() {
         let _ = fs::create_dir_all(&dir);
@@ -146,6 +147,23 @@ fn log_denial(home: &str, record: &DenialRecord) {
             let _ = writeln!(f, "{}", json);
         }
     }
+
+    // Write human-readable feedback for AI agents
+    let dest_info = record.dest.as_deref().map(|d| format!("\nDest: {}", d)).unwrap_or_default();
+    let feedback = format!(
+        "[ES-GUARD DENIED]\n\
+         Operation: {}\n\
+         Path: {}{}\n\
+         Zone: {}\n\
+         Process: {} (via {})\n\
+         \n\
+         To override, run: es-guard-override {}\n\
+         Then retry the operation.\n",
+        record.op, record.path, dest_info,
+        record.zone, record.process, record.ancestor,
+        record.path
+    );
+    let _ = fs::write(&feedback_path, &feedback);
 }
 
 // --- Process tree walking (macOS) ---
