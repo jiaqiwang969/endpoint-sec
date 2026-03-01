@@ -157,12 +157,16 @@ fn log_denial(home: &str, record: &DenialRecord) {
          Zone: {}\n\
          Process: {} (via {})\n\
          \n\
-         To override, run: es-guard-override {}\n\
+         Recommended (safer first step): es-guard-quarantine {}\n\
+         This moves the target into ./temp under your CURRENT working directory.\n\
+         \n\
+         If you must permanently delete via AI, request one-time override:\n\
+         es-guard-override {}\n\
          Or manually: jq --arg p '{}' '.temporary_overrides += [$p]' ~/.codex/es_policy.json > /tmp/p.json && mv /tmp/p.json ~/.codex/es_policy.json && sleep 2\n\
          Then retry the operation.\n",
         record.op, record.path, dest_info,
         record.zone, record.process, record.ancestor,
-        record.path, record.path
+        record.path, record.path, record.path
     );
     let _ = fs::write(&feedback_path, &feedback);
 }

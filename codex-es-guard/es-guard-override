@@ -9,6 +9,7 @@ FEEDBACK="$HOME/.codex/es-guard/last_denial.txt"
 
 if [ $# -lt 1 ]; then
     echo "Usage: es-guard-override <path>"
+    echo "Tip: safer first step is es-guard-quarantine <path> (move to ./temp)."
     echo ""
     if [ -f "$FEEDBACK" ]; then
         echo "Last denial:"

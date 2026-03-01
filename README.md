@@ -77,9 +77,9 @@ Claude Code 的实际二进制是 `node`，但通过 `process.title` 将 `argv[0
 | git 操作 `.git/objects/` | `git` (trusted tool) | ALLOW |
 | CLIProxyAPI 日志轮转 | `cli-proxy-api` (非 AI 进程) | ALLOW |
 
-## 闭环反馈：拦截 → 反馈 → 放行 → 重试
+## 闭环反馈：拦截 → 临时隔离(temp) → 按需放行
 
-当 AI Agent 被拦截后，可以通过闭环流程完成合法操作：
+当 AI Agent 被拦截后，默认先走“临时隔离”而不是直接改策略放行：
 
 ```
 Agent 执行 rm important.rs
@@ -91,11 +91,14 @@ codex-es-guard DENY → 返回 EPERM
 Agent 读取 last_denial.txt，了解拦截原因
     │
     ▼
-Agent 运行 es-guard-override <path>
-    │  → 将路径加入 temporary_overrides
-    │  → 等待 2 秒策略热重载
+Agent 运行 es-guard-quarantine <path>
+    │  → 自动创建 ./temp（若不存在）
+    │  → 先把目标移动到当前目录的 ./temp/
     ▼
-Agent 重试操作 → 成功
+需要彻底删除时，再走 es-guard-override <path>
+    │  → temporary_overrides 热重载后再重试
+    ▼
+最终删除成功（两段式防护）
 ```
 
 ### 反馈文件
@@ -109,7 +112,11 @@ Path: /Users/you/project/important.rs
 Zone: /Users/you/project
 Process: rm (via claude)
 
-To override, run: es-guard-override /Users/you/project/important.rs
+Recommended (safer first step): es-guard-quarantine /Users/you/project/important.rs
+This moves the target into ./temp under your CURRENT working directory.
+
+If you must permanently delete via AI, request one-time override:
+es-guard-override /Users/you/project/important.rs
 Or manually: jq --arg p '/Users/you/project/important.rs' '.temporary_overrides += [$p]' ~/.codex/es_policy.json > /tmp/p.json && mv /tmp/p.json ~/.codex/es_policy.json && sleep 2
 Then retry the operation.
 ```
@@ -122,6 +129,13 @@ es-guard-override /path/to/file
 
 # 放行后重试
 rm /path/to/file  # 成功
+```
+
+### es-guard-quarantine 命令（推荐第一步）
+
+```bash
+# 将目标先移动到当前目录下的 ./temp（不存在会自动创建）
+es-guard-quarantine /path/to/file
 ```
 
 ### Agent 集成与“安保条约” Prompt

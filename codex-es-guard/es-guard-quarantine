@@ -1,0 +1,56 @@
+#!/bin/bash
+# es-guard-quarantine: move targets into ./temp instead of permanent deletion
+# Usage: es-guard-quarantine <path> [path ...]
+
+set -euo pipefail
+
+FEEDBACK="$HOME/.codex/es-guard/last_denial.txt"
+
+if [ $# -lt 1 ]; then
+    echo "Usage: es-guard-quarantine <path> [path ...]"
+    echo ""
+    echo "This creates ./temp in your CURRENT directory and moves targets there."
+    echo ""
+    if [ -f "$FEEDBACK" ]; then
+        echo "Last denial:"
+        cat "$FEEDBACK"
+    fi
+    exit 1
+fi
+
+TEMP_DIR="$PWD/temp"
+mkdir -p "$TEMP_DIR"
+
+declare -i moved_count=0
+
+for target in "$@"; do
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        echo "Skip (not found): $target" >&2
+        continue
+    fi
+
+    base_name="$(basename "$target")"
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    dest="$TEMP_DIR/${base_name}.${stamp}"
+
+    i=0
+    while [ -e "$dest" ] || [ -L "$dest" ]; do
+        i=$((i + 1))
+        dest="$TEMP_DIR/${base_name}.${stamp}.${i}"
+    done
+
+    if ! mv -- "$target" "$dest" 2>/dev/null; then
+        mv "$target" "$dest"
+    fi
+
+    moved_count=$((moved_count + 1))
+    echo "Quarantined: $target -> $dest"
+done
+
+if [ "$moved_count" -eq 0 ]; then
+    echo "No targets were moved." >&2
+    exit 1
+fi
+
+echo ""
+echo "Done. Review files in: $TEMP_DIR"

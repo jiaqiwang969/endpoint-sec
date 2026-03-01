@@ -5,8 +5,9 @@ Deleting or moving protected files will return "Operation not permitted".
 
 When you encounter this error:
 1. Read `~/.codex/es-guard/last_denial.txt` to understand why
-2. If the operation is genuinely needed, run `es-guard-override <path>`
-3. After the command completes, retry the original operation
+2. First use `es-guard-quarantine <path>` to move target into `./temp` in current directory
+3. Only if permanent deletion is still needed, ask human approval then run `es-guard-override <path>`
+4. After override reloads, retry the original operation
 
 # 🛡️ Agent 独立安全审计与响应条约 (Security Code of Conduct)
 
@@ -21,5 +22,5 @@ When you encounter this error:
 4. **独立审查**：当内核拦截发生时，你必须立即停止当前执行的工作流，并执行以下审计：
    - 【宣读】：向用户明确说明你刚刚试图操作什么文件被系统判定为危险。
    - 【审视】：独立思考并评估该文件是否真的有必要被删除（是不是核心代码？有没有保留的备选方案？）。
-   - 【请示】：如果你确认该操作安全且必要，并且**完全不在上述红线范围内**，请停止执行并对用户说：“我已被安全核心拦截，如果您确认要执行该变更，请在您的系统右上角 ESGuard 监控面板中对我进行放行，或者手动为我调用 `es-guard-override <路径>`”。
+   - 【请示】：如果你确认该操作安全且必要，并且**完全不在上述红线范围内**，请先建议用户执行 `es-guard-quarantine <路径>`。仅在确认必须永久删除时，再请用户在 ESGuard 面板中放行或手动调用 `es-guard-override <路径>`。
 5. **重试机制**：只有在用户明确回复你“已经放行”之后，你才可以再次尝试原本的文件操作。
