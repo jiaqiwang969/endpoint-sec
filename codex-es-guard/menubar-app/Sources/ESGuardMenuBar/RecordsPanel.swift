@@ -169,6 +169,9 @@ struct RecordRow: View {
                 NSWorkspace.shared.selectFile(record.path, inFileViewerRootedAtPath: "")
             }
             Divider()
+            Button("先隔离到 temp") {
+                viewModel.requestQuarantine(for: record.path)
+            }
             Button("临时放行此文件 (\(viewModel.autoRevokeMinutes)分钟)") {
                 viewModel.requestOverride(for: record.path)
             }

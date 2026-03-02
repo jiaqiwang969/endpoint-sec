@@ -23,6 +23,11 @@ struct PolicyPanel: View {
                 .foregroundColor(.blue)
             }
             .padding(.horizontal)
+
+            Text("建议流程：先“隔离到 temp”，仅在确认要永久删除时再做临时放行。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding(.horizontal)
             
             // 手动添加 Override 的输入框
             HStack {

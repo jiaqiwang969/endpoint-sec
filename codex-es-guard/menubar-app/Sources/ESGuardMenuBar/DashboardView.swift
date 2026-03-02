@@ -16,32 +16,50 @@ struct DashboardView: View {
                     .font(.headline)
                 Spacer()
                 
-                if viewModel.guardRunning {
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(viewModel.hasUnacknowledgedRecords ? Color.orange : Color.green)
-                            .frame(width: 8, height: 8)
-                        Text(viewModel.hasUnacknowledgedRecords ? "有新拦截" : "守护中")
-                            .font(.caption)
-                            .foregroundColor(viewModel.hasUnacknowledgedRecords ? .orange : .secondary)
-                    }
-                } else {
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(Color.red)
-                            .frame(width: 8, height: 8)
-                        Text("守护已停止")
-                            .font(.caption)
-                            .foregroundColor(.red)
-                    }
-                    Button(action: {
-                        viewModel.restartDaemon()
-                    }) {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .buttonStyle(.plain)
-                    .help("尝试通过 launchctl 重启守护进程")
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(
+                            viewModel.guardRunning
+                                ? (viewModel.hasUnacknowledgedRecords ? Color.orange : Color.green)
+                                : Color.red
+                        )
+                        .frame(width: 8, height: 8)
+                    Text(
+                        viewModel.guardRunning
+                            ? (viewModel.hasUnacknowledgedRecords ? "有新拦截" : "守护中")
+                            : "守护已停止"
+                    )
+                    .font(.caption)
+                    .foregroundColor(
+                        viewModel.guardRunning
+                            ? (viewModel.hasUnacknowledgedRecords ? .orange : .secondary)
+                            : .red
+                    )
                 }
+
+                Button("开启") {
+                    viewModel.startDaemon()
+                }
+                .buttonStyle(.borderless)
+                .disabled(viewModel.guardRunning || viewModel.daemonActionInProgress)
+                .help("启动 launchd 中的 codex-es-guard")
+
+                Button("关闭") {
+                    viewModel.stopDaemon()
+                }
+                .buttonStyle(.borderless)
+                .disabled(!viewModel.guardRunning || viewModel.daemonActionInProgress)
+                .foregroundColor(.red)
+                .help("临时停止 launchd 中的 codex-es-guard")
+
+                Button(action: {
+                    viewModel.restartDaemon()
+                }) {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.plain)
+                .disabled(viewModel.daemonActionInProgress)
+                .help("重启守护进程")
             }
             .padding(.horizontal)
             .padding(.top, 12)

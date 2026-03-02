@@ -16,10 +16,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
     
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
-        if response.actionIdentifier == "ACTION_OVERRIDE" {
-            if let path = response.notification.request.content.userInfo["path"] as? String {
+        let action = response.actionIdentifier
+        if action == "ACTION_OVERRIDE" || action == "ACTION_QUARANTINE" {
+            if let path = response.notification.request.content.userInfo["path"] as? String, !path.isEmpty {
                 Task { @MainActor in
-                    self.viewModel?.requestOverride(for: path)
+                    if action == "ACTION_QUARANTINE" {
+                        self.viewModel?.requestQuarantine(for: path)
+                    } else {
+                        self.viewModel?.requestOverride(for: path)
+                    }
                 }
             }
         }

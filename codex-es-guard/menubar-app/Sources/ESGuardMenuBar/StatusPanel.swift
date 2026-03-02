@@ -16,9 +16,9 @@ struct StatusPanel: View {
                         .font(.headline)
                     
                     HStack {
-                        StatBox(title: "总计拦截", value: "\(viewModel.records.count)", color: .orange)
-                        StatBox(title: "删除 (DELETE)", value: "\(viewModel.records.filter{$0.op == "unlink"}.count)", color: .red)
-                        StatBox(title: "移动 (MOVE)", value: "\(viewModel.records.filter{$0.op == "rename"}.count)", color: .blue)
+                        StatBox(title: "总计拦截", value: "\(viewModel.totalIntercepts)", color: .orange)
+                        StatBox(title: "删除 (DELETE)", value: "\(viewModel.totalDeletes)", color: .red)
+                        StatBox(title: "移动 (MOVE)", value: "\(viewModel.totalMoves)", color: .blue)
                     }
                 }
                 .padding(.horizontal)
@@ -45,7 +45,7 @@ struct StatusPanel: View {
                                 • 目标文件: `\(lastRecord.path)`
                                 • 发起进程: \(lastRecord.ancestor)
                                 
-                                该目录属于「受保护安全区」。请重新评估是否确实需要\(action)该文件。如果确有必要，请告诉我，我会为您进行临时放行。
+                                该目录属于「受保护安全区」。请重新评估是否确实需要\(action)该文件。建议先执行隔离（移动到 ./temp），仅在必须永久删除时再申请临时放行。
                                 """
                                 let pasteboard = NSPasteboard.general
                                 pasteboard.clearContents()
@@ -94,11 +94,19 @@ struct StatusPanel: View {
                                 .foregroundColor(.secondary)
                             
                             Spacer()
-                            
+
+                            Button(action: {
+                                viewModel.requestQuarantine(for: lastRecord.path)
+                            }) {
+                                Text("先隔离到 temp")
+                                    .bold()
+                            }
+                            .buttonStyle(.bordered)
+
                             Button(action: {
                                 viewModel.requestOverride(for: lastRecord.path)
                             }) {
-                                Text("临时放行此文件 (3分钟)")
+                                Text("临时放行此文件 (\(viewModel.autoRevokeMinutes)分钟)")
                                     .bold()
                             }
                             .buttonStyle(.borderedProminent)
@@ -121,12 +129,40 @@ struct StatusPanel: View {
                 .padding(.horizontal)
                 
                 Divider()
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("拦截反馈 (last_denial.txt)")
+                            .font(.headline)
+                        Spacer()
+                        if let feedbackPath = viewModel.lastDeniedPath {
+                            Button("隔离该文件") {
+                                viewModel.requestQuarantine(for: feedbackPath)
+                            }
+                            .buttonStyle(.borderless)
+                            .foregroundColor(.orange)
+                        }
+                    }
+
+                    Text(viewModel.lastDenial)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(10)
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(6)
+                }
+                .padding(.horizontal)
+
+                Divider()
                 
                 // ----------------------------------------------------
                 // 数据图表模块
                 // ----------------------------------------------------
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("AI Agent 行为画像")
+                    Text("AI Agent 行为画像 (全局)")
                         .font(.headline)
                     
                     if viewModel.agentStats.isEmpty {

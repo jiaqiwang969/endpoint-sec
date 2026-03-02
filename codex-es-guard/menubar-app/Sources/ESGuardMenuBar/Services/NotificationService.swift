@@ -5,15 +5,21 @@ class NotificationService {
     static let shared = NotificationService()
     
     func requestPermission() {
+        let quarantineAction = UNNotificationAction(
+            identifier: "ACTION_QUARANTINE",
+            title: "先隔离到 temp",
+            options: [.foreground]
+        )
+
         let overrideAction = UNNotificationAction(
             identifier: "ACTION_OVERRIDE",
-            title: "临时放行此文件 (Override)",
+            title: "临时放行 (Override)",
             options: [.foreground]
         )
         
         let category = UNNotificationCategory(
             identifier: "ES_GUARD_DENIAL",
-            actions: [overrideAction],
+            actions: [quarantineAction, overrideAction],
             intentIdentifiers: [],
             options: .customDismissAction
         )
@@ -33,7 +39,7 @@ class NotificationService {
         content.title = "⚠️ 拦截警告 (ES Guard)"
         let action = record.op == "unlink" ? "删除" : "移动"
         let fileName = URL(fileURLWithPath: record.path).lastPathComponent
-        content.body = "已阻止 \(record.ancestor) 进程试图\(action)文件：\(fileName)"
+        content.body = "已阻止 \(record.ancestor) 试图\(action)文件：\(fileName)。建议先隔离到 temp。"
         content.sound = UNNotificationSound.default
         content.categoryIdentifier = "ES_GUARD_DENIAL"
         content.userInfo = ["path": record.path]
