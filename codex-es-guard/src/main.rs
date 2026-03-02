@@ -8,7 +8,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::panic::AssertUnwindSafe;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,6 +16,29 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CACHE_TTL_SECS: u64 = 5;
 const DEFAULT_FILE_MODE: u32 = 0o644;
 const DEFAULT_DIR_MODE: u32 = 0o700;
+const RUNTIME_OVERRIDE_FILE_MODE: u32 = 0o600;
+const OVERRIDE_DEFAULT_MINUTES: u64 = 3;
+const OVERRIDE_MAX_MINUTES: u64 = 30;
+const OVERRIDE_STORE_DIR: &str = "/var/db/codex-es-guard";
+
+#[derive(Debug, Deserialize)]
+struct OverrideRequest {
+    id: String,
+    action: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    minutes: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct OverrideResponse {
+    id: String,
+    status: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<u64>,
+}
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 struct SecurityPolicy {
@@ -187,6 +210,85 @@ fn home_digit_root(path: &str, home: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn normalize_absolute_path(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::RootDir => {},
+            Component::CurDir => {},
+            Component::ParentDir => {
+                let _ = parts.pop();
+            },
+            Component::Normal(segment) => {
+                parts.push(segment.to_string_lossy().to_string());
+            },
+            _ => return None,
+        }
+    }
+
+    if parts.is_empty() {
+        Some("/".to_string())
+    } else {
+        Some(format!("/{}", parts.join("/")))
+    }
+}
+
+fn sanitize_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "default".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn policy_user_name(home: &str) -> String {
+    let fallback = "default";
+    let base = Path::new(home)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback);
+    sanitize_component(base)
+}
+
+fn runtime_override_db_path(home: &str) -> PathBuf {
+    let user = policy_user_name(home);
+    PathBuf::from(OVERRIDE_STORE_DIR).join(format!("{}.json", user))
+}
+
+fn override_request_dir(home: &str) -> PathBuf {
+    PathBuf::from(home)
+        .join(".codex")
+        .join("es-guard")
+        .join("override-requests")
+}
+
+fn request_response_path(request_dir: &Path, id: &str) -> PathBuf {
+    request_dir.join(format!("{}.response.json", sanitize_component(id)))
+}
+
+fn ensure_guard_dirs(home: &str) -> io::Result<PathBuf> {
+    let codex_dir = PathBuf::from(home).join(".codex");
+    ensure_dir_not_symlink(&codex_dir, DEFAULT_DIR_MODE)?;
+
+    let guard_dir = codex_dir.join("es-guard");
+    ensure_dir_not_symlink(&guard_dir, DEFAULT_DIR_MODE)?;
+    Ok(guard_dir)
 }
 
 fn ensure_dir_not_symlink(path: &Path, mode: u32) -> io::Result<()> {
@@ -507,6 +609,440 @@ fn save_policy(policy_path: &str, policy: &SecurityPolicy) -> io::Result<()> {
     Ok(())
 }
 
+fn load_runtime_overrides(path: &Path) -> io::Result<Vec<TemporaryOverrideEntry>> {
+    let mut file = match open_read_no_follow(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(err) => return Err(err),
+    };
+    verify_regular_file(&file, path)?;
+
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    let decoded = serde_json::from_str::<Vec<TemporaryOverrideEntry>>(&content)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    Ok(decoded)
+}
+
+fn save_runtime_overrides(path: &Path, overrides: &[TemporaryOverrideEntry]) -> io::Result<()> {
+    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+    let _lock = acquire_lock_dir(&lock_path)?;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "override path has no parent"))?;
+    ensure_dir_not_symlink(parent, DEFAULT_DIR_MODE)?;
+
+    let existing_meta = match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "refuse to save runtime overrides via symlink",
+                ));
+            }
+            if !meta.file_type().is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "runtime override path is not a regular file",
+                ));
+            }
+            Some(meta)
+        },
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err),
+    };
+
+    let serialized =
+        serde_json::to_vec_pretty(overrides).map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+    let final_mode = existing_meta
+        .as_ref()
+        .map(|m| m.mode() & 0o777)
+        .unwrap_or(RUNTIME_OVERRIDE_FILE_MODE);
+    let fallback_owner = fs::symlink_metadata(parent).ok().map(|meta| (meta.uid(), meta.gid()));
+    let final_owner = existing_meta
+        .as_ref()
+        .map(|meta| (meta.uid(), meta.gid()))
+        .or(fallback_owner);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("overrides.json");
+
+    let mut tmp_path: Option<PathBuf> = None;
+    let mut tmp_file: Option<File> = None;
+    for attempt in 0..32 {
+        let candidate = parent.join(format!(
+            ".{}.tmp.{}.{}.{}",
+            file_name,
+            std::process::id(),
+            now_ts(),
+            attempt
+        ));
+        let open_result = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(RUNTIME_OVERRIDE_FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&candidate);
+        match open_result {
+            Ok(file) => {
+                tmp_path = Some(candidate);
+                tmp_file = Some(file);
+                break;
+            },
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    let tmp_path = tmp_path.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "failed to allocate temp runtime override file",
+        )
+    })?;
+    let mut tmp_file = tmp_file.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            "failed to open temp runtime override file",
+        )
+    })?;
+    verify_regular_file(&tmp_file, &tmp_path)?;
+
+    tmp_file.write_all(&serialized)?;
+    tmp_file.sync_all()?;
+    tmp_file.set_permissions(fs::Permissions::from_mode(final_mode))?;
+
+    if let Some((uid, gid)) = final_owner {
+        let rc = unsafe { libc::fchown(tmp_file.as_raw_fd(), uid, gid) };
+        if rc != 0 {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    drop(tmp_file);
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn is_dangerous_override_path(path: &str, policy: &SecurityPolicy, home: &str) -> bool {
+    let normalized = trim_trailing_slashes(path);
+    let normalized_home = trim_trailing_slashes(home);
+
+    if normalized == "/" || normalized == normalized_home {
+        return true;
+    }
+    if policy
+        .protected_zones
+        .iter()
+        .any(|zone| trim_trailing_slashes(zone.as_str()) == normalized)
+    {
+        return true;
+    }
+    if policy.auto_protect_home_digit_children {
+        if let Some(auto_root) = home_digit_root(normalized, home) {
+            if trim_trailing_slashes(auto_root.as_str()) == normalized {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn apply_override_request(
+    req: &OverrideRequest,
+    policy: &SecurityPolicy,
+    home: &str,
+    overrides: &mut Vec<TemporaryOverrideEntry>,
+) -> (bool, OverrideResponse) {
+    let action = req.action.trim().to_lowercase();
+    match action.as_str() {
+        "grant" => {
+            let raw_path = match req.path.as_deref() {
+                Some(path) => path.trim(),
+                None => "",
+            };
+            if raw_path.is_empty() {
+                return (
+                    false,
+                    OverrideResponse {
+                        id: req.id.clone(),
+                        status: "error".to_string(),
+                        message: "missing path".to_string(),
+                        expires_at: None,
+                    },
+                );
+            }
+            let path = match normalize_absolute_path(raw_path) {
+                Some(path) => path,
+                None => {
+                    return (
+                        false,
+                        OverrideResponse {
+                            id: req.id.clone(),
+                            status: "error".to_string(),
+                            message: "invalid absolute path".to_string(),
+                            expires_at: None,
+                        },
+                    );
+                },
+            };
+            if path == "/" {
+                return (
+                    false,
+                    OverrideResponse {
+                        id: req.id.clone(),
+                        status: "error".to_string(),
+                        message: "invalid absolute path".to_string(),
+                        expires_at: None,
+                    },
+                );
+            }
+            if !policy.is_in_any_zone(path.as_str(), home) {
+                return (
+                    false,
+                    OverrideResponse {
+                        id: req.id.clone(),
+                        status: "error".to_string(),
+                        message: "path outside protected zones".to_string(),
+                        expires_at: None,
+                    },
+                );
+            }
+            if is_dangerous_override_path(path.as_str(), policy, home) {
+                return (
+                    false,
+                    OverrideResponse {
+                        id: req.id.clone(),
+                        status: "error".to_string(),
+                        message: "broad path override is not allowed".to_string(),
+                        expires_at: None,
+                    },
+                );
+            }
+
+            let minutes = req.minutes.unwrap_or(OVERRIDE_DEFAULT_MINUTES);
+            if minutes == 0 {
+                return (
+                    false,
+                    OverrideResponse {
+                        id: req.id.clone(),
+                        status: "error".to_string(),
+                        message: "no-expire override is disabled for automated requests".to_string(),
+                        expires_at: None,
+                    },
+                );
+            }
+            if minutes > OVERRIDE_MAX_MINUTES {
+                return (
+                    false,
+                    OverrideResponse {
+                        id: req.id.clone(),
+                        status: "error".to_string(),
+                        message: format!("minutes exceeds max allowed ({})", OVERRIDE_MAX_MINUTES),
+                        expires_at: None,
+                    },
+                );
+            }
+
+            let now = now_ts();
+            let expires_at = now.saturating_add(minutes.saturating_mul(60));
+            let normalized = path.clone();
+            overrides.retain(|entry| trim_trailing_slashes(entry.path()) != normalized.as_str());
+            overrides.push(TemporaryOverrideEntry::Rule(TemporaryOverrideRule {
+                path,
+                expires_at: Some(expires_at),
+                created_at: Some(now),
+                created_by: Some("es-guard-helper".to_string()),
+            }));
+
+            (
+                true,
+                OverrideResponse {
+                    id: req.id.clone(),
+                    status: "ok".to_string(),
+                    message: format!("override granted for {} minute(s)", minutes),
+                    expires_at: Some(expires_at),
+                },
+            )
+        },
+        "remove" => {
+            let raw_path = match req.path.as_deref() {
+                Some(path) => path.trim(),
+                None => "",
+            };
+            if raw_path.is_empty() {
+                return (
+                    false,
+                    OverrideResponse {
+                        id: req.id.clone(),
+                        status: "error".to_string(),
+                        message: "missing path".to_string(),
+                        expires_at: None,
+                    },
+                );
+            }
+            let path = match normalize_absolute_path(raw_path) {
+                Some(path) => path,
+                None => {
+                    return (
+                        false,
+                        OverrideResponse {
+                            id: req.id.clone(),
+                            status: "error".to_string(),
+                            message: "invalid absolute path".to_string(),
+                            expires_at: None,
+                        },
+                    );
+                },
+            };
+            let before = overrides.len();
+            overrides.retain(|entry| trim_trailing_slashes(entry.path()) != path.as_str());
+            let removed = before.saturating_sub(overrides.len());
+            (
+                removed > 0,
+                OverrideResponse {
+                    id: req.id.clone(),
+                    status: "ok".to_string(),
+                    message: format!("removed {} override entries", removed),
+                    expires_at: None,
+                },
+            )
+        },
+        "clear" => {
+            let changed = !overrides.is_empty();
+            overrides.clear();
+            (
+                changed,
+                OverrideResponse {
+                    id: req.id.clone(),
+                    status: "ok".to_string(),
+                    message: "all overrides cleared".to_string(),
+                    expires_at: None,
+                },
+            )
+        },
+        _ => (
+            false,
+            OverrideResponse {
+                id: req.id.clone(),
+                status: "error".to_string(),
+                message: format!("unknown action: {}", req.action),
+                expires_at: None,
+            },
+        ),
+    }
+}
+
+fn write_override_response(response_path: &Path, response: &OverrideResponse) -> io::Result<()> {
+    let mut file = open_truncate_no_follow(response_path, RUNTIME_OVERRIDE_FILE_MODE)?;
+    verify_regular_file(&file, response_path)?;
+    let content = serde_json::to_vec(response).map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+    file.write_all(&content)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+fn process_override_requests(
+    request_dir: &Path,
+    policy: &SecurityPolicy,
+    home: &str,
+    overrides: &mut Vec<TemporaryOverrideEntry>,
+) -> bool {
+    let guard_dir = match ensure_guard_dirs(home) {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("[override] cannot use guard dir: {}", err);
+            return false;
+        },
+    };
+
+    let expected_request_dir = guard_dir.join("override-requests");
+    let active_request_dir = if request_dir == expected_request_dir.as_path() {
+        request_dir
+    } else {
+        &expected_request_dir
+    };
+
+    if let Err(err) = ensure_dir_not_symlink(active_request_dir, DEFAULT_DIR_MODE) {
+        eprintln!("[override] cannot use request dir: {}", err);
+        return false;
+    }
+
+    let mut request_files: Vec<PathBuf> = match fs::read_dir(active_request_dir) {
+        Ok(iter) => iter
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".request.json"))
+            })
+            .collect(),
+        Err(err) => {
+            eprintln!("[override] failed to scan request dir: {}", err);
+            return false;
+        },
+    };
+    request_files.sort();
+
+    let mut changed = false;
+    for request_path in request_files {
+        let request_id = request_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".request.json"))
+            .map(sanitize_component)
+            .unwrap_or_else(|| format!("unknown-{}", now_ts()));
+        let response_path = request_response_path(active_request_dir, &request_id);
+
+        let request = match open_read_no_follow(&request_path).and_then(|mut file| {
+            verify_regular_file(&file, &request_path)?;
+            let mut content = String::new();
+            file.read_to_string(&mut content)?;
+            serde_json::from_str::<OverrideRequest>(&content)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
+        }) {
+            Ok(req) => req,
+            Err(err) => {
+                let _ = write_override_response(
+                    &response_path,
+                    &OverrideResponse {
+                        id: request_id.clone(),
+                        status: "error".to_string(),
+                        message: format!("invalid request: {}", err),
+                        expires_at: None,
+                    },
+                );
+                let _ = fs::remove_file(&request_path);
+                continue;
+            },
+        };
+
+        let mut request = request;
+        request.id = request_id.clone();
+        let response_path = request_response_path(active_request_dir, request.id.as_str());
+        let (request_changed, response) = apply_override_request(&request, policy, home, overrides);
+        if request_changed {
+            changed = true;
+        }
+        if let Err(err) = write_override_response(&response_path, &response) {
+            eprintln!("[override] failed to write response: {}", err);
+        }
+        if let Err(err) = fs::remove_file(&request_path) {
+            eprintln!("[override] failed to remove request file: {}", err);
+        }
+    }
+
+    changed
+}
+
 fn is_system_temp(path: &str, home: &str) -> bool {
     path_prefix_match(path, &format!("{}/.Trash", home))
         || path_prefix_match(path, "/private/tmp")
@@ -515,17 +1051,13 @@ fn is_system_temp(path: &str, home: &str) -> bool {
 }
 
 fn log_denial(home: &str, record: &DenialRecord) {
-    let codex_dir = PathBuf::from(home).join(".codex");
-    if let Err(err) = ensure_dir_not_symlink(&codex_dir, DEFAULT_DIR_MODE) {
-        eprintln!("[log] cannot use codex dir: {}", err);
-        return;
-    }
-
-    let guard_dir = codex_dir.join("es-guard");
-    if let Err(err) = ensure_dir_not_symlink(&guard_dir, DEFAULT_DIR_MODE) {
-        eprintln!("[log] cannot use guard dir: {}", err);
-        return;
-    }
+    let guard_dir = match ensure_guard_dirs(home) {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("[log] cannot use guard dir: {}", err);
+            return;
+        },
+    };
 
     let log_path = guard_dir.join("denials.jsonl");
     let feedback_path = guard_dir.join("last_denial.txt");
@@ -561,7 +1093,7 @@ fn log_denial(home: &str, record: &DenialRecord) {
          \n\
          If you must permanently delete via AI, request one-time override with TTL:\n\
          es-guard-override --minutes 3 {}\n\
-         (Use --no-expire only for emergency/manual cleanup)\n\
+         (Short TTL only; no-expire is rejected by helper)\n\
          Then retry the operation.\n",
         record.op, record.path, dest_info, record.zone, record.process, record.ancestor, record.path, record.path
     );
@@ -842,6 +1374,18 @@ fn should_deny(
 mod tests {
     use super::*;
 
+    fn test_policy() -> SecurityPolicy {
+        SecurityPolicy {
+            protected_zones: vec!["/Users/jqwang/project".to_string()],
+            temporary_overrides: vec![],
+            auto_protect_home_digit_children: true,
+            allow_vcs_metadata_in_ai_context: true,
+            trusted_tools: default_trusted_tools(),
+            ai_agent_patterns: default_ai_agent_patterns(),
+            allow_trusted_tools_in_ai_context: false,
+        }
+    }
+
     #[test]
     fn legacy_override_path_still_decodes_and_applies() {
         let json = r#"{
@@ -928,6 +1472,19 @@ mod tests {
             "/Users/jqwang/projectx",
             "/Users/jqwang/project"
         ));
+    }
+
+    #[test]
+    fn normalize_absolute_path_collapses_dot_segments() {
+        assert_eq!(
+            normalize_absolute_path("/Users/jqwang/project/./a/../b.txt"),
+            Some("/Users/jqwang/project/b.txt".to_string())
+        );
+        assert_eq!(
+            normalize_absolute_path("/Users/jqwang/project/../../.ssh/id_rsa"),
+            Some("/Users/.ssh/id_rsa".to_string())
+        );
+        assert_eq!(normalize_absolute_path("relative/path"), None);
     }
 
     #[test]
@@ -1072,14 +1629,74 @@ mod tests {
             &policy
         ));
     }
+
+    #[test]
+    fn apply_override_request_rejects_no_expire() {
+        let policy = test_policy();
+        let mut overrides = Vec::new();
+        let request = OverrideRequest {
+            id: "req-1".to_string(),
+            action: "grant".to_string(),
+            path: Some("/Users/jqwang/project/file.txt".to_string()),
+            minutes: Some(0),
+        };
+
+        let (changed, response) = apply_override_request(&request, &policy, "/Users/jqwang", &mut overrides);
+        assert!(!changed);
+        assert_eq!(response.status, "error");
+        assert!(response.message.contains("no-expire"));
+        assert!(overrides.is_empty());
+    }
+
+    #[test]
+    fn apply_override_request_rejects_zone_root_path() {
+        let policy = test_policy();
+        let mut overrides = Vec::new();
+        let request = OverrideRequest {
+            id: "req-2".to_string(),
+            action: "grant".to_string(),
+            path: Some("/Users/jqwang/project".to_string()),
+            minutes: Some(3),
+        };
+
+        let (changed, response) = apply_override_request(&request, &policy, "/Users/jqwang", &mut overrides);
+        assert!(!changed);
+        assert_eq!(response.status, "error");
+        assert!(response.message.contains("broad path"));
+        assert!(overrides.is_empty());
+    }
 }
 
 fn main() {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let policy_path = format!("{}/.codex/es_policy.json", home);
     let home_for_reload = home.clone();
+    let runtime_override_path = runtime_override_db_path(&home);
+    let request_dir_path = override_request_dir(&home);
 
-    let initial_policy = load_policy(&policy_path).unwrap_or_default();
+    let mut initial_policy = load_policy(&policy_path).unwrap_or_default();
+    initial_policy.temporary_overrides.clear();
+    let mut runtime_overrides = match load_runtime_overrides(&runtime_override_path) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!("[override] failed to load runtime overrides: {}", err);
+            Vec::new()
+        },
+    };
+    initial_policy.temporary_overrides = runtime_overrides.clone();
+    if initial_policy.sanitize_overrides(now_ts(), &home) {
+        runtime_overrides = initial_policy.temporary_overrides.clone();
+        if let Err(err) = save_runtime_overrides(&runtime_override_path, &runtime_overrides) {
+            eprintln!(
+                "[override] failed to persist sanitized runtime overrides: {}",
+                err
+            );
+        }
+    }
+    if let Err(err) = save_policy(&policy_path, &initial_policy) {
+        eprintln!("[policy] failed to write initial policy snapshot: {}", err);
+    }
+
     let global_policy = Arc::new(Mutex::new(initial_policy));
 
     // Process ancestry cache (cleared on policy reload)
@@ -1089,53 +1706,114 @@ fn main() {
     let policy_clone = global_policy.clone();
     let cache_clone = ancestor_cache.clone();
     let path_clone = policy_path.clone();
+    let override_path_clone = runtime_override_path.clone();
+    let request_path_clone = request_dir_path.clone();
     thread::spawn(move || {
-        let mut last_mtime = SystemTime::UNIX_EPOCH;
+        let mut static_policy = load_policy(&path_clone).unwrap_or_default();
+        static_policy.temporary_overrides.clear();
+        let mut runtime_overrides = match load_runtime_overrides(&override_path_clone) {
+            Ok(entries) => entries,
+            Err(err) => {
+                eprintln!("[override] failed to load runtime overrides: {}", err);
+                Vec::new()
+            },
+        };
+        let mut last_policy_mtime = fs::metadata(&path_clone)
+            .and_then(|meta| meta.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut last_override_mtime = fs::metadata(&override_path_clone)
+            .and_then(|meta| meta.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+
         loop {
-            let mut snapshot_to_save: Option<SecurityPolicy> = None;
+            let mut changed = false;
+            let mut overrides_changed = false;
+            let mut should_mirror_policy = false;
 
             if let Ok(metadata) = fs::metadata(&path_clone) {
                 if let Ok(mtime) = metadata.modified() {
-                    if mtime != last_mtime {
+                    if mtime != last_policy_mtime {
                         if let Some(mut new_policy) = load_policy(&path_clone) {
-                            let changed_by_sanitize = new_policy.sanitize_overrides(now_ts(), &home_for_reload);
-                            if let Ok(mut lock) = policy_clone.lock() {
-                                *lock = new_policy.clone();
-                                // Clear cache on policy change
-                                if let Ok(mut c) = cache_clone.lock() {
-                                    c.clear();
-                                }
-                                println!("[policy] reloaded");
-                                last_mtime = mtime;
-                                if changed_by_sanitize {
-                                    snapshot_to_save = Some(new_policy);
-                                }
-                            }
+                            new_policy.temporary_overrides.clear();
+                            static_policy = new_policy;
+                            last_policy_mtime = mtime;
+                            changed = true;
+                            should_mirror_policy = true;
+                            println!("[policy] reloaded static config");
                         }
                     }
                 }
             }
 
-            {
+            if let Ok(metadata) = fs::metadata(&override_path_clone) {
+                if let Ok(mtime) = metadata.modified() {
+                    if mtime != last_override_mtime {
+                        match load_runtime_overrides(&override_path_clone) {
+                            Ok(entries) => {
+                                runtime_overrides = entries;
+                                last_override_mtime = mtime;
+                                changed = true;
+                            },
+                            Err(err) => {
+                                eprintln!("[override] failed to reload runtime overrides: {}", err);
+                            },
+                        }
+                    }
+                }
+            }
+
+            if process_override_requests(
+                &request_path_clone,
+                &static_policy,
+                &home_for_reload,
+                &mut runtime_overrides,
+            ) {
+                changed = true;
+                overrides_changed = true;
+            }
+
+            let mut combined_policy = static_policy.clone();
+            combined_policy.temporary_overrides = runtime_overrides.clone();
+            if combined_policy.sanitize_overrides(now_ts(), &home_for_reload) {
+                runtime_overrides = combined_policy.temporary_overrides.clone();
+                combined_policy.temporary_overrides = runtime_overrides.clone();
+                changed = true;
+                overrides_changed = true;
+            }
+
+            if overrides_changed {
+                if let Err(err) = save_runtime_overrides(&override_path_clone, &runtime_overrides) {
+                    eprintln!("[override] failed to persist runtime overrides: {}", err);
+                } else {
+                    should_mirror_policy = true;
+                    if let Ok(metadata) = fs::metadata(&override_path_clone) {
+                        if let Ok(mtime) = metadata.modified() {
+                            last_override_mtime = mtime;
+                        }
+                    }
+                }
+            }
+
+            if changed {
+                combined_policy.temporary_overrides = runtime_overrides.clone();
                 if let Ok(mut lock) = policy_clone.lock() {
-                    if lock.sanitize_overrides(now_ts(), &home_for_reload) {
-                        snapshot_to_save = Some(lock.clone());
-                        if let Ok(mut c) = cache_clone.lock() {
-                            c.clear();
-                        }
+                    *lock = combined_policy.clone();
+                    if let Ok(mut c) = cache_clone.lock() {
+                        c.clear();
                     }
                 }
             }
 
-            if let Some(policy_snapshot) = snapshot_to_save {
-                if let Err(err) = save_policy(&path_clone, &policy_snapshot) {
-                    eprintln!("[policy] failed to persist sanitized policy: {}", err);
+            if should_mirror_policy {
+                if let Err(err) = save_policy(&path_clone, &combined_policy) {
+                    eprintln!("[policy] failed to mirror runtime overrides: {}", err);
                 } else if let Ok(metadata) = fs::metadata(&path_clone) {
                     if let Ok(mtime) = metadata.modified() {
-                        last_mtime = mtime;
+                        last_policy_mtime = mtime;
                     }
                 }
             }
+
             thread::sleep(Duration::from_secs(1));
         }
     });

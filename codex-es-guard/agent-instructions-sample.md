@@ -8,6 +8,7 @@ When you encounter this error:
 2. First use `es-guard-quarantine <path>` to move target into `./temp` in current directory
 3. Only if permanent deletion is still needed, ask human approval then run `es-guard-override --minutes 3 <path>` (or another short TTL)
    - Never request override for broad paths like `/`, `$HOME`, or repository root unless human explicitly confirms emergency cleanup
+   - No-expire override is disabled; keep TTL short and explicit
    - Do not attempt bypass via `git rm`, `git clean`, or language-level file APIs; these are treated as destructive flows too
 4. After override reloads, retry the original operation
 

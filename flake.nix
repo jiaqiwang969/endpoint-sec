@@ -116,7 +116,7 @@
 
             system.activationScripts.postActivation.text = let
               # Nix is the source of truth for protected_zones.
-              # temporary_overrides is runtime-only (managed by AI agent / user).
+              # temporary_overrides is runtime-only and managed by codex-es-guard root helper.
               protectedZonesJson = builtins.toJSON cfg.protectedZones;
               autoProtectHomeDigitChildrenDefaultJson =
                 if cfg.autoProtectHomeDigitChildrenDefault then "true" else "false";
@@ -145,21 +145,25 @@
                 echo "codex-es-guard: daemon restarted"
               fi
 
-              # Sync protected_zones from Nix config (always update).
-              # Preserve existing temporary_overrides from runtime.
+              # Root-owned runtime override store (authoritative).
+              RUNTIME_OVERRIDE_DIR="/var/db/codex-es-guard"
+              mkdir -p "$RUNTIME_OVERRIDE_DIR"
+              chown root:wheel "$RUNTIME_OVERRIDE_DIR"
+              chmod 700 "$RUNTIME_OVERRIDE_DIR"
+
+              # Sync static policy from Nix config (always update).
+              # temporary_overrides field is mirror-only and filled by daemon.
               POLICY_DIR="${homeDir}/.codex"
               POLICY_FILE="$POLICY_DIR/es_policy.json"
               mkdir -p "$POLICY_DIR"
               chown ${cfg.user}:staff "$POLICY_DIR"
 
-              EXISTING_OVERRIDES="[]"
               EXISTING_TRUSTED_TOOLS="null"
               EXISTING_AI_PATTERNS="null"
               EXISTING_ALLOW_VCS_META_IN_AI="null"
               EXISTING_ALLOW_TRUSTED_IN_AI="null"
               EXISTING_AUTO_PROTECT_HOME_DIGIT_CHILDREN="null"
               if [ -f "$POLICY_FILE" ]; then
-                EXISTING_OVERRIDES=$(${pkgs.jq}/bin/jq -c '.temporary_overrides // []' "$POLICY_FILE" 2>/dev/null || echo "[]")
                 EXISTING_TRUSTED_TOOLS=$(${pkgs.jq}/bin/jq -c '.trusted_tools // null' "$POLICY_FILE" 2>/dev/null || echo "null")
                 EXISTING_AI_PATTERNS=$(${pkgs.jq}/bin/jq -c '.ai_agent_patterns // null' "$POLICY_FILE" 2>/dev/null || echo "null")
                 EXISTING_ALLOW_VCS_META_IN_AI=$(${pkgs.jq}/bin/jq -c '.allow_vcs_metadata_in_ai_context // null' "$POLICY_FILE" 2>/dev/null || echo "null")
@@ -169,14 +173,13 @@
 
               ${pkgs.jq}/bin/jq -n \
                 --argjson zones '${protectedZonesJson}' \
-                --argjson overrides "$EXISTING_OVERRIDES" \
                 --argjson trustedTools "$EXISTING_TRUSTED_TOOLS" \
                 --argjson aiPatterns "$EXISTING_AI_PATTERNS" \
                 --argjson allowVcsMetaInAi "$EXISTING_ALLOW_VCS_META_IN_AI" \
                 --argjson allowTrustedInAi "$EXISTING_ALLOW_TRUSTED_IN_AI" \
                 --argjson autoProtectHomeDigitChildren "$EXISTING_AUTO_PROTECT_HOME_DIGIT_CHILDREN" \
                 --argjson autoProtectHomeDigitChildrenDefault ${autoProtectHomeDigitChildrenDefaultJson} \
-                '({protected_zones: $zones, temporary_overrides: $overrides}
+                '({protected_zones: $zones, temporary_overrides: []}
                   + {auto_protect_home_digit_children: (
                       if $autoProtectHomeDigitChildren == null
                       then $autoProtectHomeDigitChildrenDefault
@@ -194,6 +197,10 @@
               # Ensure log directory
               mkdir -p "${homeDir}/.codex/es-guard"
               chown ${cfg.user}:staff "${homeDir}/.codex/es-guard"
+              chmod 700 "${homeDir}/.codex/es-guard"
+              mkdir -p "${homeDir}/.codex/es-guard/override-requests"
+              chown ${cfg.user}:staff "${homeDir}/.codex/es-guard/override-requests"
+              chmod 700 "${homeDir}/.codex/es-guard/override-requests"
             '';
           };
         };

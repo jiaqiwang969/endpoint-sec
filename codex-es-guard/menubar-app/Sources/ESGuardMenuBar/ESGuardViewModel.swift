@@ -296,6 +296,9 @@ final class ESGuardViewModel: ObservableObject {
     private var recordsLoadToken: UInt64 = 0
 
     init() {
+        if autoRevokeMinutes <= 0 {
+            autoRevokeMinutes = 3
+        }
         refresh()
         setupWatchers()
     }
@@ -658,9 +661,13 @@ final class ESGuardViewModel: ObservableObject {
         }
 
         let revokeMinutes = autoRevokeMinutes
+        guard revokeMinutes > 0 else {
+            presentMessage("放行失败：已禁用不过期放行，请选择 1-30 分钟", success: false, clearAfter: 7.0)
+            return
+        }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let env = ["ES_GUARD_OVERRIDE_MINUTES": "\(max(revokeMinutes, 0))"]
+            let env = ["ES_GUARD_OVERRIDE_MINUTES": "\(max(revokeMinutes, 1))"]
             let result = runProcessSync(
                 launchPath: "/usr/local/bin/es-guard-override",
                 arguments: [cleanPath],
@@ -669,17 +676,10 @@ final class ESGuardViewModel: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 if let result, result.status == 0 {
-                    if revokeMinutes > 0 {
-                        self.presentMessage(
-                            "成功将 \(URL(fileURLWithPath: cleanPath).lastPathComponent) 设为临时放行（\(revokeMinutes) 分钟）",
-                            success: true
-                        )
-                    } else {
-                        self.presentMessage(
-                            "成功放行 \(URL(fileURLWithPath: cleanPath).lastPathComponent)（不过期，请手动清理）",
-                            success: true
-                        )
-                    }
+                    self.presentMessage(
+                        "成功将 \(URL(fileURLWithPath: cleanPath).lastPathComponent) 设为临时放行（\(revokeMinutes) 分钟）",
+                        success: true
+                    )
                     self.refresh()
                     return
                 }
@@ -746,15 +746,55 @@ final class ESGuardViewModel: ObservableObject {
     }
     
     func removeOverride(path: String) {
-        let normalizedPath = trimTrailingSlashes(path)
-        mutatePolicyOnDisk {
-            $0.temporaryOverrides.removeAll(where: { trimTrailingSlashes($0.path) == normalizedPath })
+        guard let cleanPath = normalizedAbsolutePath(from: path) else {
+            presentMessage("撤销失败：路径无效", success: false, clearAfter: 6.0)
+            return
         }
+        submitOverrideCommand(
+            arguments: ["--remove", cleanPath],
+            successMessage: "已撤销临时放行：\(URL(fileURLWithPath: cleanPath).lastPathComponent)",
+            failurePrefix: "撤销放行失败"
+        )
     }
     
     func clearAllOverrides() {
-        mutatePolicyOnDisk(successMessage: "已清除所有临时放行路径", successClearAfter: 3.0) {
-            $0.temporaryOverrides = []
+        submitOverrideCommand(
+            arguments: ["--clear"],
+            successMessage: "已清空全部临时放行路径",
+            failurePrefix: "清空放行失败",
+            clearAfter: 3.0
+        )
+    }
+
+    private func submitOverrideCommand(
+        arguments: [String],
+        successMessage: String,
+        failurePrefix: String,
+        clearAfter: TimeInterval = 5.0
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = runProcessSync(
+                launchPath: "/usr/local/bin/es-guard-override",
+                arguments: arguments
+            )
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                if let result, result.status == 0 {
+                    self.presentMessage(successMessage, success: true, clearAfter: clearAfter)
+                    self.refresh()
+                    return
+                }
+                if let result {
+                    let detail = result.stderr.isEmpty ? result.stdout : result.stderr
+                    if detail.isEmpty {
+                        self.presentMessage("\(failurePrefix) (退出码: \(result.status))", success: false, clearAfter: 6.0)
+                    } else {
+                        self.presentMessage("\(failurePrefix): \(detail)", success: false, clearAfter: 6.0)
+                    }
+                } else {
+                    self.presentMessage("\(failurePrefix)：无法调用 es-guard-override", success: false, clearAfter: 6.0)
+                }
+            }
         }
     }
 

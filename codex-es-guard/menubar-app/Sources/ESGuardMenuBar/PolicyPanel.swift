@@ -210,22 +210,22 @@ struct PolicyPanel: View {
                     Button(role: .destructive) {
                         showClearOverridesAlert = true
                     } label: {
-                        Label("一键清空 temporary_overrides（写入 es_policy.json）", systemImage: "trash")
+                        Label("一键清空 temporary_overrides（经 root helper）", systemImage: "trash")
                     }
                     .disabled(viewModel.policy.temporaryOverrides.isEmpty)
 
-                    Text("仅清空 es_policy.json 的 temporary_overrides，不会修改 protected_zones。")
+                    Text("调用 es-guard-override --clear 清空运行时放行，不会修改 protected_zones。")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
                 
                 Section(header: Text("UI 偏好设置 (Preferences)")) {
                     Picker("放行路径的自动过期时间", selection: $viewModel.autoRevokeMinutes) {
-                        Text("从不过期 (不推荐)").tag(0)
                         Text("1 分钟").tag(1)
                         Text("3 分钟 (默认)").tag(3)
                         Text("5 分钟").tag(5)
                         Text("10 分钟").tag(10)
+                        Text("30 分钟 (上限)").tag(30)
                     }
                     .pickerStyle(MenuPickerStyle())
                     .font(.caption)
@@ -249,7 +249,7 @@ struct PolicyPanel: View {
                 viewModel.clearAllOverrides()
             }
         } message: {
-            Text("这会把 es_policy.json 中 temporary_overrides 清空，用于重置临时放行状态。")
+            Text("这会通过 root helper 清空 runtime temporary_overrides，用于重置临时放行状态。")
         }
     }
     
@@ -263,7 +263,7 @@ struct PolicyPanel: View {
 
     private func overrideStatusText(_ override: TemporaryOverride) -> String {
         guard let expiresAt = override.expiresAt else {
-            return "不过期（需手动清理）"
+            return "不过期（legacy/manual，建议清理）"
         }
 
         let now = Int(Date().timeIntervalSince1970)
