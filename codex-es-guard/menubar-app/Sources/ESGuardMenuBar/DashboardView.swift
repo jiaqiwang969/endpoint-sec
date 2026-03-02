@@ -22,8 +22,8 @@ struct DashboardView: View {
                             Circle()
                                 .fill(
                                     viewModel.guardRunning
-                                        ? (viewModel.hasUnacknowledgedRecords ? Color.orange : Color.green)
-                                        : Color.red
+                                        ? (viewModel.hasUnacknowledgedRecords ? ApplePalette.warning : ApplePalette.success)
+                                        : ApplePalette.danger
                                 )
                                 .frame(width: 8, height: 8)
                             Text(
@@ -34,14 +34,14 @@ struct DashboardView: View {
                             .font(.caption)
                             .foregroundColor(
                                 viewModel.guardRunning
-                                    ? (viewModel.hasUnacknowledgedRecords ? .orange : .secondary)
-                                    : .red
+                                    ? (viewModel.hasUnacknowledgedRecords ? ApplePalette.warning : .secondary)
+                                    : ApplePalette.danger
                             )
                         }
 
                         Text(actionOrStateHint)
                             .font(.caption2)
-                            .foregroundColor(viewModel.daemonActionInProgress ? .orange : .secondary)
+                            .foregroundColor(viewModel.daemonActionInProgress ? ApplePalette.warning : .secondary)
                     }
                 }
 
@@ -74,11 +74,11 @@ struct DashboardView: View {
                     .buttonStyle(.plain)
                     .background(
                         Capsule()
-                            .fill(Color(NSColor.controlBackgroundColor))
+                            .fill(ApplePalette.panelBackground)
                     )
                     .overlay(
                         Capsule()
-                            .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+                            .stroke(ApplePalette.border, lineWidth: 1)
                     )
                     .disabled(viewModel.daemonActionInProgress)
                     .help("重启守护进程")
@@ -134,14 +134,15 @@ struct DashboardView: View {
                     NSApplication.shared.terminate(nil)
                 }
                 .buttonStyle(.borderless)
-                .foregroundColor(.red)
+                .foregroundColor(ApplePalette.danger)
                 .help("这只会退出监控界面，底层安全守护进程将继续运行")
             }
             .padding(.horizontal)
             .padding(.vertical, 8)
-            .background(Color(NSColor.controlBackgroundColor))
+            .background(ApplePalette.panelBackground)
         }
         .frame(width: 420)
+        .tint(ApplePalette.accent)
         .onAppear {
             viewModel.acknowledgeRecords() // 用户打开了面板，清除警报
         }
@@ -179,7 +180,7 @@ private struct DaemonCapsuleControl: View {
             capsuleButton(
                 title: "开启",
                 isActive: guardRunning,
-                tint: .green,
+                tint: ApplePalette.success,
                 showProgress: actionInProgress && currentAction == .starting,
                 disabled: guardRunning || actionInProgress,
                 action: onStart
@@ -188,7 +189,7 @@ private struct DaemonCapsuleControl: View {
             capsuleButton(
                 title: "关闭",
                 isActive: !guardRunning,
-                tint: .red,
+                tint: ApplePalette.danger,
                 showProgress: actionInProgress && currentAction == .stopping,
                 disabled: !guardRunning || actionInProgress,
                 action: onStop
@@ -197,11 +198,11 @@ private struct DaemonCapsuleControl: View {
         .padding(3)
         .background(
             Capsule()
-                .fill(Color(NSColor.controlBackgroundColor))
+                .fill(ApplePalette.panelBackground)
         )
         .overlay(
             Capsule()
-                .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+                .stroke(ApplePalette.border, lineWidth: 1)
         )
     }
 

@@ -65,7 +65,7 @@ struct RecordsPanel: View {
                 }
             }
             .padding(6)
-            .background(Color(NSColor.controlBackgroundColor))
+            .background(ApplePalette.panelBackground)
             .cornerRadius(6)
             .padding(.horizontal)
             .padding(.bottom, 8)
@@ -75,7 +75,7 @@ struct RecordsPanel: View {
                     Spacer()
                     Image(systemName: "shield.checkmark.fill")
                         .font(.largeTitle)
-                        .foregroundColor(.green)
+                        .foregroundColor(ApplePalette.success)
                     Text("未查询到匹配的拦截记录")
                         .foregroundColor(.secondary)
                         .padding(.top, 8)
@@ -99,13 +99,13 @@ struct RecordRow: View {
     private func getAgentColor(for name: String) -> Color {
         let nameLower = name.lowercased()
         if nameLower.contains("codex") {
-            return .purple
+            return .indigo.opacity(0.88)
         } else if nameLower.contains("claude") {
-            return .orange
+            return ApplePalette.warning.opacity(0.88)
         } else if nameLower.contains("copilot") {
-            return .teal
+            return .teal.opacity(0.88)
         } else {
-            return .gray
+            return .secondary.opacity(0.75)
         }
     }
     
@@ -114,7 +114,7 @@ struct RecordRow: View {
             HStack {
                 Text(record.op == "unlink" ? "DELETE" : "MOVE")
                     .font(.system(.caption, design: .monospaced).bold())
-                    .foregroundColor(record.op == "unlink" ? .red : .blue)
+                    .foregroundColor(record.op == "unlink" ? ApplePalette.danger : ApplePalette.info)
                 
                 Text(URL(fileURLWithPath: record.path).lastPathComponent)
                     .font(.callout.bold())

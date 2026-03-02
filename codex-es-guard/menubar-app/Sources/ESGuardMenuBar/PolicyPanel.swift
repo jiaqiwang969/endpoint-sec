@@ -22,7 +22,7 @@ struct PolicyPanel: View {
                         .font(.caption)
                 }
                 .buttonStyle(.plain)
-                .foregroundColor(.blue)
+                .foregroundColor(ApplePalette.accent)
             }
             .padding(.horizontal)
 
@@ -74,7 +74,7 @@ struct PolicyPanel: View {
                             showClearOverridesAlert = true
                         }
                         .font(.caption)
-                        .foregroundColor(.red)
+                        .foregroundColor(ApplePalette.danger)
                         .buttonStyle(PlainButtonStyle())
                     }
                 }) {
@@ -87,12 +87,12 @@ struct PolicyPanel: View {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(override.path)
                                         .font(.system(.caption, design: .monospaced))
-                                        .foregroundColor(.orange)
+                                        .foregroundColor(ApplePalette.warning)
 
                                     TimelineView(.periodic(from: .now, by: 1.0)) { _ in
                                         Text(overrideStatusText(override))
                                             .font(.caption2)
-                                            .foregroundColor(override.isExpired ? .red : .secondary)
+                                            .foregroundColor(override.isExpired ? ApplePalette.danger : .secondary)
                                     }
 
                                     if let meta = overrideMetaText(override) {
@@ -106,7 +106,7 @@ struct PolicyPanel: View {
                                     viewModel.removeOverride(path: override.path)
                                 }) {
                                     Image(systemName: "xmark.circle.fill")
-                                        .foregroundColor(.red)
+                                        .foregroundColor(ApplePalette.danger)
                                 }
                                 .buttonStyle(PlainButtonStyle())
                             }
@@ -128,17 +128,17 @@ struct PolicyPanel: View {
                     let vcsMetaInAI = viewModel.policy.allowVCSMetadataInAIContext ?? true
                     Text("AI 上下文 Git/JJ 元数据维护(.git/.jj): " + (vcsMetaInAI ? "开启 (推荐)" : "关闭 (更严格)"))
                         .font(.caption)
-                        .foregroundColor(vcsMetaInAI ? .secondary : .orange)
+                        .foregroundColor(vcsMetaInAI ? .secondary : ApplePalette.warning)
 
                     let autoProtectHomeDigitChildren = viewModel.policy.autoProtectHomeDigitChildren ?? true
                     Text("HOME 数字前缀目录自动保护: " + (autoProtectHomeDigitChildren ? "开启 (推荐)" : "关闭"))
                         .font(.caption)
-                        .foregroundColor(autoProtectHomeDigitChildren ? .secondary : .orange)
+                        .foregroundColor(autoProtectHomeDigitChildren ? .secondary : ApplePalette.warning)
 
                     let trustedInAI = viewModel.policy.allowTrustedToolsInAIContext ?? false
                     Text("AI 上下文信任工具放行: " + (trustedInAI ? "开启 (兼容模式)" : "关闭 (推荐更安全)"))
                         .font(.caption)
-                        .foregroundColor(trustedInAI ? .orange : .secondary)
+                        .foregroundColor(trustedInAI ? ApplePalette.warning : .secondary)
                 }
 
                 Section(header: Text("高级安全开关")) {

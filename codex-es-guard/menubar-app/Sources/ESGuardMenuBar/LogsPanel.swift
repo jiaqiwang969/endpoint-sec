@@ -19,7 +19,7 @@ struct LogsPanel: View {
                 Spacer()
                 
                 Toggle("仅查看错误", isOn: $showOnlyErrors)
-                    .toggleStyle(SwitchToggleStyle(tint: .red))
+                    .toggleStyle(SwitchToggleStyle(tint: ApplePalette.danger))
                     .controlSize(.small)
                 
                 Button(action: {
@@ -43,13 +43,13 @@ struct LogsPanel: View {
                         ForEach(filteredLogs) { line in
                             Text(line.text)
                                 .font(.system(size: 10, design: .monospaced))
-                                .foregroundColor(line.isError ? .red : .primary)
+                                .foregroundColor(line.isError ? ApplePalette.danger : .primary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .textSelection(.enabled)
                         }
                     }
                     .padding(8)
-                    .background(Color(NSColor.textBackgroundColor))
+                    .background(ApplePalette.textBackground)
                     .cornerRadius(4)
                 }
                 .padding(.horizontal)

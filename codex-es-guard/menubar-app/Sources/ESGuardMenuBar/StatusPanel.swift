@@ -16,9 +16,9 @@ struct StatusPanel: View {
                         .font(.headline)
                     
                     HStack {
-                        StatBox(title: "总计拦截", value: "\(viewModel.totalIntercepts)", color: .orange)
-                        StatBox(title: "删除 (DELETE)", value: "\(viewModel.totalDeletes)", color: .red)
-                        StatBox(title: "移动 (MOVE)", value: "\(viewModel.totalMoves)", color: .blue)
+                        StatBox(title: "总计拦截", value: "\(viewModel.totalIntercepts)", color: ApplePalette.warning)
+                        StatBox(title: "删除 (DELETE)", value: "\(viewModel.totalDeletes)", color: ApplePalette.danger)
+                        StatBox(title: "移动 (MOVE)", value: "\(viewModel.totalMoves)", color: ApplePalette.info)
                     }
                 }
                 .padding(.horizontal)
@@ -55,7 +55,7 @@ struct StatusPanel: View {
                                     .font(.caption)
                             }
                             .buttonStyle(.plain)
-                            .foregroundColor(.blue)
+                            .foregroundColor(ApplePalette.accent)
                             .help("一键生成喂给 AI Agent 的报错提示词")
                         }
                     }
@@ -67,7 +67,7 @@ struct StatusPanel: View {
                                 .foregroundColor(.white)
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
-                                .background(lastRecord.op == "unlink" ? Color.red : Color.blue)
+                                .background(lastRecord.op == "unlink" ? ApplePalette.danger : ApplePalette.info)
                                 .cornerRadius(4)
                             
                             Text(lastRecord.process)
@@ -114,7 +114,7 @@ struct StatusPanel: View {
                                     .bold()
                             }
                             .buttonStyle(.borderedProminent)
-                            .tint(.orange)
+                            .tint(ApplePalette.warning)
                         }
                         .padding(.top, 4)
                     } else {
@@ -126,7 +126,7 @@ struct StatusPanel: View {
                     if !viewModel.overrideMessage.isEmpty {
                         Text(viewModel.overrideMessage)
                             .font(.caption)
-                            .foregroundColor(viewModel.overrideSuccess ? .green : .red)
+                            .foregroundColor(viewModel.overrideSuccess ? ApplePalette.success : ApplePalette.danger)
                             .padding(.top, 4)
                     }
                 }
@@ -144,7 +144,7 @@ struct StatusPanel: View {
                                 viewModel.requestQuarantine(for: feedbackPath)
                             }
                             .buttonStyle(.borderless)
-                            .foregroundColor(.orange)
+                            .foregroundColor(ApplePalette.warning)
                         }
                     }
 
@@ -155,7 +155,7 @@ struct StatusPanel: View {
                         .lineLimit(10)
                         .padding(8)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(NSColor.controlBackgroundColor))
+                        .background(ApplePalette.panelBackground)
                         .cornerRadius(6)
                 }
                 .padding(.horizontal)
@@ -182,7 +182,7 @@ struct StatusPanel: View {
                                 x: .value("Count", stat.deleteCount),
                                 y: .value("Agent", stat.agentName)
                             )
-                            .foregroundStyle(.red)
+                            .foregroundStyle(ApplePalette.danger)
                             .annotation(position: .overlay, alignment: .center) {
                                 if stat.deleteCount > 0 {
                                     Text("\(stat.deleteCount)")
@@ -196,7 +196,7 @@ struct StatusPanel: View {
                                 x: .value("Count", stat.moveCount),
                                 y: .value("Agent", stat.agentName)
                             )
-                            .foregroundStyle(.blue)
+                            .foregroundStyle(ApplePalette.info)
                             .annotation(position: .overlay, alignment: .center) {
                                 if stat.moveCount > 0 {
                                     Text("\(stat.moveCount)")
@@ -212,9 +212,9 @@ struct StatusPanel: View {
                         
                         // 图例
                         HStack {
-                            Circle().fill(Color.red).frame(width: 6, height: 6)
+                            Circle().fill(ApplePalette.danger).frame(width: 6, height: 6)
                             Text("尝试删除").font(.system(size: 10)).foregroundColor(.secondary)
-                            Circle().fill(Color.blue).frame(width: 6, height: 6)
+                            Circle().fill(ApplePalette.info).frame(width: 6, height: 6)
                             Text("尝试移动").font(.system(size: 10)).foregroundColor(.secondary)
                         }
                     }
@@ -244,7 +244,7 @@ struct StatBox: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(8)
-        .background(Color(NSColor.controlBackgroundColor))
+        .background(ApplePalette.panelBackground)
         .cornerRadius(6)
     }
 }
