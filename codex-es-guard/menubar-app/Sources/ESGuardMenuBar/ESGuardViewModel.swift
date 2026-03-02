@@ -206,6 +206,18 @@ private func pathPrefixMatch(_ path: String, prefix: String) -> Bool {
     return normalizedPath == normalizedPrefix || normalizedPath.hasPrefix(normalizedPrefix + "/")
 }
 
+private func homeDigitRoot(path: String, home: String) -> String? {
+    let normalizedPath = trimTrailingSlashes(path)
+    let normalizedHome = trimTrailingSlashes(home)
+    let homePrefix = normalizedHome + "/"
+    guard normalizedPath.hasPrefix(homePrefix) else { return nil }
+
+    let suffix = String(normalizedPath.dropFirst(homePrefix.count))
+    guard let firstComponent = suffix.split(separator: "/").first, !firstComponent.isEmpty else { return nil }
+    guard firstComponent.first?.isNumber == true else { return nil }
+    return normalizedHome + "/" + String(firstComponent)
+}
+
 private func acquireDirectoryLock(path: String, retries: Int = 100, sleepMs: UInt32 = 50) -> URL? {
     let lockURL = URL(fileURLWithPath: path)
     for _ in 0..<max(retries, 1) {
@@ -565,7 +577,11 @@ final class ESGuardViewModel: ObservableObject {
     }
 
     private func isInProtectedZone(_ path: String) -> Bool {
-        policy.protectedZones.contains(where: { pathPrefixMatch(path, prefix: $0) })
+        if policy.protectedZones.contains(where: { pathPrefixMatch(path, prefix: $0) }) {
+            return true
+        }
+        return (policy.autoProtectHomeDigitChildren ?? true)
+            && homeDigitRoot(path: path, home: homeDir) != nil
     }
 
     private func isDangerousBroadPath(_ path: String) -> Bool {
@@ -574,7 +590,15 @@ final class ESGuardViewModel: ObservableObject {
         if normalized == "/" || normalized == home {
             return true
         }
-        return policy.protectedZones.contains(where: { trimTrailingSlashes($0) == normalized })
+        if policy.protectedZones.contains(where: { trimTrailingSlashes($0) == normalized }) {
+            return true
+        }
+        if (policy.autoProtectHomeDigitChildren ?? true),
+           let autoRoot = homeDigitRoot(path: normalized, home: home),
+           trimTrailingSlashes(autoRoot) == normalized {
+            return true
+        }
+        return false
     }
 
     private func mutatePolicyOnDisk(
@@ -753,6 +777,17 @@ final class ESGuardViewModel: ObservableObject {
             successClearAfter: 6.0
         ) {
             $0.allowVCSMetadataInAIContext = enabled
+        }
+    }
+
+    func updateAutoProtectHomeDigitChildren(_ enabled: Bool) {
+        mutatePolicyOnDisk(
+            successMessage: enabled
+                ? "已开启：HOME 下数字前缀目录（如 01-agent/0x-lab）自动受保护"
+                : "已关闭：仅按 protected_zones 目录匹配（边界匹配）",
+            successClearAfter: 6.0
+        ) {
+            $0.autoProtectHomeDigitChildren = enabled
         }
     }
 }

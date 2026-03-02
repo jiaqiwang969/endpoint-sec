@@ -88,6 +88,7 @@ struct SecurityPolicy: Codable {
     var temporaryOverrides: [TemporaryOverride]
     var trustedTools: [String]?
     var aiAgentPatterns: [String]?
+    var autoProtectHomeDigitChildren: Bool? = nil
     var allowVCSMetadataInAIContext: Bool? = nil
     var allowTrustedToolsInAIContext: Bool? = nil
     
@@ -96,6 +97,7 @@ struct SecurityPolicy: Codable {
         case temporaryOverrides = "temporary_overrides"
         case trustedTools = "trusted_tools"
         case aiAgentPatterns = "ai_agent_patterns"
+        case autoProtectHomeDigitChildren = "auto_protect_home_digit_children"
         case allowVCSMetadataInAIContext = "allow_vcs_metadata_in_ai_context"
         case allowTrustedToolsInAIContext = "allow_trusted_tools_in_ai_context"
     }

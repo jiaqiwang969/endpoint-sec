@@ -183,6 +183,7 @@ es-guard-quarantine /path/to/file
       "created_by": "es-guard-override"
     }
   ],
+  "auto_protect_home_digit_children": true,
   "trusted_tools": ["git", "jj", "cargo", "rustup", "rustc", "swift", "nix", "make", "go", "docker"],
   "ai_agent_patterns": ["codex", "claude", "claude-code"],
   "allow_vcs_metadata_in_ai_context": true,
@@ -194,6 +195,7 @@ es-guard-quarantine /path/to/file
 |------|------|--------|
 | `protected_zones` | 受保护目录前缀 | `[]` |
 | `temporary_overrides` | 临时豁免路径（支持字符串旧格式与 `{path, expires_at}` 新格式） | `[]` |
+| `auto_protect_home_digit_children` | 自动保护 HOME 下首层“数字开头”目录（如 `~/01-agent`、`~/0x-lab`） | `true` |
 | `trusted_tools` | 受信任的工具进程名（兼容模式用） | git, jj, cargo, rustup 等 |
 | `ai_agent_patterns` | AI Agent 进程名匹配模式（子字符串匹配） | codex, claude, claude-code |
 | `allow_vcs_metadata_in_ai_context` | 是否允许 AI 的 git/jj 维护 `.git/.jj` 元数据（不包含工作区删除） | `true` |
@@ -203,6 +205,8 @@ es-guard-quarantine /path/to/file
 - 守护进程会自动清理已过期的 `temporary_overrides`，并回写策略文件
 - 默认兼顾效率与安全：允许 AI 的 git/jj 维护 `.git/.jj` 元数据，但 `git rm/git clean` 这类工作区删除仍会拦截
 - 默认更安全：AI 上下文不再因为 trusted_tools 自动放行；如需兼容可显式开启 `allow_trusted_tools_in_ai_context`
+- 路径匹配使用“目录边界匹配”：`/Users/you/0` 不会匹配 `/Users/you/01-agent`
+- 如需覆盖新建的 `0x-*`/`01-*` 目录，开启 `auto_protect_home_digit_children` 更稳妥
 - `trusted_tools` 和 `ai_agent_patterns` 有内置默认值，无需在 JSON 中指定
 - `protected_zones` 由 Nix 激活脚本管理，`temporary_overrides` 由 Agent 运行时管理
 
@@ -219,6 +223,7 @@ services.codex-es-guard = {
   enable = true;
   user = "yourname";
   protectedZones = [ "/Users/yourname/projects" ];
+  autoProtectHomeDigitChildrenDefault = true;
 };
 ```
 
@@ -270,7 +275,7 @@ sudo /usr/local/bin/codex-es-guard
 *   **⏳ 智能“阅后即焚”放行策略**
     安全的最大敌人是遗忘。通过 UI 授权的临时放行操作，应用会在后台启动一个静默倒计时（默认 3 分钟，支持偏好设置持久化修改）。时间一到，自动撤销授权，防止留下永久后门。
 *   **🧷 前端安全兜底**
-    App 侧会拒绝对根目录/家目录/保护目录根执行整段放行，并要求放行路径必须落在 `protected_zones` 内，避免误操作导致策略失控。
+    App 侧会拒绝对根目录/家目录/保护目录根执行整段放行，并要求放行路径必须落在受保护范围内（`protected_zones` 或自动数字目录保护），避免误操作导致策略失控。
 *   **🧩 Git 元数据细粒度开关**
     UI 提供 `allow_vcs_metadata_in_ai_context`（默认开启，推荐），只允许 AI 的 git/jj 维护 `.git/.jj` 元数据，不放行工作区删除。
 *   **⚖️ 兼容模式开关**

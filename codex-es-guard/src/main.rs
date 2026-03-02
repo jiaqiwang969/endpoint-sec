@@ -22,6 +22,9 @@ struct SecurityPolicy {
     protected_zones: Vec<String>,
     temporary_overrides: Vec<TemporaryOverrideEntry>,
 
+    #[serde(default = "default_auto_protect_home_digit_children")]
+    auto_protect_home_digit_children: bool,
+
     #[serde(default = "default_allow_vcs_metadata_in_ai_context")]
     allow_vcs_metadata_in_ai_context: bool,
 
@@ -87,6 +90,10 @@ fn default_trusted_tools() -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+fn default_auto_protect_home_digit_children() -> bool {
+    true
 }
 
 fn default_allow_vcs_metadata_in_ai_context() -> bool {
@@ -155,6 +162,31 @@ fn path_prefix_match(path: &str, prefix: &str) -> bool {
         return normalized_path.starts_with('/');
     }
     normalized_path == normalized_prefix || normalized_path.starts_with(&format!("{}/", normalized_prefix))
+}
+
+fn home_digit_root(path: &str, home: &str) -> Option<String> {
+    let normalized_path = trim_trailing_slashes(path);
+    let normalized_home = trim_trailing_slashes(home);
+    let home_prefix = format!("{}/", normalized_home);
+
+    if !normalized_path.starts_with(&home_prefix) {
+        return None;
+    }
+    let suffix = &normalized_path[home_prefix.len()..];
+    let first_component = suffix.split('/').next().unwrap_or("");
+    if first_component.is_empty() {
+        return None;
+    }
+
+    if first_component
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_digit())
+    {
+        Some(format!("{}/{}", normalized_home, first_component))
+    } else {
+        None
+    }
 }
 
 fn ensure_dir_not_symlink(path: &Path, mode: u32) -> io::Result<()> {
@@ -249,11 +281,22 @@ impl SecurityPolicy {
             .any(|entry| !entry.is_expired(now) && path_prefix_match(target_path, entry.path()))
     }
 
-    fn is_protected(&self, target_path: &str) -> bool {
-        let in_zone = self
-            .protected_zones
+    fn is_in_configured_zone(&self, target_path: &str) -> bool {
+        self.protected_zones
             .iter()
-            .any(|zone| path_prefix_match(target_path, zone));
+            .any(|zone| path_prefix_match(target_path, zone))
+    }
+
+    fn is_in_auto_home_digit_zone(&self, target_path: &str, home: &str) -> bool {
+        self.auto_protect_home_digit_children && home_digit_root(target_path, home).is_some()
+    }
+
+    fn is_in_any_zone(&self, target_path: &str, home: &str) -> bool {
+        self.is_in_configured_zone(target_path) || self.is_in_auto_home_digit_zone(target_path, home)
+    }
+
+    fn is_protected(&self, target_path: &str, home: &str) -> bool {
+        let in_zone = self.is_in_any_zone(target_path, home);
         if !in_zone {
             return false;
         }
@@ -266,12 +309,23 @@ impl SecurityPolicy {
         true
     }
 
-    fn matched_zone(&self, target_path: &str) -> String {
-        self.protected_zones
+    fn matched_zone(&self, target_path: &str, home: &str) -> String {
+        if let Some(zone) = self
+            .protected_zones
             .iter()
             .find(|zone| path_prefix_match(target_path, zone.as_str()))
             .cloned()
-            .unwrap_or_default()
+        {
+            return zone;
+        }
+
+        if self.auto_protect_home_digit_children {
+            if let Some(auto_zone) = home_digit_root(target_path, home) {
+                return auto_zone;
+            }
+        }
+
+        String::new()
     }
 
     fn is_trusted_tool(&self, exe_name: &str) -> bool {
@@ -285,15 +339,21 @@ impl SecurityPolicy {
             .any(|pattern| exe_name.contains(pattern.as_str()))
     }
 
-    fn sanitize_overrides(&mut self, now: u64) -> bool {
+    fn sanitize_overrides(&mut self, now: u64, home: &str) -> bool {
         let before = self.temporary_overrides.len();
+        let protected_zones = self.protected_zones.clone();
+        let auto_home_digit = self.auto_protect_home_digit_children;
         self.temporary_overrides.retain(|entry| {
             let path = entry.path();
+            let in_configured_zone = protected_zones
+                .iter()
+                .any(|zone| path_prefix_match(path, zone.as_str()));
+            let in_auto_zone = auto_home_digit && home_digit_root(path, home).is_some();
             !entry.is_expired(now)
                 && !path.is_empty()
                 && path.starts_with('/')
                 && path != "/"
-                && self.protected_zones.iter().any(|zone| path_prefix_match(path, zone))
+                && (in_configured_zone || in_auto_zone)
         });
 
         let mut seen_paths: HashSet<String> = HashSet::new();
@@ -747,7 +807,7 @@ fn should_deny(
     cache: &mut HashMap<i32, CachedAncestor>,
 ) -> Option<(String, String)> {
     // 1. Not in protected zone → ALLOW
-    if !policy.is_protected(path) {
+    if !policy.is_protected(path, home) {
         return None;
     }
 
@@ -790,7 +850,10 @@ mod tests {
         }"#;
         let policy: SecurityPolicy = serde_json::from_str(json).expect("policy json should decode");
         assert!(
-            !policy.is_protected("/Users/jqwang/00-nixos-config/nixos-config/file.txt"),
+            !policy.is_protected(
+                "/Users/jqwang/00-nixos-config/nixos-config/file.txt",
+                "/Users/jqwang"
+            ),
             "legacy string override should still bypass protection"
         );
     }
@@ -805,13 +868,14 @@ mod tests {
                 created_at: Some(1),
                 created_by: Some("test".to_string()),
             })],
+            auto_protect_home_digit_children: false,
             allow_vcs_metadata_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
         };
 
-        let changed = policy.sanitize_overrides(100);
+        let changed = policy.sanitize_overrides(100, "/Users/jqwang");
         assert!(changed, "expired override should be removed");
         assert!(policy.temporary_overrides.is_empty());
     }
@@ -829,13 +893,14 @@ mod tests {
                     created_by: Some("newer".to_string()),
                 }),
             ],
+            auto_protect_home_digit_children: false,
             allow_vcs_metadata_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
         };
 
-        let changed = policy.sanitize_overrides(1);
+        let changed = policy.sanitize_overrides(1, "/Users/jqwang");
         assert!(changed, "duplicate overrides should be compacted");
         assert_eq!(policy.temporary_overrides.len(), 1);
         assert_eq!(
@@ -875,18 +940,78 @@ mod tests {
                 TemporaryOverrideEntry::Path("/Users/jqwang/other/file".to_string()),
                 TemporaryOverrideEntry::Path("/Users/jqwang/project/file.txt".to_string()),
             ],
+            auto_protect_home_digit_children: false,
             allow_vcs_metadata_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
         };
 
-        let changed = policy.sanitize_overrides(1);
+        let changed = policy.sanitize_overrides(1, "/Users/jqwang");
         assert!(changed, "invalid paths should be removed");
         assert_eq!(policy.temporary_overrides.len(), 1);
         assert_eq!(
             policy.temporary_overrides[0].path(),
             "/Users/jqwang/project/file.txt"
+        );
+    }
+
+    #[test]
+    fn home_digit_root_matches_first_path_component() {
+        assert_eq!(
+            home_digit_root("/Users/jqwang/01-agent/new-codex", "/Users/jqwang"),
+            Some("/Users/jqwang/01-agent".to_string())
+        );
+        assert_eq!(
+            home_digit_root("/Users/jqwang/0x-lab/demo.txt", "/Users/jqwang"),
+            Some("/Users/jqwang/0x-lab".to_string())
+        );
+        assert_eq!(
+            home_digit_root("/Users/jqwang/dev/project", "/Users/jqwang"),
+            None
+        );
+        assert_eq!(home_digit_root("/tmp/01-agent", "/Users/jqwang"), None);
+    }
+
+    #[test]
+    fn auto_home_digit_zone_applies_protection() {
+        let policy = SecurityPolicy {
+            protected_zones: vec![],
+            temporary_overrides: vec![],
+            auto_protect_home_digit_children: true,
+            allow_vcs_metadata_in_ai_context: true,
+            trusted_tools: default_trusted_tools(),
+            ai_agent_patterns: default_ai_agent_patterns(),
+            allow_trusted_tools_in_ai_context: false,
+        };
+
+        assert!(policy.is_protected("/Users/jqwang/01-agent/file.txt", "/Users/jqwang"));
+        assert!(policy.is_protected("/Users/jqwang/0x-lab/file.txt", "/Users/jqwang"));
+        assert!(!policy.is_protected("/Users/jqwang/dev/file.txt", "/Users/jqwang"));
+        assert!(!policy.is_protected("/tmp/01-agent/file.txt", "/Users/jqwang"));
+    }
+
+    #[test]
+    fn sanitize_overrides_keeps_auto_home_digit_entries() {
+        let mut policy = SecurityPolicy {
+            protected_zones: vec![],
+            temporary_overrides: vec![
+                TemporaryOverrideEntry::Path("/Users/jqwang/01-agent/file.txt".to_string()),
+                TemporaryOverrideEntry::Path("/Users/jqwang/dev/file.txt".to_string()),
+            ],
+            auto_protect_home_digit_children: true,
+            allow_vcs_metadata_in_ai_context: true,
+            trusted_tools: default_trusted_tools(),
+            ai_agent_patterns: default_ai_agent_patterns(),
+            allow_trusted_tools_in_ai_context: false,
+        };
+
+        let changed = policy.sanitize_overrides(1, "/Users/jqwang");
+        assert!(changed, "outside auto-zone entries should be removed");
+        assert_eq!(policy.temporary_overrides.len(), 1);
+        assert_eq!(
+            policy.temporary_overrides[0].path(),
+            "/Users/jqwang/01-agent/file.txt"
         );
     }
 
@@ -952,6 +1077,7 @@ mod tests {
 fn main() {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let policy_path = format!("{}/.codex/es_policy.json", home);
+    let home_for_reload = home.clone();
 
     let initial_policy = load_policy(&policy_path).unwrap_or_default();
     let global_policy = Arc::new(Mutex::new(initial_policy));
@@ -972,7 +1098,7 @@ fn main() {
                 if let Ok(mtime) = metadata.modified() {
                     if mtime != last_mtime {
                         if let Some(mut new_policy) = load_policy(&path_clone) {
-                            let changed_by_sanitize = new_policy.sanitize_overrides(now_ts());
+                            let changed_by_sanitize = new_policy.sanitize_overrides(now_ts(), &home_for_reload);
                             if let Ok(mut lock) = policy_clone.lock() {
                                 *lock = new_policy.clone();
                                 // Clear cache on policy change
@@ -992,7 +1118,7 @@ fn main() {
 
             {
                 if let Ok(mut lock) = policy_clone.lock() {
-                    if lock.sanitize_overrides(now_ts()) {
+                    if lock.sanitize_overrides(now_ts(), &home_for_reload) {
                         snapshot_to_save = Some(lock.clone());
                         if let Ok(mut c) = cache_clone.lock() {
                             c.clear();
@@ -1034,7 +1160,7 @@ fn main() {
                 if let Some((proc_name, ancestor)) =
                     should_deny(&path, pid, &home_for_handler, &current_policy, &mut cache)
                 {
-                    let zone = current_policy.matched_zone(&path);
+                    let zone = current_policy.matched_zone(&path, &home_for_handler);
                     println!(
                         "[DENY] unlink by {} (via {}): {}",
                         proc_name, ancestor, path
@@ -1072,37 +1198,34 @@ fn main() {
 
                 // For rename: deny if moving OUT of protected zone in AI context
                 let mut cache = safe_cache.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                let deny_reason =
-                    if !current_policy.is_protected(&source_path) || is_system_temp(&source_path, &home_for_handler) {
+                let deny_reason = if !current_policy.is_protected(&source_path, &home_for_handler)
+                    || is_system_temp(&source_path, &home_for_handler)
+                {
+                    None
+                } else if let Some(ai_ancestor) = find_ai_ancestor(pid, &current_policy, &mut cache) {
+                    let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
+                    if should_allow_vcs_metadata_rename_in_ai_context(
+                        &source_path,
+                        &dest_path_str,
+                        Some(process_name.as_str()),
+                        &current_policy,
+                    ) {
                         None
-                    } else if let Some(ai_ancestor) = find_ai_ancestor(pid, &current_policy, &mut cache) {
-                        let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
-                        if should_allow_vcs_metadata_rename_in_ai_context(
-                            &source_path,
-                            &dest_path_str,
-                            Some(process_name.as_str()),
-                            &current_policy,
-                        ) {
-                            None
-                        } else if current_policy.allow_trusted_tools_in_ai_context
-                            && is_trusted_process_name(process_name.as_str(), &current_policy)
-                        {
-                            None
-                        } else if !current_policy
-                            .protected_zones
-                            .iter()
-                            .any(|zone| path_prefix_match(&dest_path_str, zone))
-                        {
-                            Some((process_name, ai_ancestor))
-                        } else {
-                            None
-                        }
+                    } else if current_policy.allow_trusted_tools_in_ai_context
+                        && is_trusted_process_name(process_name.as_str(), &current_policy)
+                    {
+                        None
+                    } else if !current_policy.is_in_any_zone(&dest_path_str, &home_for_handler) {
+                        Some((process_name, ai_ancestor))
                     } else {
                         None
-                    };
+                    }
+                } else {
+                    None
+                };
 
                 if let Some((proc_name, ancestor)) = deny_reason {
-                    let zone = current_policy.matched_zone(&source_path);
+                    let zone = current_policy.matched_zone(&source_path, &home_for_handler);
                     println!(
                         "[DENY] rename by {} (via {}): {} -> {}",
                         proc_name, ancestor, source_path, dest_path_str

@@ -118,7 +118,7 @@ if [ "$target" = "/" ]; then
     exit 1
 fi
 
-if ! jq -e --arg path "$target" '
+if ! jq -e --arg path "$target" --arg home "$HOME" '
   def trim_slash:
     if . == "/" then "/" else sub("/+$"; "") end;
   def prefix_match($p; $z):
@@ -129,9 +129,28 @@ if ! jq -e --arg path "$target" '
       else
         ($np == $nz) or ($np | startswith($nz + "/"))
       end;
-  (.protected_zones // []) | any(. as $zone | prefix_match($path; $zone))
+  def home_digit_root($p; $h):
+    ($p | trim_slash) as $np
+    | ($h | trim_slash) as $nh
+    | if $nh == "/" then
+        null
+      elif ($np | startswith($nh + "/")) then
+        ($np[($nh|length + 1):] | split("/") | .[0]) as $first
+        | if ($first | length) > 0 and ($first | test("^[0-9]")) then
+            ($nh + "/" + $first)
+          else
+            null
+          end
+      else
+        null
+      end;
+  ((.protected_zones // []) | any(. as $zone | prefix_match($path; $zone)))
+    or (
+      (.auto_protect_home_digit_children // true)
+      and (home_digit_root($path; $home) != null)
+    )
 ' "$POLICY" >/dev/null; then
-    echo "Error: target is outside protected_zones, refusing broad override" >&2
+    echo "Error: target is outside configured/auto protected zones, refusing broad override" >&2
     exit 1
 fi
 

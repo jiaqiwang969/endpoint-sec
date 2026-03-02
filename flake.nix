@@ -86,6 +86,17 @@
               example = [ "/Users/me/projects" "/Users/me/important" ];
               description = "Directory prefixes to protect from deletion/move.";
             };
+
+            autoProtectHomeDigitChildrenDefault = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              description = ''
+                Default value for `auto_protect_home_digit_children` when the
+                policy file does not yet define it. When enabled, any first-level
+                child directory under HOME whose name starts with a digit
+                (e.g. ~/01-agent, ~/0x-lab) is treated as protected.
+              '';
+            };
           };
 
           config = lib.mkIf cfg.enable {
@@ -107,6 +118,8 @@
               # Nix is the source of truth for protected_zones.
               # temporary_overrides is runtime-only (managed by AI agent / user).
               protectedZonesJson = builtins.toJSON cfg.protectedZones;
+              autoProtectHomeDigitChildrenDefaultJson =
+                if cfg.autoProtectHomeDigitChildrenDefault then "true" else "false";
             in ''
               # === codex-es-guard activation ===
               ES_BIN="${cfg.package}/bin/codex-es-guard"
@@ -144,12 +157,14 @@
               EXISTING_AI_PATTERNS="null"
               EXISTING_ALLOW_VCS_META_IN_AI="null"
               EXISTING_ALLOW_TRUSTED_IN_AI="null"
+              EXISTING_AUTO_PROTECT_HOME_DIGIT_CHILDREN="null"
               if [ -f "$POLICY_FILE" ]; then
                 EXISTING_OVERRIDES=$(${pkgs.jq}/bin/jq -c '.temporary_overrides // []' "$POLICY_FILE" 2>/dev/null || echo "[]")
                 EXISTING_TRUSTED_TOOLS=$(${pkgs.jq}/bin/jq -c '.trusted_tools // null' "$POLICY_FILE" 2>/dev/null || echo "null")
                 EXISTING_AI_PATTERNS=$(${pkgs.jq}/bin/jq -c '.ai_agent_patterns // null' "$POLICY_FILE" 2>/dev/null || echo "null")
                 EXISTING_ALLOW_VCS_META_IN_AI=$(${pkgs.jq}/bin/jq -c '.allow_vcs_metadata_in_ai_context // null' "$POLICY_FILE" 2>/dev/null || echo "null")
                 EXISTING_ALLOW_TRUSTED_IN_AI=$(${pkgs.jq}/bin/jq -c '.allow_trusted_tools_in_ai_context // null' "$POLICY_FILE" 2>/dev/null || echo "null")
+                EXISTING_AUTO_PROTECT_HOME_DIGIT_CHILDREN=$(${pkgs.jq}/bin/jq -c '.auto_protect_home_digit_children // null' "$POLICY_FILE" 2>/dev/null || echo "null")
               fi
 
               ${pkgs.jq}/bin/jq -n \
@@ -159,7 +174,15 @@
                 --argjson aiPatterns "$EXISTING_AI_PATTERNS" \
                 --argjson allowVcsMetaInAi "$EXISTING_ALLOW_VCS_META_IN_AI" \
                 --argjson allowTrustedInAi "$EXISTING_ALLOW_TRUSTED_IN_AI" \
+                --argjson autoProtectHomeDigitChildren "$EXISTING_AUTO_PROTECT_HOME_DIGIT_CHILDREN" \
+                --argjson autoProtectHomeDigitChildrenDefault ${autoProtectHomeDigitChildrenDefaultJson} \
                 '({protected_zones: $zones, temporary_overrides: $overrides}
+                  + {auto_protect_home_digit_children: (
+                      if $autoProtectHomeDigitChildren == null
+                      then $autoProtectHomeDigitChildrenDefault
+                      else $autoProtectHomeDigitChildren
+                      end
+                    )}
                   + (if $trustedTools == null then {} else {trusted_tools: $trustedTools} end)
                   + (if $aiPatterns == null then {} else {ai_agent_patterns: $aiPatterns} end)
                   + (if $allowVcsMetaInAi == null then {} else {allow_vcs_metadata_in_ai_context: $allowVcsMetaInAi} end)

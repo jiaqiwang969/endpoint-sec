@@ -128,6 +128,11 @@ struct PolicyPanel: View {
                         .font(.caption)
                         .foregroundColor(vcsMetaInAI ? .secondary : .orange)
 
+                    let autoProtectHomeDigitChildren = viewModel.policy.autoProtectHomeDigitChildren ?? true
+                    Text("HOME 数字前缀目录自动保护: " + (autoProtectHomeDigitChildren ? "开启 (推荐)" : "关闭"))
+                        .font(.caption)
+                        .foregroundColor(autoProtectHomeDigitChildren ? .secondary : .orange)
+
                     let trustedInAI = viewModel.policy.allowTrustedToolsInAIContext ?? false
                     Text("AI 上下文信任工具放行: " + (trustedInAI ? "开启 (兼容模式)" : "关闭 (推荐更安全)"))
                         .font(.caption)
@@ -135,8 +140,28 @@ struct PolicyPanel: View {
                 }
 
                 Section(header: Text("高级安全开关")) {
+                    let autoProtectHomeDigitChildren = viewModel.policy.autoProtectHomeDigitChildren ?? true
                     let vcsMetaInAI = viewModel.policy.allowVCSMetadataInAIContext ?? true
                     let trustedInAI = viewModel.policy.allowTrustedToolsInAIContext ?? false
+
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("自动保护 HOME 下数字前缀目录")
+                                .font(.caption)
+                            Text("例如 ~/01-agent、~/0x-lab。可覆盖新建目录，避免 /Users/you/0 与 /Users/you/01-* 边界不匹配。")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Toggle("", isOn: Binding(
+                            get: { autoProtectHomeDigitChildren },
+                            set: { enabled in
+                                viewModel.updateAutoProtectHomeDigitChildren(enabled)
+                            }
+                        ))
+                        .toggleStyle(.switch)
+                        .labelsHidden()
+                    }
 
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
