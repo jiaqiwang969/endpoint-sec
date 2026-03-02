@@ -941,7 +941,7 @@ fn apply_override_request(
 }
 
 fn write_override_response(response_path: &Path, response: &OverrideResponse) -> io::Result<()> {
-    let mut file = open_truncate_no_follow(response_path, RUNTIME_OVERRIDE_FILE_MODE)?;
+    let mut file = open_truncate_no_follow(response_path, DEFAULT_FILE_MODE)?;
     verify_regular_file(&file, response_path)?;
     let content = serde_json::to_vec(response).map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
     file.write_all(&content)?;
