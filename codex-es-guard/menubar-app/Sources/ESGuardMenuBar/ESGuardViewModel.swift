@@ -373,11 +373,17 @@ final class ESGuardViewModel: ObservableObject {
         label: "dev.codex-es-guard.daemon-control",
         qos: .userInitiated
     )
+    private let recordsLoadQueue = DispatchQueue(
+        label: "dev.codex-es-guard.records-load",
+        qos: .utility
+    )
     
     private var previousRecordCount: Int = 0
     private var isFirstLoad: Bool = true
     private var recordsLoadToken: UInt64 = 0
     private var messageToken: UInt64 = 0
+    private var recordsReloadWorkItem: DispatchWorkItem?
+    private var daemonStatusPollCancellable: AnyCancellable?
 
     init() {
         if autoRevokeMinutes <= 0 || autoRevokeMinutes > 30 {
@@ -385,9 +391,12 @@ final class ESGuardViewModel: ObservableObject {
         }
         refresh()
         setupWatchers()
+        setupDaemonStatusPolling()
     }
     
     deinit {
+        daemonStatusPollCancellable?.cancel()
+        recordsReloadWorkItem?.cancel()
         fileMonitor.stopAll()
         logTailer.stopTailing()
     }
@@ -448,6 +457,17 @@ final class ESGuardViewModel: ObservableObject {
         }
     }
 
+    private func setupDaemonStatusPolling() {
+        daemonStatusPollCancellable = Timer
+            .publish(every: 3.0, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in
+                guard let self = self else { return }
+                if self.daemonActionInProgress { return }
+                self.checkGuardRunning()
+            }
+    }
+
     func startDaemon() {
         guard !daemonActionInProgress else { return }
         daemonActionInProgress = true
@@ -463,7 +483,9 @@ final class ESGuardViewModel: ObservableObject {
                 "  if [ -f \(quotedPlist) ]; then /bin/launchctl bootstrap system \(quotedPlist) >/dev/null 2>&1 || true; fi",
                 "fi",
                 "/bin/launchctl enable \(quotedTarget)",
-                "/bin/launchctl kickstart -k \(quotedTarget)",
+                "if /bin/launchctl print \(quotedTarget) >/dev/null 2>&1; then",
+                "  /bin/launchctl kickstart -k \(quotedTarget)",
+                "fi",
             ].joined(separator: "; ")
 
             let transaction = runShellTransactionWithPrivilegeFallback(command: command)
@@ -510,7 +532,13 @@ final class ESGuardViewModel: ObservableObject {
 
         daemonControlQueue.async {
             let quotedTarget = shellQuote(serviceTarget)
-            let command = "/bin/launchctl disable \(quotedTarget); /bin/launchctl bootout \(quotedTarget)"
+            let quotedPlist = shellQuote(self.daemonPlistPath)
+            let command = [
+                "/bin/launchctl disable \(quotedTarget) >/dev/null 2>&1 || true",
+                "if /bin/launchctl print \(quotedTarget) >/dev/null 2>&1; then",
+                "  /bin/launchctl bootout \(quotedTarget) >/dev/null 2>&1 || /bin/launchctl bootout system \(quotedPlist) >/dev/null 2>&1 || true",
+                "fi",
+            ].joined(separator: "; ")
             let transaction = runShellTransactionWithPrivilegeFallback(command: command)
             let status = queryLaunchctlServiceStatus(serviceTarget: serviceTarget)
             let details = bestProcessDetail(transaction.result)
@@ -550,7 +578,14 @@ final class ESGuardViewModel: ObservableObject {
 
         daemonControlQueue.async {
             let quotedTarget = shellQuote(serviceTarget)
-            let command = "/bin/launchctl kickstart -k \(quotedTarget)"
+            let quotedPlist = shellQuote(self.daemonPlistPath)
+            let command = [
+                "if ! /bin/launchctl print \(quotedTarget) >/dev/null 2>&1; then",
+                "  if [ -f \(quotedPlist) ]; then /bin/launchctl bootstrap system \(quotedPlist) >/dev/null 2>&1 || true; fi",
+                "fi",
+                "/bin/launchctl enable \(quotedTarget) >/dev/null 2>&1 || true",
+                "/bin/launchctl kickstart -k \(quotedTarget)",
+            ].joined(separator: "; ")
             let transaction = runShellTransactionWithPrivilegeFallback(command: command)
             let status = queryLaunchctlServiceStatus(serviceTarget: serviceTarget)
             let restarted = status.running
@@ -588,7 +623,7 @@ final class ESGuardViewModel: ObservableObject {
         }
         
         fileMonitor.watch(path: denialsPath) { [weak self] in
-            Task { @MainActor in self?.loadRecords() }
+            Task { @MainActor in self?.scheduleLoadRecords() }
         }
         
         fileMonitor.watch(path: lastDenialPath) { [weak self] in
@@ -611,7 +646,7 @@ final class ESGuardViewModel: ObservableObject {
         let token = recordsLoadToken
         let path = denialsPath
 
-        DispatchQueue.global(qos: .utility).async {
+        recordsLoadQueue.async {
             guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
                 DispatchQueue.main.async { [weak self] in
                     guard let self = self else { return }
@@ -646,6 +681,17 @@ final class ESGuardViewModel: ObservableObject {
                 self.isFirstLoad = false
             }
         }
+    }
+
+    private func scheduleLoadRecords(delay: TimeInterval = 0.2) {
+        recordsReloadWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.loadRecords()
+            }
+        }
+        recordsReloadWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
     
     private func loadPolicy() {
