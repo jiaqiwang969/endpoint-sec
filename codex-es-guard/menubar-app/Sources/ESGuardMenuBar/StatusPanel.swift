@@ -61,14 +61,13 @@ struct StatusPanel: View {
                     }
                     
                     if let lastRecord = viewModel.records.first {
+                        let isDelete = lastRecord.op == "unlink"
                         HStack {
-                            Text(lastRecord.op.uppercased())
-                                .font(.system(.caption, design: .monospaced).bold())
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(lastRecord.op == "unlink" ? ApplePalette.danger : ApplePalette.info)
-                                .cornerRadius(4)
+                            TagBadge(
+                                text: lastRecord.op.uppercased(),
+                                tint: isDelete ? ApplePalette.danger : ApplePalette.info,
+                                fill: isDelete ? ApplePalette.subtleDanger : ApplePalette.subtleInfo
+                            )
                             
                             Text(lastRecord.process)
                                 .font(.system(.caption, design: .monospaced))

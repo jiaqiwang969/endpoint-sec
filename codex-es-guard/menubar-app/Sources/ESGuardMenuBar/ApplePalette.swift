@@ -13,4 +13,6 @@ enum ApplePalette {
     static let border = Color(nsColor: .separatorColor).opacity(0.35)
     static let subtleDanger = danger.opacity(0.16)
     static let subtleSuccess = success.opacity(0.16)
+    static let subtleWarning = warning.opacity(0.16)
+    static let subtleInfo = info.opacity(0.16)
 }

@@ -99,35 +99,40 @@ struct RecordRow: View {
     private func getAgentColor(for name: String) -> Color {
         let nameLower = name.lowercased()
         if nameLower.contains("codex") {
-            return .indigo.opacity(0.88)
+            return .indigo
         } else if nameLower.contains("claude") {
-            return ApplePalette.warning.opacity(0.88)
+            return ApplePalette.warning
         } else if nameLower.contains("copilot") {
-            return .teal.opacity(0.88)
+            return .teal
         } else {
-            return .secondary.opacity(0.75)
+            return .secondary
         }
     }
     
     var body: some View {
+        let isDelete = record.op == "unlink"
+        let opTint = isDelete ? ApplePalette.danger : ApplePalette.info
+        let opFill = isDelete ? ApplePalette.subtleDanger : ApplePalette.subtleInfo
+        let agentTint = getAgentColor(for: record.ancestor)
+
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text(record.op == "unlink" ? "DELETE" : "MOVE")
-                    .font(.system(.caption, design: .monospaced).bold())
-                    .foregroundColor(record.op == "unlink" ? ApplePalette.danger : ApplePalette.info)
+                TagBadge(
+                    text: isDelete ? "DELETE" : "MOVE",
+                    tint: opTint,
+                    fill: opFill
+                )
                 
                 Text(URL(fileURLWithPath: record.path).lastPathComponent)
                     .font(.callout.bold())
                 
                 Spacer()
                 
-                Text(record.ancestor)
-                    .font(.system(size: 9, design: .monospaced).bold())
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(getAgentColor(for: record.ancestor))
-                    .cornerRadius(4)
+                TagBadge(
+                    text: record.ancestor,
+                    tint: agentTint,
+                    fill: agentTint.opacity(0.18)
+                )
             }
             
             Text(record.path)
@@ -153,7 +158,7 @@ struct RecordRow: View {
             HStack {
                 Text(Date(timeIntervalSince1970: TimeInterval(record.ts)).formatted(date: .omitted, time: .standard))
                     .font(.caption2)
-                    .foregroundColor(.gray)
+                    .foregroundColor(.secondary)
                 Spacer()
             }
         }
