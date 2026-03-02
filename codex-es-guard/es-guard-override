@@ -15,6 +15,7 @@ REQUEST_DIR="$HOME/.codex/es-guard/override-requests"
 DEFAULT_MINUTES="${ES_GUARD_OVERRIDE_MINUTES:-3}"
 MAX_MINUTES="${ES_GUARD_OVERRIDE_MAX_MINUTES:-30}"
 WAIT_SECS="${ES_GUARD_OVERRIDE_WAIT_SECS:-8}"
+MAX_PATH_LEN="${ES_GUARD_OVERRIDE_MAX_PATH_LEN:-4096}"
 
 usage() {
     echo "Usage:"
@@ -61,15 +62,21 @@ make_request_id() {
 wait_for_response() {
     local response_file="$1"
     local timeout_secs="$2"
+    local expected_id="$3"
     local deadline=$((SECONDS + timeout_secs))
 
     while [ "$SECONDS" -lt "$deadline" ]; do
         if [ -f "$response_file" ]; then
-            local status message expires
+            local response_id status message expires
+            response_id="$(jq -r '.id // empty' "$response_file" 2>/dev/null || echo "")"
             status="$(jq -r '.status // "error"' "$response_file" 2>/dev/null || echo "error")"
             message="$(jq -r '.message // ""' "$response_file" 2>/dev/null || echo "")"
             expires="$(jq -r '.expires_at // empty' "$response_file" 2>/dev/null || true)"
             rm -f "$response_file"
+            if [ -z "$response_id" ] || [ "$response_id" != "$expected_id" ]; then
+                echo "error"$'\n'"response id mismatch"$'\n'
+                return 0
+            fi
             echo "$status"$'\n'"$message"$'\n'"$expires"
             return 0
         fi
@@ -164,6 +171,14 @@ case "$action" in
             echo "Error: refusing to override root path '/'" >&2
             exit 1
         fi
+        if ! [[ "$MAX_PATH_LEN" =~ ^[0-9]+$ ]]; then
+            echo "Error: ES_GUARD_OVERRIDE_MAX_PATH_LEN must be a non-negative integer" >&2
+            exit 1
+        fi
+        if [ "${#target}" -gt "$MAX_PATH_LEN" ]; then
+            echo "Error: target path too long (max $MAX_PATH_LEN chars)" >&2
+            exit 1
+        fi
         ;;
     *)
         echo "Error: unknown action" >&2
@@ -241,7 +256,7 @@ esac
 mv "$tmp_request" "$request_file"
 trap - EXIT
 
-if ! response_payload="$(wait_for_response "$response_file" "$WAIT_SECS")"; then
+if ! response_payload="$(wait_for_response "$response_file" "$WAIT_SECS" "$request_id")"; then
     rm -f "$request_file"
     echo "Error: override helper timeout. Ensure codex-es-guard daemon is running." >&2
     exit 1

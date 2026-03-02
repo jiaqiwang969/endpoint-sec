@@ -20,6 +20,10 @@ const RUNTIME_OVERRIDE_FILE_MODE: u32 = 0o600;
 const OVERRIDE_DEFAULT_MINUTES: u64 = 3;
 const OVERRIDE_MAX_MINUTES: u64 = 30;
 const OVERRIDE_STORE_DIR: &str = "/var/db/codex-es-guard";
+const MAX_OVERRIDE_PATH_LEN: usize = 4096;
+const MAX_RUNTIME_OVERRIDES: usize = 512;
+const MAX_OVERRIDE_REQUEST_SIZE_BYTES: u64 = 8192;
+const STALE_RESPONSE_RETENTION_SECS: u64 = 300;
 
 #[derive(Debug, Deserialize)]
 struct OverrideRequest {
@@ -804,6 +808,17 @@ fn apply_override_request(
                     },
                 );
             }
+            if path.len() > MAX_OVERRIDE_PATH_LEN {
+                return (
+                    false,
+                    OverrideResponse {
+                        id: req.id.clone(),
+                        status: "error".to_string(),
+                        message: format!("path too long (max {})", MAX_OVERRIDE_PATH_LEN),
+                        expires_at: None,
+                    },
+                );
+            }
             if !policy.is_in_any_zone(path.as_str(), home) {
                 return (
                     false,
@@ -855,6 +870,17 @@ fn apply_override_request(
             let expires_at = now.saturating_add(minutes.saturating_mul(60));
             let normalized = path.clone();
             overrides.retain(|entry| trim_trailing_slashes(entry.path()) != normalized.as_str());
+            if overrides.len() >= MAX_RUNTIME_OVERRIDES {
+                return (
+                    false,
+                    OverrideResponse {
+                        id: req.id.clone(),
+                        status: "error".to_string(),
+                        message: format!("too many active overrides (max {})", MAX_RUNTIME_OVERRIDES),
+                        expires_at: None,
+                    },
+                );
+            }
             overrides.push(TemporaryOverrideEntry::Rule(TemporaryOverrideRule {
                 path,
                 expires_at: Some(expires_at),
@@ -902,6 +928,17 @@ fn apply_override_request(
                     );
                 },
             };
+            if path.len() > MAX_OVERRIDE_PATH_LEN {
+                return (
+                    false,
+                    OverrideResponse {
+                        id: req.id.clone(),
+                        status: "error".to_string(),
+                        message: format!("path too long (max {})", MAX_OVERRIDE_PATH_LEN),
+                        expires_at: None,
+                    },
+                );
+            }
             let before = overrides.len();
             overrides.retain(|entry| trim_trailing_slashes(entry.path()) != path.as_str());
             let removed = before.saturating_sub(overrides.len());
@@ -949,6 +986,43 @@ fn write_override_response(response_path: &Path, response: &OverrideResponse) ->
     Ok(())
 }
 
+fn prune_stale_response_files(request_dir: &Path, now: u64) {
+    let Ok(iter) = fs::read_dir(request_dir) else {
+        return;
+    };
+
+    for entry in iter.filter_map(Result::ok) {
+        let path = entry.path();
+        let is_response = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".response.json"));
+        if !is_response {
+            continue;
+        }
+
+        let modified_secs = match fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+            .map(|delta| delta.as_secs())
+        {
+            Some(ts) => ts,
+            None => continue,
+        };
+        if now.saturating_sub(modified_secs) <= STALE_RESPONSE_RETENTION_SECS {
+            continue;
+        }
+        if let Err(err) = fs::remove_file(&path) {
+            eprintln!(
+                "[override] failed to prune stale response {}: {}",
+                path.display(),
+                err
+            );
+        }
+    }
+}
+
 fn process_override_requests(
     request_dir: &Path,
     policy: &SecurityPolicy,
@@ -974,6 +1048,7 @@ fn process_override_requests(
         eprintln!("[override] cannot use request dir: {}", err);
         return false;
     }
+    prune_stale_response_files(active_request_dir, now_ts());
 
     let mut request_files: Vec<PathBuf> = match fs::read_dir(active_request_dir) {
         Ok(iter) => iter
@@ -1004,6 +1079,17 @@ fn process_override_requests(
 
         let request = match open_read_no_follow(&request_path).and_then(|mut file| {
             verify_regular_file(&file, &request_path)?;
+            let meta = file.metadata()?;
+            if meta.len() > MAX_OVERRIDE_REQUEST_SIZE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "request too large ({} bytes > {})",
+                        meta.len(),
+                        MAX_OVERRIDE_REQUEST_SIZE_BYTES
+                    ),
+                ));
+            }
             let mut content = String::new();
             file.read_to_string(&mut content)?;
             serde_json::from_str::<OverrideRequest>(&content)
@@ -1664,6 +1750,52 @@ mod tests {
         assert_eq!(response.status, "error");
         assert!(response.message.contains("broad path"));
         assert!(overrides.is_empty());
+    }
+
+    #[test]
+    fn apply_override_request_rejects_too_long_path() {
+        let policy = test_policy();
+        let mut overrides = Vec::new();
+        let long_suffix = "a".repeat(MAX_OVERRIDE_PATH_LEN);
+        let request = OverrideRequest {
+            id: "req-long".to_string(),
+            action: "grant".to_string(),
+            path: Some(format!("/Users/jqwang/project/{}", long_suffix)),
+            minutes: Some(1),
+        };
+
+        let (changed, response) = apply_override_request(&request, &policy, "/Users/jqwang", &mut overrides);
+        assert!(!changed);
+        assert_eq!(response.status, "error");
+        assert!(response.message.contains("path too long"));
+        assert!(overrides.is_empty());
+    }
+
+    #[test]
+    fn apply_override_request_rejects_when_override_pool_full() {
+        let policy = test_policy();
+        let mut overrides = (0..MAX_RUNTIME_OVERRIDES)
+            .map(|idx| {
+                TemporaryOverrideEntry::Rule(TemporaryOverrideRule {
+                    path: format!("/Users/jqwang/project/file-{}", idx),
+                    expires_at: Some(now_ts().saturating_add(60)),
+                    created_at: Some(now_ts()),
+                    created_by: Some("seed".to_string()),
+                })
+            })
+            .collect::<Vec<_>>();
+        let request = OverrideRequest {
+            id: "req-full".to_string(),
+            action: "grant".to_string(),
+            path: Some("/Users/jqwang/project/new-file".to_string()),
+            minutes: Some(1),
+        };
+
+        let (changed, response) = apply_override_request(&request, &policy, "/Users/jqwang", &mut overrides);
+        assert!(!changed);
+        assert_eq!(response.status, "error");
+        assert!(response.message.contains("too many active overrides"));
+        assert_eq!(overrides.len(), MAX_RUNTIME_OVERRIDES);
     }
 }
 

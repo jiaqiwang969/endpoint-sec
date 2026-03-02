@@ -296,7 +296,7 @@ final class ESGuardViewModel: ObservableObject {
     private var recordsLoadToken: UInt64 = 0
 
     init() {
-        if autoRevokeMinutes <= 0 {
+        if autoRevokeMinutes <= 0 || autoRevokeMinutes > 30 {
             autoRevokeMinutes = 3
         }
         refresh()
@@ -660,7 +660,10 @@ final class ESGuardViewModel: ObservableObject {
             return
         }
 
-        let revokeMinutes = autoRevokeMinutes
+        let revokeMinutes = min(max(autoRevokeMinutes, 1), 30)
+        if revokeMinutes != autoRevokeMinutes {
+            autoRevokeMinutes = revokeMinutes
+        }
         guard revokeMinutes > 0 else {
             presentMessage("放行失败：已禁用不过期放行，请选择 1-30 分钟", success: false, clearAfter: 7.0)
             return
