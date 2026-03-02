@@ -145,6 +145,7 @@ rm /path/to/file  # 成功
 > 安全限流：`--minutes` 默认上限 30 分钟（可通过环境变量 `ES_GUARD_OVERRIDE_MAX_MINUTES` 调整），`--no-expire` 自动请求已禁用。
 >
 > root helper 还会校验 `requester_pid`：来自 AI 祖先进程的自动放行请求将被拒绝（避免 Agent 自行给自己放行）。
+> 同时会验证该 PID 当前确实在运行 `es-guard-override` helper，防止伪造其他进程 PID 进行绕过。
 
 ### es-guard-quarantine 命令（推荐第一步）
 

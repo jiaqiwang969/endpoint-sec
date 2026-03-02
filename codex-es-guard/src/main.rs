@@ -1027,6 +1027,10 @@ fn validate_override_request_origin(req: &OverrideRequest, policy: &SecurityPoli
         })
         .ok_or_else(|| format!("requester pid {} is not alive; retry request", pid))?;
 
+    if !is_override_helper_process(pid) {
+        return Err("requester process is not es-guard-override helper".to_string());
+    }
+
     let mut cache = HashMap::new();
     if let Some(ai_ancestor) = find_ai_ancestor(pid, policy, &mut cache) {
         return Err(format!(
@@ -1397,7 +1401,47 @@ fn get_process_path(pid: i32) -> Option<String> {
 
 /// Get the process argv[0] via sysctl KERN_PROCARGS2.
 /// This reflects process.title changes (e.g., Node.js setting title to "claude").
-fn get_process_argv0(pid: i32) -> Option<String> {
+fn parse_procargs_argv(buf: &[u8]) -> Vec<String> {
+    if buf.len() < 4 {
+        return Vec::new();
+    }
+    let argc_raw = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if argc_raw <= 0 {
+        return Vec::new();
+    }
+    let argc = argc_raw as usize;
+
+    // Layout: argc(i32) + exec_path + \0 + padding(\0s) + argv[0] + \0 + argv[1] + ...
+    let mut pos = 4;
+    while pos < buf.len() && buf[pos] != 0 {
+        pos += 1;
+    }
+    while pos < buf.len() && buf[pos] == 0 {
+        pos += 1;
+    }
+
+    let mut args: Vec<String> = Vec::with_capacity(argc);
+    while pos < buf.len() && args.len() < argc {
+        while pos < buf.len() && buf[pos] == 0 {
+            pos += 1;
+        }
+        if pos >= buf.len() {
+            break;
+        }
+
+        let start = pos;
+        while pos < buf.len() && buf[pos] != 0 {
+            pos += 1;
+        }
+        if start < pos {
+            args.push(String::from_utf8_lossy(&buf[start..pos]).to_string());
+        }
+    }
+
+    args
+}
+
+fn get_process_argv(pid: i32) -> Option<Vec<String>> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut size: libc::size_t = 0;
 
@@ -1431,29 +1475,37 @@ fn get_process_argv0(pid: i32) -> Option<String> {
         return None;
     }
 
-    // Layout: argc(i32) + exec_path + \0 + padding(\0s) + argv[0] + \0 + ...
-    let mut pos = 4; // skip argc
-                     // skip exec_path
-    while pos < size && buf[pos] != 0 {
-        pos += 1;
-    }
-    // skip null padding
-    while pos < size && buf[pos] == 0 {
-        pos += 1;
-    }
-    // read argv[0]
-    let start = pos;
-    while pos < size && buf[pos] != 0 {
-        pos += 1;
-    }
-
-    if start < pos {
-        let argv0 = String::from_utf8_lossy(&buf[start..pos]).to_string();
-        // Extract basename
-        Some(argv0.rsplit('/').next().unwrap_or(&argv0).to_string())
-    } else {
+    buf.truncate(size);
+    let args = parse_procargs_argv(&buf);
+    if args.is_empty() {
         None
+    } else {
+        Some(args)
     }
+}
+
+fn get_process_argv0(pid: i32) -> Option<String> {
+    get_process_argv(pid).and_then(|args| {
+        args.first()
+            .map(|argv0| argv0.rsplit('/').next().unwrap_or(argv0.as_str()).to_string())
+    })
+}
+
+fn is_override_helper_argv(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        Path::new(arg)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "es-guard-override")
+    })
+}
+
+fn is_override_helper_process(pid: i32) -> bool {
+    let args = match get_process_argv(pid) {
+        Some(args) => args,
+        None => return false,
+    };
+    is_override_helper_argv(&args)
 }
 
 /// Query proc_bsdinfo for a process. Returns (ppid, comm_name).
@@ -2018,6 +2070,61 @@ mod tests {
         };
         let err = validate_override_request_origin(&invalid_pid, &policy).expect_err("pid must be positive");
         assert!(err.contains("invalid requester_pid"));
+    }
+
+    #[test]
+    fn parse_procargs_argv_extracts_expected_arguments() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(3_i32).to_ne_bytes());
+        payload.extend_from_slice(b"/bin/bash");
+        payload.push(0);
+        payload.push(0);
+        payload.extend_from_slice(b"/bin/bash");
+        payload.push(0);
+        payload.extend_from_slice(b"/usr/local/bin/es-guard-override");
+        payload.push(0);
+        payload.extend_from_slice(b"--clear");
+        payload.push(0);
+
+        let args = parse_procargs_argv(&payload);
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], "/bin/bash");
+        assert_eq!(args[1], "/usr/local/bin/es-guard-override");
+        assert_eq!(args[2], "--clear");
+    }
+
+    #[test]
+    fn helper_argv_detection_requires_override_binary_argument() {
+        let helper_args = vec![
+            "/bin/bash".to_string(),
+            "/usr/local/bin/es-guard-override".to_string(),
+            "--minutes".to_string(),
+            "3".to_string(),
+        ];
+        assert!(is_override_helper_argv(&helper_args));
+
+        let unrelated_args = vec!["/bin/bash".to_string(), "/tmp/custom-script.sh".to_string()];
+        assert!(!is_override_helper_argv(&unrelated_args));
+    }
+
+    #[test]
+    fn validate_override_request_origin_rejects_non_helper_process() {
+        let policy = test_policy();
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .expect("sleep should spawn");
+        let request = OverrideRequest {
+            id: "req-origin-3".to_string(),
+            action: "clear".to_string(),
+            path: None,
+            minutes: None,
+            requester_pid: Some(child.id() as i32),
+        };
+        let err = validate_override_request_origin(&request, &policy).expect_err("non-helper process must be rejected");
+        assert!(err.contains("not es-guard-override helper"));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
