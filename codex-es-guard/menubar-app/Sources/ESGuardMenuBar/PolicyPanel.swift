@@ -89,9 +89,11 @@ struct PolicyPanel: View {
                                         .font(.system(.caption, design: .monospaced))
                                         .foregroundColor(.orange)
 
-                                    Text(overrideStatusText(override))
-                                        .font(.caption2)
-                                        .foregroundColor(override.isExpired ? .red : .secondary)
+                                    TimelineView(.periodic(from: .now, by: 1.0)) { _ in
+                                        Text(overrideStatusText(override))
+                                            .font(.caption2)
+                                            .foregroundColor(override.isExpired ? .red : .secondary)
+                                    }
 
                                     if let meta = overrideMetaText(override) {
                                         Text(meta)

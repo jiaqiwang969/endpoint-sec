@@ -17,30 +17,39 @@ struct DashboardView: View {
                 Spacer()
                 
                 HStack(spacing: 4) {
-                    Circle()
-                        .fill(
-                            viewModel.guardRunning
-                                ? (viewModel.hasUnacknowledgedRecords ? Color.orange : Color.green)
-                                : Color.red
-                        )
-                        .frame(width: 8, height: 8)
-                    Text(
-                        viewModel.guardRunning
-                            ? (viewModel.hasUnacknowledgedRecords ? "有新拦截" : "守护中")
-                            : "守护已停止"
-                    )
-                    .font(.caption)
-                    .foregroundColor(
-                        viewModel.guardRunning
-                            ? (viewModel.hasUnacknowledgedRecords ? .orange : .secondary)
-                            : .red
-                    )
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(
+                                    viewModel.guardRunning
+                                        ? (viewModel.hasUnacknowledgedRecords ? Color.orange : Color.green)
+                                        : Color.red
+                                )
+                                .frame(width: 8, height: 8)
+                            Text(
+                                viewModel.guardRunning
+                                    ? (viewModel.hasUnacknowledgedRecords ? "有新拦截" : "守护中")
+                                    : "守护已停止"
+                            )
+                            .font(.caption)
+                            .foregroundColor(
+                                viewModel.guardRunning
+                                    ? (viewModel.hasUnacknowledgedRecords ? .orange : .secondary)
+                                    : .red
+                            )
+                        }
+
+                        Text(actionOrStateHint)
+                            .font(.caption2)
+                            .foregroundColor(viewModel.daemonActionInProgress ? .orange : .secondary)
+                    }
                 }
 
                 HStack(spacing: 8) {
                     DaemonCapsuleControl(
                         guardRunning: viewModel.guardRunning,
                         actionInProgress: viewModel.daemonActionInProgress,
+                        currentAction: viewModel.daemonCurrentAction,
                         onStart: { viewModel.startDaemon() },
                         onStop: { viewModel.stopDaemon() }
                     )
@@ -50,7 +59,7 @@ struct DashboardView: View {
                         viewModel.restartDaemon()
                     }) {
                         Group {
-                            if viewModel.daemonActionInProgress {
+                            if viewModel.daemonCurrentAction == .restarting {
                                 ProgressView()
                                     .progressViewStyle(.circular)
                                     .controlSize(.small)
@@ -142,9 +151,26 @@ struct DashboardView: View {
     }
 }
 
+private extension DashboardView {
+    var actionOrStateHint: String {
+        if let action = viewModel.daemonCurrentAction {
+            switch action {
+            case .starting:
+                return "正在启动守护进程..."
+            case .stopping:
+                return "正在停止守护进程..."
+            case .restarting:
+                return "正在重启守护进程..."
+            }
+        }
+        return viewModel.daemonStateHint
+    }
+}
+
 private struct DaemonCapsuleControl: View {
     let guardRunning: Bool
     let actionInProgress: Bool
+    let currentAction: DaemonActionKind?
     let onStart: () -> Void
     let onStop: () -> Void
 
@@ -154,6 +180,7 @@ private struct DaemonCapsuleControl: View {
                 title: "开启",
                 isActive: guardRunning,
                 tint: .green,
+                showProgress: actionInProgress && currentAction == .starting,
                 disabled: guardRunning || actionInProgress,
                 action: onStart
             )
@@ -162,6 +189,7 @@ private struct DaemonCapsuleControl: View {
                 title: "关闭",
                 isActive: !guardRunning,
                 tint: .red,
+                showProgress: actionInProgress && currentAction == .stopping,
                 disabled: !guardRunning || actionInProgress,
                 action: onStop
             )
@@ -181,20 +209,29 @@ private struct DaemonCapsuleControl: View {
         title: String,
         isActive: Bool,
         tint: Color,
+        showProgress: Bool,
         disabled: Bool,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundColor(isActive ? .white : tint.opacity(disabled ? 0.45 : 1.0))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .frame(minWidth: 48)
-                .background(
-                    Capsule()
-                        .fill(isActive ? tint.opacity(disabled ? 0.55 : 1.0) : Color.clear)
-                )
+            Group {
+                if showProgress {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .controlSize(.small)
+                } else {
+                    Text(title)
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(isActive ? .white : tint.opacity(disabled ? 0.45 : 1.0))
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .frame(minWidth: 48)
+            .background(
+                Capsule()
+                    .fill(isActive ? tint.opacity(disabled ? 0.55 : 1.0) : Color.clear)
+            )
         }
         .buttonStyle(.plain)
         .disabled(disabled)

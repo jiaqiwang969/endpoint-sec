@@ -23,6 +23,12 @@ private struct LaunchctlServiceStatus {
     let detail: String
 }
 
+enum DaemonActionKind: Equatable {
+    case starting
+    case stopping
+    case restarting
+}
+
 private func runProcessSync(
     launchPath: String,
     arguments: [String],
@@ -236,6 +242,27 @@ private func queryLaunchctlServiceStatus(serviceTarget: String) -> LaunchctlServ
     )
 }
 
+private func daemonStateHintText(from status: LaunchctlServiceStatus) -> String {
+    if status.running {
+        if let state = status.state, !state.isEmpty {
+            return "launchd: \(state)"
+        }
+        return "launchd: running"
+    }
+
+    if status.exists {
+        if let state = status.state, !state.isEmpty {
+            return "launchd: \(state)"
+        }
+        return "launchd: 已加载但未运行"
+    }
+
+    if !status.detail.isEmpty {
+        return "launchd: 未加载"
+    }
+    return "launchd: 未知"
+}
+
 private func trimTrailingSlashes(_ path: String) -> String {
     if path == "/" { return "/" }
     var normalized = path
@@ -304,12 +331,14 @@ private func writePolicyFile(_ policy: SecurityPolicy, path: String) throws {
 @MainActor
 final class ESGuardViewModel: ObservableObject {
     @Published var guardRunning: Bool = false
+    @Published var daemonStateHint: String = "launchd: 状态未知"
     @Published var records: [DenialRecord] = [] // UI 列表使用，只保留最新的 500 条
     @Published var policy: SecurityPolicy = .empty
     @Published var lastDenial: String = "暂无最新拦截记录"
     @Published var overrideMessage: String = ""
     @Published var overrideSuccess: Bool = false
     @Published var daemonActionInProgress: Bool = false
+    @Published var daemonCurrentAction: DaemonActionKind? = nil
     @Published var logLines: [LogLine] = []
     
     // 全局真实统计数据 (不限于内存里的前 N 条)
@@ -381,8 +410,10 @@ final class ESGuardViewModel: ObservableObject {
         daemonControlQueue.async {
             let status = queryLaunchctlServiceStatus(serviceTarget: serviceTarget)
             let running = status.running
+            let hint = daemonStateHintText(from: status)
             DispatchQueue.main.async { [weak self] in
                 self?.guardRunning = running
+                self?.daemonStateHint = hint
             }
         }
     }
@@ -420,6 +451,7 @@ final class ESGuardViewModel: ObservableObject {
     func startDaemon() {
         guard !daemonActionInProgress else { return }
         daemonActionInProgress = true
+        daemonCurrentAction = .starting
         let serviceTarget = daemonServiceTarget
         let plistPath = daemonPlistPath
 
@@ -443,6 +475,9 @@ final class ESGuardViewModel: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 self.daemonActionInProgress = false
+                self.daemonCurrentAction = nil
+                self.guardRunning = started
+                self.daemonStateHint = daemonStateHintText(from: status)
                 self.refreshGuardRunningAfterDelay()
                 if started {
                     if transaction.usedPrivilege {
@@ -470,6 +505,7 @@ final class ESGuardViewModel: ObservableObject {
     func stopDaemon() {
         guard !daemonActionInProgress else { return }
         daemonActionInProgress = true
+        daemonCurrentAction = .stopping
         let serviceTarget = daemonServiceTarget
 
         daemonControlQueue.async {
@@ -483,6 +519,9 @@ final class ESGuardViewModel: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 self.daemonActionInProgress = false
+                self.daemonCurrentAction = nil
+                self.guardRunning = status.running
+                self.daemonStateHint = daemonStateHintText(from: status)
                 self.refreshGuardRunningAfterDelay()
                 if stopped {
                     if transaction.usedPrivilege {
@@ -506,6 +545,7 @@ final class ESGuardViewModel: ObservableObject {
     func restartDaemon() {
         guard !daemonActionInProgress else { return }
         daemonActionInProgress = true
+        daemonCurrentAction = .restarting
         let serviceTarget = daemonServiceTarget
 
         daemonControlQueue.async {
@@ -519,6 +559,9 @@ final class ESGuardViewModel: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 self.daemonActionInProgress = false
+                self.daemonCurrentAction = nil
+                self.guardRunning = restarted
+                self.daemonStateHint = daemonStateHintText(from: status)
                 self.refreshGuardRunningAfterDelay()
                 if restarted {
                     if transaction.usedPrivilege {
