@@ -37,29 +37,43 @@ struct DashboardView: View {
                     )
                 }
 
-                Button("开启") {
-                    viewModel.startDaemon()
-                }
-                .buttonStyle(.borderless)
-                .disabled(viewModel.guardRunning || viewModel.daemonActionInProgress)
-                .help("启动 launchd 中的 codex-es-guard")
+                HStack(spacing: 8) {
+                    DaemonCapsuleControl(
+                        guardRunning: viewModel.guardRunning,
+                        actionInProgress: viewModel.daemonActionInProgress,
+                        onStart: { viewModel.startDaemon() },
+                        onStop: { viewModel.stopDaemon() }
+                    )
+                    .help("胶囊开关：启动或停止 launchd 中的 codex-es-guard")
 
-                Button("关闭") {
-                    viewModel.stopDaemon()
+                    Button(action: {
+                        viewModel.restartDaemon()
+                    }) {
+                        Group {
+                            if viewModel.daemonActionInProgress {
+                                ProgressView()
+                                    .progressViewStyle(.circular)
+                                    .controlSize(.small)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                        }
+                        .frame(width: 14, height: 14)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.plain)
+                    .background(
+                        Capsule()
+                            .fill(Color(NSColor.controlBackgroundColor))
+                    )
+                    .overlay(
+                        Capsule()
+                            .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+                    )
+                    .disabled(viewModel.daemonActionInProgress)
+                    .help("重启守护进程")
                 }
-                .buttonStyle(.borderless)
-                .disabled(!viewModel.guardRunning || viewModel.daemonActionInProgress)
-                .foregroundColor(.red)
-                .help("临时停止 launchd 中的 codex-es-guard")
-
-                Button(action: {
-                    viewModel.restartDaemon()
-                }) {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.plain)
-                .disabled(viewModel.daemonActionInProgress)
-                .help("重启守护进程")
             }
             .padding(.horizontal)
             .padding(.top, 12)
@@ -125,5 +139,64 @@ struct DashboardView: View {
         .onChange(of: currentTab) { _ in
             viewModel.acknowledgeRecords() // 切换 Tab 也算已读
         }
+    }
+}
+
+private struct DaemonCapsuleControl: View {
+    let guardRunning: Bool
+    let actionInProgress: Bool
+    let onStart: () -> Void
+    let onStop: () -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            capsuleButton(
+                title: "开启",
+                isActive: guardRunning,
+                tint: .green,
+                disabled: guardRunning || actionInProgress,
+                action: onStart
+            )
+
+            capsuleButton(
+                title: "关闭",
+                isActive: !guardRunning,
+                tint: .red,
+                disabled: !guardRunning || actionInProgress,
+                action: onStop
+            )
+        }
+        .padding(3)
+        .background(
+            Capsule()
+                .fill(Color(NSColor.controlBackgroundColor))
+        )
+        .overlay(
+            Capsule()
+                .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+        )
+    }
+
+    private func capsuleButton(
+        title: String,
+        isActive: Bool,
+        tint: Color,
+        disabled: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundColor(isActive ? .white : tint.opacity(disabled ? 0.45 : 1.0))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .frame(minWidth: 48)
+                .background(
+                    Capsule()
+                        .fill(isActive ? tint.opacity(disabled ? 0.55 : 1.0) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
     }
 }

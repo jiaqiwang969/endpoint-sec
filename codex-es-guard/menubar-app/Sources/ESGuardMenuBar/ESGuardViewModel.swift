@@ -2,6 +2,243 @@ import Foundation
 import SwiftUI
 import Combine
 
+private struct ProcessExecutionResult {
+    let status: Int32
+    let stdout: String
+    let stderr: String
+}
+
+private struct RecordsSnapshot {
+    let totalIntercepts: Int
+    let totalDeletes: Int
+    let totalMoves: Int
+    let records: [DenialRecord]
+    let agentStats: [AgentStats]
+}
+
+private func runProcessSync(
+    launchPath: String,
+    arguments: [String],
+    currentDirectory: String? = nil,
+    environment: [String: String]? = nil
+) -> ProcessExecutionResult? {
+    let task = Process()
+    task.launchPath = launchPath
+    task.arguments = arguments
+    if let currentDirectory {
+        task.currentDirectoryURL = URL(fileURLWithPath: currentDirectory)
+    }
+    if let environment {
+        var merged = ProcessInfo.processInfo.environment
+        for (key, value) in environment {
+            merged[key] = value
+        }
+        task.environment = merged
+    }
+
+    let stdoutPipe = Pipe()
+    let stderrPipe = Pipe()
+    task.standardOutput = stdoutPipe
+    task.standardError = stderrPipe
+
+    do {
+        try task.run()
+        task.waitUntilExit()
+    } catch {
+        return nil
+    }
+
+    let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+    let stdout = String(data: stdoutData, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let stderr = String(data: stderrData, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+    return ProcessExecutionResult(
+        status: task.terminationStatus,
+        stdout: stdout,
+        stderr: stderr
+    )
+}
+
+private func parseDenialsSnapshot(from data: Data) -> RecordsSnapshot {
+    let lines = String(data: data, encoding: .utf8)?.split(separator: "\n") ?? []
+    let decoder = JSONDecoder()
+    var allParsed: [DenialRecord] = []
+    allParsed.reserveCapacity(lines.count)
+
+    var deletes = 0
+    var moves = 0
+    var statsDict: [String: (del: Int, mov: Int)] = [:]
+
+    for line in lines {
+        guard let lineData = String(line).data(using: .utf8),
+              let record = try? decoder.decode(DenialRecord.self, from: lineData) else {
+            continue
+        }
+
+        allParsed.append(record)
+        let key = record.ancestor
+        let current = statsDict[key] ?? (0, 0)
+        if record.op == "unlink" {
+            deletes += 1
+            statsDict[key] = (current.del + 1, current.mov)
+        } else if record.op == "rename" {
+            moves += 1
+            statsDict[key] = (current.del, current.mov + 1)
+        }
+    }
+
+    let uiRecords = Array(allParsed.reversed().prefix(500))
+    let agentStats = statsDict.map { key, value in
+        AgentStats(agentName: key, deleteCount: value.del, moveCount: value.mov)
+    }.sorted(by: { $0.total > $1.total })
+
+    return RecordsSnapshot(
+        totalIntercepts: allParsed.count,
+        totalDeletes: deletes,
+        totalMoves: moves,
+        records: uiRecords,
+        agentStats: agentStats
+    )
+}
+
+private func shellQuote(_ value: String) -> String {
+    if value.isEmpty {
+        return "''"
+    }
+    let escaped = value.replacingOccurrences(of: "'", with: "'\"'\"'")
+    return "'\(escaped)'"
+}
+
+private func escapeForAppleScript(_ value: String) -> String {
+    value
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+}
+
+private func runPrivilegedShellSync(command: String) -> ProcessExecutionResult? {
+    let appleScriptCommand = "do shell script \"\(escapeForAppleScript(command))\" with administrator privileges"
+    return runProcessSync(
+        launchPath: "/usr/bin/osascript",
+        arguments: ["-e", appleScriptCommand]
+    )
+}
+
+private func bestProcessDetail(_ result: ProcessExecutionResult?) -> String {
+    if let result {
+        if !result.stderr.isEmpty { return result.stderr }
+        if !result.stdout.isEmpty { return result.stdout }
+    }
+    return ""
+}
+
+private func isPermissionDeniedMessage(_ message: String) -> Bool {
+    let lowered = message.lowercased()
+    return lowered.contains("operation not permitted")
+        || lowered.contains("not permitted")
+        || lowered.contains("could not enable service")
+        || lowered.contains("could not disable service")
+        || lowered.contains("boot-out failed: 1")
+        || lowered.contains("try re-running the command as root")
+        || lowered.contains("requires administrator privileges")
+}
+
+private func isUserCanceledMessage(_ message: String) -> Bool {
+    let lowered = message.lowercased()
+    return lowered.contains("user canceled")
+        || lowered.contains("user cancelled")
+        || lowered.contains("execution error: -128")
+        || lowered.contains("cancel")
+}
+
+private func shouldRetryLaunchctlWithPrivilege(
+    _ result: ProcessExecutionResult?,
+    arguments: [String]
+) -> Bool {
+    guard let result else { return true }
+    guard result.status != 0 else { return false }
+    let detail = bestProcessDetail(result)
+    if isPermissionDeniedMessage(detail) {
+        return true
+    }
+
+    let lowered = detail.lowercased()
+    let targetsSystemDomain = arguments.contains("system")
+        || arguments.contains(where: { $0.hasPrefix("system/") })
+
+    if targetsSystemDomain && lowered.contains("input/output error") {
+        return true
+    }
+
+    return false
+}
+
+private func runLaunchctlCommand(arguments: [String]) -> (result: ProcessExecutionResult?, usedPrivilege: Bool) {
+    let direct = runProcessSync(launchPath: "/bin/launchctl", arguments: arguments)
+    guard shouldRetryLaunchctlWithPrivilege(direct, arguments: arguments) else {
+        return (direct, false)
+    }
+
+    let shellCommand = (["/bin/launchctl"] + arguments).map(shellQuote).joined(separator: " ")
+    let privileged = runPrivilegedShellSync(command: shellCommand)
+    return (privileged ?? direct, true)
+}
+
+private func trimTrailingSlashes(_ path: String) -> String {
+    if path == "/" { return "/" }
+    var normalized = path
+    while normalized.hasSuffix("/") {
+        normalized.removeLast()
+    }
+    return normalized.isEmpty ? "/" : normalized
+}
+
+private func pathPrefixMatch(_ path: String, prefix: String) -> Bool {
+    let normalizedPath = trimTrailingSlashes(path)
+    let normalizedPrefix = trimTrailingSlashes(prefix)
+
+    guard normalizedPrefix.hasPrefix("/") else { return false }
+    if normalizedPrefix == "/" {
+        return normalizedPath.hasPrefix("/")
+    }
+    return normalizedPath == normalizedPrefix || normalizedPath.hasPrefix(normalizedPrefix + "/")
+}
+
+private func acquireDirectoryLock(path: String, retries: Int = 100, sleepMs: UInt32 = 50) -> URL? {
+    let lockURL = URL(fileURLWithPath: path)
+    for _ in 0..<max(retries, 1) {
+        do {
+            try FileManager.default.createDirectory(
+                at: lockURL,
+                withIntermediateDirectories: false
+            )
+            return lockURL
+        } catch {
+            usleep(sleepMs * 1_000)
+        }
+    }
+    return nil
+}
+
+private func releaseDirectoryLock(_ lockURL: URL?) {
+    guard let lockURL else { return }
+    try? FileManager.default.removeItem(at: lockURL)
+}
+
+private func readPolicyFile(path: String) throws -> SecurityPolicy {
+    let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    return try JSONDecoder().decode(SecurityPolicy.self, from: data)
+}
+
+private func writePolicyFile(_ policy: SecurityPolicy, path: String) throws {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(policy)
+    try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+}
+
 @MainActor
 final class ESGuardViewModel: ObservableObject {
     @Published var guardRunning: Bool = false
@@ -31,6 +268,7 @@ final class ESGuardViewModel: ObservableObject {
     // File paths
     private let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
     var policyPath: String { "\(homeDir)/.codex/es_policy.json" }
+    private var policyLockPath: String { "\(policyPath).lock" }
     private var denialsPath: String { "\(homeDir)/.codex/es-guard/denials.jsonl" }
     private var lastDenialPath: String { "\(homeDir)/.codex/es-guard/last_denial.txt" }
     private let logPath = "/tmp/codex-es-guard.log"
@@ -43,7 +281,7 @@ final class ESGuardViewModel: ObservableObject {
     
     private var previousRecordCount: Int = 0
     private var isFirstLoad: Bool = true
-    private var revokeTimers: [String: Timer] = [:]
+    private var recordsLoadToken: UInt64 = 0
 
     init() {
         refresh()
@@ -53,9 +291,6 @@ final class ESGuardViewModel: ObservableObject {
     deinit {
         fileMonitor.stopAll()
         logTailer.stopTailing()
-        for timer in revokeTimers.values {
-            timer.invalidate()
-        }
     }
     
     func refresh() {
@@ -72,18 +307,15 @@ final class ESGuardViewModel: ObservableObject {
     }
     
     private func checkGuardRunning() {
-        let task = Process()
-        task.launchPath = "/usr/bin/pgrep"
-        task.arguments = ["-x", "codex-es-guard"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        
-        do {
-            try task.run()
-            task.waitUntilExit()
-            self.guardRunning = (task.terminationStatus == 0)
-        } catch {
-            self.guardRunning = false
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = runProcessSync(
+                launchPath: "/usr/bin/pgrep",
+                arguments: ["-x", "codex-es-guard"]
+            )
+            let running = (result?.status == 0)
+            DispatchQueue.main.async { [weak self] in
+                self?.guardRunning = running
+            }
         }
     }
 
@@ -97,40 +329,6 @@ final class ESGuardViewModel: ObservableObject {
         return nil
     }
 
-    private func runProcess(
-        launchPath: String,
-        arguments: [String],
-        currentDirectory: String? = nil
-    ) -> (status: Int32, stdout: String, stderr: String)? {
-        let task = Process()
-        task.launchPath = launchPath
-        task.arguments = arguments
-        if let currentDirectory {
-            task.currentDirectoryURL = URL(fileURLWithPath: currentDirectory)
-        }
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        task.standardOutput = stdoutPipe
-        task.standardError = stderrPipe
-
-        do {
-            try task.run()
-            task.waitUntilExit()
-        } catch {
-            return nil
-        }
-
-        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        let stdout = String(data: stdoutData, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let stderr = String(data: stderrData, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-        return (task.terminationStatus, stdout, stderr)
-    }
-
     private func presentMessage(_ message: String, success: Bool, clearAfter seconds: TimeInterval = 4.0) {
         self.overrideMessage = message
         self.overrideSuccess = success
@@ -141,7 +339,7 @@ final class ESGuardViewModel: ObservableObject {
         }
     }
 
-    private func refreshGuardRunningAfterDelay(_ delay: TimeInterval = 0.8) {
+    private func refreshGuardRunningAfterDelay(_ delay: TimeInterval = 0.25) {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
             self.checkGuardRunning()
         }
@@ -150,72 +348,127 @@ final class ESGuardViewModel: ObservableObject {
     func startDaemon() {
         guard !daemonActionInProgress else { return }
         daemonActionInProgress = true
-        defer { daemonActionInProgress = false }
+        let serviceTarget = daemonServiceTarget
+        let plistPath = daemonPlistPath
 
-        _ = runProcess(launchPath: "/bin/launchctl", arguments: ["enable", daemonServiceTarget])
-        let kick = runProcess(launchPath: "/bin/launchctl", arguments: ["kickstart", "-k", daemonServiceTarget])
+        DispatchQueue.global(qos: .userInitiated).async {
+            let enableResult = runLaunchctlCommand(arguments: ["enable", serviceTarget])
+            let kickResult = runLaunchctlCommand(arguments: ["kickstart", "-k", serviceTarget])
 
-        var started = (kick?.status == 0)
-        var details = kick?.stderr ?? ""
+            var usedPrivilege = enableResult.usedPrivilege || kickResult.usedPrivilege
+            var started = (kickResult.result?.status == 0)
+            var details = bestProcessDetail(kickResult.result)
 
-        if !started, FileManager.default.fileExists(atPath: daemonPlistPath) {
-            _ = runProcess(launchPath: "/bin/launchctl", arguments: ["bootstrap", "system", daemonPlistPath])
-            let retryKick = runProcess(launchPath: "/bin/launchctl", arguments: ["kickstart", "-k", daemonServiceTarget])
-            started = (retryKick?.status == 0)
-            if let retryErr = retryKick?.stderr, !retryErr.isEmpty {
-                details = retryErr
+            if !started, FileManager.default.fileExists(atPath: plistPath) {
+                let bootstrapResult = runLaunchctlCommand(arguments: ["bootstrap", "system", plistPath])
+                let retryKickResult = runLaunchctlCommand(arguments: ["kickstart", "-k", serviceTarget])
+                usedPrivilege = usedPrivilege || bootstrapResult.usedPrivilege || retryKickResult.usedPrivilege
+                started = (retryKickResult.result?.status == 0)
+                let retryDetail = bestProcessDetail(retryKickResult.result)
+                if !retryDetail.isEmpty {
+                    details = retryDetail
+                } else {
+                    let bootstrapDetail = bestProcessDetail(bootstrapResult.result)
+                    if !bootstrapDetail.isEmpty {
+                        details = bootstrapDetail
+                    }
+                }
             }
-        }
 
-        refreshGuardRunningAfterDelay()
-        if started {
-            presentMessage("守护进程已请求启动", success: true)
-        } else if details.isEmpty {
-            presentMessage("启动失败，请检查 launchctl 权限或守护配置", success: false, clearAfter: 6.0)
-        } else {
-            presentMessage("启动失败: \(details)", success: false, clearAfter: 6.0)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.daemonActionInProgress = false
+                self.refreshGuardRunningAfterDelay()
+                if started {
+                    if usedPrivilege {
+                        self.presentMessage("守护进程已请求启动（已完成管理员授权）", success: true)
+                    } else {
+                        self.presentMessage("守护进程已请求启动", success: true)
+                    }
+                } else if details.lowercased().contains("could not find service") {
+                    self.presentMessage(
+                        "启动失败：系统中未加载 dev.codex-es-guard，请先执行 nix switch/make 再试",
+                        success: false,
+                        clearAfter: 7.0
+                    )
+                } else if isUserCanceledMessage(details) {
+                    self.presentMessage("启动已取消：未完成管理员授权", success: false, clearAfter: 6.0)
+                } else if details.isEmpty {
+                    self.presentMessage("启动失败，请检查 launchctl 权限或守护配置", success: false, clearAfter: 6.0)
+                } else {
+                    self.presentMessage("启动失败: \(details)", success: false, clearAfter: 6.0)
+                }
+            }
         }
     }
 
     func stopDaemon() {
         guard !daemonActionInProgress else { return }
         daemonActionInProgress = true
-        defer { daemonActionInProgress = false }
+        let serviceTarget = daemonServiceTarget
 
-        _ = runProcess(launchPath: "/bin/launchctl", arguments: ["disable", daemonServiceTarget])
-        let bootout = runProcess(launchPath: "/bin/launchctl", arguments: ["bootout", daemonServiceTarget])
+        DispatchQueue.global(qos: .userInitiated).async {
+            let disableResult = runLaunchctlCommand(arguments: ["disable", serviceTarget])
+            let bootoutResult = runLaunchctlCommand(arguments: ["bootout", serviceTarget])
 
-        let stderr = bootout?.stderr ?? ""
-        let likelyAlreadyStopped = stderr.contains("No such process")
-            || stderr.contains("not found")
-            || stderr.contains("No such file or directory")
-        let stopped = (bootout?.status == 0) || likelyAlreadyStopped
+            let usedPrivilege = disableResult.usedPrivilege || bootoutResult.usedPrivilege
+            let details = bestProcessDetail(bootoutResult.result)
+            let likelyAlreadyStopped = details.contains("No such process")
+                || details.contains("not found")
+                || details.contains("No such file or directory")
+            let stopped = (bootoutResult.result?.status == 0) || likelyAlreadyStopped
 
-        refreshGuardRunningAfterDelay()
-        if stopped {
-            presentMessage("守护进程已请求停止", success: true)
-        } else if stderr.isEmpty {
-            presentMessage("停止失败，请检查 launchctl 权限或守护配置", success: false, clearAfter: 6.0)
-        } else {
-            presentMessage("停止失败: \(stderr)", success: false, clearAfter: 6.0)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.daemonActionInProgress = false
+                self.refreshGuardRunningAfterDelay()
+                if stopped {
+                    if usedPrivilege {
+                        self.presentMessage("守护进程已请求停止（已完成管理员授权）", success: true)
+                    } else {
+                        self.presentMessage("守护进程已请求停止", success: true)
+                    }
+                } else if isUserCanceledMessage(details) {
+                    self.presentMessage("停止已取消：未完成管理员授权", success: false, clearAfter: 6.0)
+                } else if isPermissionDeniedMessage(details) {
+                    self.presentMessage("停止失败：需要管理员权限，请在弹窗中授权", success: false, clearAfter: 6.0)
+                } else if details.isEmpty {
+                    self.presentMessage("停止失败，请检查 launchctl 权限或守护配置", success: false, clearAfter: 6.0)
+                } else {
+                    self.presentMessage("停止失败: \(details)", success: false, clearAfter: 6.0)
+                }
+            }
         }
     }
     
     func restartDaemon() {
         guard !daemonActionInProgress else { return }
         daemonActionInProgress = true
-        defer { daemonActionInProgress = false }
+        let serviceTarget = daemonServiceTarget
 
-        let kick = runProcess(launchPath: "/bin/launchctl", arguments: ["kickstart", "-k", daemonServiceTarget])
-        refreshGuardRunningAfterDelay()
-        if kick?.status == 0 {
-            presentMessage("守护进程已成功重启", success: true)
-        } else {
-            let detail = kick?.stderr ?? ""
-            if detail.isEmpty {
-                presentMessage("重启失败，可能存在权限或配置问题", success: false, clearAfter: 6.0)
-            } else {
-                presentMessage("重启失败: \(detail)", success: false, clearAfter: 6.0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let kickResult = runLaunchctlCommand(arguments: ["kickstart", "-k", serviceTarget])
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.daemonActionInProgress = false
+                self.refreshGuardRunningAfterDelay()
+                if kickResult.result?.status == 0 {
+                    if kickResult.usedPrivilege {
+                        self.presentMessage("守护进程已成功重启（已完成管理员授权）", success: true)
+                    } else {
+                        self.presentMessage("守护进程已成功重启", success: true)
+                    }
+                } else {
+                    let detail = bestProcessDetail(kickResult.result)
+                    if isUserCanceledMessage(detail) {
+                        self.presentMessage("重启已取消：未完成管理员授权", success: false, clearAfter: 6.0)
+                    } else if detail.isEmpty {
+                        self.presentMessage("重启失败，可能存在权限或配置问题", success: false, clearAfter: 6.0)
+                    } else {
+                        self.presentMessage("重启失败: \(detail)", success: false, clearAfter: 6.0)
+                    }
+                }
             }
         }
     }
@@ -245,67 +498,45 @@ final class ESGuardViewModel: ObservableObject {
     }
     
     private func loadRecords() {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: denialsPath)) else {
-            self.records = []
-            self.agentStats = []
-            self.totalIntercepts = 0
-            self.totalDeletes = 0
-            self.totalMoves = 0
-            return
-        }
-        
-        let lines = String(data: data, encoding: .utf8)?.split(separator: "\n") ?? []
-        let decoder = JSONDecoder()
-        
-        // 我们完整遍历所有的行，用于统计真实的全局数据和图表
-        var allParsed: [DenialRecord] = []
-        
-        for line in lines {
-            guard let lineData = String(line).data(using: .utf8) else { continue }
-            if let record = try? decoder.decode(DenialRecord.self, from: lineData) {
-                allParsed.append(record)
+        recordsLoadToken += 1
+        let token = recordsLoadToken
+        let path = denialsPath
+
+        DispatchQueue.global(qos: .utility).async {
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    guard token == self.recordsLoadToken else { return }
+                    self.records = []
+                    self.agentStats = []
+                    self.totalIntercepts = 0
+                    self.totalDeletes = 0
+                    self.totalMoves = 0
+                    self.previousRecordCount = 0
+                    self.isFirstLoad = false
+                }
+                return
+            }
+
+            let snapshot = parseDenialsSnapshot(from: data)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                guard token == self.recordsLoadToken else { return }
+
+                if !self.isFirstLoad && snapshot.totalIntercepts > self.previousRecordCount,
+                   let newest = snapshot.records.first {
+                    NotificationService.shared.sendDenialNotification(for: newest)
+                }
+
+                self.previousRecordCount = snapshot.totalIntercepts
+                self.records = snapshot.records
+                self.totalIntercepts = snapshot.totalIntercepts
+                self.totalDeletes = snapshot.totalDeletes
+                self.totalMoves = snapshot.totalMoves
+                self.agentStats = snapshot.agentStats
+                self.isFirstLoad = false
             }
         }
-        
-        // 提取最新用于显示的列表，倒序，最多取前 500 条给 UI
-        let reversedAll = Array(allParsed.reversed())
-        let uiRecords = Array(reversedAll.prefix(500))
-        
-        // 发送通知逻辑：只根据最新状态判断
-        if !isFirstLoad && allParsed.count > self.previousRecordCount && !uiRecords.isEmpty {
-            if let newest = uiRecords.first {
-                NotificationService.shared.sendDenialNotification(for: newest)
-            }
-        }
-        
-        self.previousRecordCount = allParsed.count
-        self.records = uiRecords
-        
-        // 更新真实的全局统计数据
-        self.totalIntercepts = allParsed.count
-        var deletes = 0
-        var moves = 0
-        var statsDict: [String: (del: Int, mov: Int)] = [:]
-        
-        for r in allParsed {
-            let key = r.ancestor
-            let current = statsDict[key] ?? (0, 0)
-            if r.op == "unlink" {
-                deletes += 1
-                statsDict[key] = (current.del + 1, current.mov)
-            } else if r.op == "rename" {
-                moves += 1
-                statsDict[key] = (current.del, current.mov + 1)
-            }
-        }
-        
-        self.totalDeletes = deletes
-        self.totalMoves = moves
-        self.agentStats = statsDict.map { k, v in
-            AgentStats(agentName: k, deleteCount: v.del, moveCount: v.mov)
-        }.sorted(by: { $0.total > $1.total })
-        
-        self.isFirstLoad = false
     }
     
     private func loadPolicy() {
@@ -324,32 +555,134 @@ final class ESGuardViewModel: ObservableObject {
             self.lastDenial = "暂无最新拦截记录"
         }
     }
+
+    private func normalizedAbsolutePath(from rawPath: String) -> String? {
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let expanded = NSString(string: trimmed).expandingTildeInPath
+        let normalized = URL(fileURLWithPath: expanded).standardizedFileURL.path
+        return normalized.hasPrefix("/") ? normalized : nil
+    }
+
+    private func isInProtectedZone(_ path: String) -> Bool {
+        policy.protectedZones.contains(where: { pathPrefixMatch(path, prefix: $0) })
+    }
+
+    private func isDangerousBroadPath(_ path: String) -> Bool {
+        let normalized = trimTrailingSlashes(path)
+        let home = trimTrailingSlashes(homeDir)
+        if normalized == "/" || normalized == home {
+            return true
+        }
+        return policy.protectedZones.contains(where: { trimTrailingSlashes($0) == normalized })
+    }
+
+    private func mutatePolicyOnDisk(
+        successMessage: String? = nil,
+        successClearAfter: TimeInterval = 4.0,
+        mutation: @escaping (inout SecurityPolicy) -> Void
+    ) {
+        let policyPath = self.policyPath
+        let lockPath = self.policyLockPath
+        let fallbackPolicy = self.policy
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let lockURL = acquireDirectoryLock(path: lockPath) else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.presentMessage("策略文件正被占用，请稍后重试", success: false, clearAfter: 6.0)
+                }
+                return
+            }
+            defer { releaseDirectoryLock(lockURL) }
+
+            var updatedPolicy = (try? readPolicyFile(path: policyPath)) ?? fallbackPolicy
+            mutation(&updatedPolicy)
+
+            do {
+                try writePolicyFile(updatedPolicy, path: policyPath)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.policy = updatedPolicy
+                    if let successMessage {
+                        self.presentMessage(successMessage, success: true, clearAfter: successClearAfter)
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    self?.presentMessage(
+                        "更新策略文件失败: \(error.localizedDescription)",
+                        success: false,
+                        clearAfter: 6.0
+                    )
+                }
+            }
+        }
+    }
     
     func requestOverride(for path: String) {
-        let cleanPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanPath.isEmpty else { return }
-        
-        let task = Process()
-        task.launchPath = "/usr/local/bin/es-guard-override"
-        task.arguments = [cleanPath]
-        
-        do {
-            try task.run()
-            task.waitUntilExit()
-            if task.terminationStatus == 0 {
-                self.presentMessage("成功将 \(URL(fileURLWithPath: cleanPath).lastPathComponent) 设为临时放行", success: true)
-                scheduleOverrideRevocation(for: cleanPath)
-            } else {
-                self.presentMessage("放行执行失败 (退出码: \(task.terminationStatus))", success: false)
+        guard let cleanPath = normalizedAbsolutePath(from: path) else {
+            presentMessage("放行失败：路径必须是绝对路径", success: false, clearAfter: 6.0)
+            return
+        }
+        guard isInProtectedZone(cleanPath) else {
+            presentMessage("放行失败：该路径不在受保护目录中，无需放行", success: false, clearAfter: 6.0)
+            return
+        }
+        guard !isDangerousBroadPath(cleanPath) else {
+            presentMessage("放行失败：禁止对根目录/家目录/保护目录根做整段放行", success: false, clearAfter: 7.0)
+            return
+        }
+
+        let revokeMinutes = autoRevokeMinutes
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let env = ["ES_GUARD_OVERRIDE_MINUTES": "\(max(revokeMinutes, 0))"]
+            let result = runProcessSync(
+                launchPath: "/usr/local/bin/es-guard-override",
+                arguments: [cleanPath],
+                environment: env
+            )
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                if let result, result.status == 0 {
+                    if revokeMinutes > 0 {
+                        self.presentMessage(
+                            "成功将 \(URL(fileURLWithPath: cleanPath).lastPathComponent) 设为临时放行（\(revokeMinutes) 分钟）",
+                            success: true
+                        )
+                    } else {
+                        self.presentMessage(
+                            "成功放行 \(URL(fileURLWithPath: cleanPath).lastPathComponent)（不过期，请手动清理）",
+                            success: true
+                        )
+                    }
+                    self.refresh()
+                    return
+                }
+
+                if let result {
+                    let detail = result.stderr.isEmpty ? result.stdout : result.stderr
+                    if detail.isEmpty {
+                        self.presentMessage("放行执行失败 (退出码: \(result.status))", success: false)
+                    } else {
+                        self.presentMessage("放行执行失败: \(detail)", success: false)
+                    }
+                } else {
+                    self.presentMessage("放行程序调用出错，请检查 es-guard-override 是否可执行", success: false)
+                }
             }
-        } catch {
-            self.presentMessage("放行程序调用出错: \(error.localizedDescription)", success: false)
         }
     }
 
     func requestQuarantine(for path: String) {
-        let cleanPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanPath.isEmpty else { return }
+        guard let cleanPath = normalizedAbsolutePath(from: path) else {
+            presentMessage("隔离失败: 路径必须是绝对路径", success: false, clearAfter: 6.0)
+            return
+        }
+        guard !isDangerousBroadPath(cleanPath) else {
+            presentMessage("隔离失败: 目标过于宽泛，请选择具体文件或子目录", success: false, clearAfter: 6.0)
+            return
+        }
 
         let fileURL = URL(fileURLWithPath: cleanPath)
         let parentDir = fileURL.deletingLastPathComponent().path
@@ -358,90 +691,68 @@ final class ESGuardViewModel: ObservableObject {
             return
         }
 
-        let result = runProcess(
-            launchPath: "/usr/local/bin/es-guard-quarantine",
-            arguments: [cleanPath],
-            currentDirectory: parentDir
-        )
-
-        if let result, result.status == 0 {
-            presentMessage(
-                "已将 \(fileURL.lastPathComponent) 隔离到 \(parentDir)/temp",
-                success: true,
-                clearAfter: 5.0
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = runProcessSync(
+                launchPath: "/usr/local/bin/es-guard-quarantine",
+                arguments: [cleanPath],
+                currentDirectory: parentDir
             )
-            refresh()
-        } else if let result {
-            let detail = result.stderr.isEmpty ? result.stdout : result.stderr
-            if detail.isEmpty {
-                presentMessage("隔离失败，请检查路径和权限", success: false, clearAfter: 6.0)
-            } else {
-                presentMessage("隔离失败: \(detail)", success: false, clearAfter: 6.0)
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                if let result, result.status == 0 {
+                    self.presentMessage(
+                        "已将 \(fileURL.lastPathComponent) 隔离到 \(parentDir)/temp",
+                        success: true,
+                        clearAfter: 5.0
+                    )
+                    self.refresh()
+                } else if let result {
+                    let detail = result.stderr.isEmpty ? result.stdout : result.stderr
+                    if detail.isEmpty {
+                        self.presentMessage("隔离失败，请检查路径和权限", success: false, clearAfter: 6.0)
+                    } else {
+                        self.presentMessage("隔离失败: \(detail)", success: false, clearAfter: 6.0)
+                    }
+                } else {
+                    self.presentMessage("隔离失败: 无法调用 es-guard-quarantine", success: false, clearAfter: 6.0)
+                }
             }
-        } else {
-            presentMessage("隔离失败: 无法调用 es-guard-quarantine", success: false, clearAfter: 6.0)
         }
     }
     
-    private func scheduleOverrideRevocation(for path: String) {
-        revokeTimers[path]?.invalidate()
-        if autoRevokeMinutes <= 0 { return }
-        
-        let duration = TimeInterval(autoRevokeMinutes * 60)
-        let timer = Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { [weak self] _ in
-            Task { @MainActor in
-                self?.removeOverride(path: path, autoRevoked: true)
-                self?.revokeTimers.removeValue(forKey: path)
-            }
-        }
-        revokeTimers[path] = timer
-    }
-    
-    func removeOverride(path: String, autoRevoked: Bool = false) {
-        var newPolicy = self.policy
-        newPolicy.temporaryOverrides.removeAll(where: { $0 == path })
-        
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = .prettyPrinted
-        let policyURL = URL(fileURLWithPath: policyPath)
-        
-        do {
-            let data = try encoder.encode(newPolicy)
-            try data.write(to: policyURL)
-            self.policy = newPolicy
-            
-            if autoRevoked {
-                self.presentMessage(
-                    "安全提醒: \(URL(fileURLWithPath: path).lastPathComponent) 临时放行期已满，自动清理。",
-                    success: true,
-                    clearAfter: 5.0
-                )
-                NotificationService.shared.sendAutoRevokeNotification(path: path)
-            }
-            
-        } catch {
-            print("Failed to remove override: \(error)")
+    func removeOverride(path: String) {
+        let normalizedPath = trimTrailingSlashes(path)
+        mutatePolicyOnDisk {
+            $0.temporaryOverrides.removeAll(where: { trimTrailingSlashes($0.path) == normalizedPath })
         }
     }
     
     func clearAllOverrides() {
-        var newPolicy = self.policy
-        newPolicy.temporaryOverrides = []
-        
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = .prettyPrinted
-        
-        do {
-            let data = try encoder.encode(newPolicy)
-            try data.write(to: URL(fileURLWithPath: policyPath))
-            self.presentMessage("已清除所有的临时放行路径", success: true, clearAfter: 3.0)
-            
-            for timer in revokeTimers.values {
-                timer.invalidate()
-            }
-            revokeTimers.removeAll()
-        } catch {
-            self.presentMessage("更新策略文件失败: \(error.localizedDescription)", success: false)
+        mutatePolicyOnDisk(successMessage: "已清除所有临时放行路径", successClearAfter: 3.0) {
+            $0.temporaryOverrides = []
+        }
+    }
+
+    func updateAllowTrustedToolsInAIContext(_ enabled: Bool) {
+        mutatePolicyOnDisk(
+            successMessage: enabled
+                ? "已开启兼容模式：AI 上下文可按 trusted_tools 放行（风险更高）"
+                : "已关闭兼容模式：AI 上下文将严格拦截（推荐）",
+            successClearAfter: 6.0
+        ) {
+            $0.allowTrustedToolsInAIContext = enabled
+        }
+    }
+
+    func updateAllowVCSMetadataInAIContext(_ enabled: Bool) {
+        mutatePolicyOnDisk(
+            successMessage: enabled
+                ? "已允许 AI 维护 .git/.jj 元数据（推荐，仍会拦截 git rm 工作区文件）"
+                : "已关闭 AI 的 .git/.jj 元数据放行（更严格，但可能影响 AI 执行 git commit）",
+            successClearAfter: 6.0
+        ) {
+            $0.allowVCSMetadataInAIContext = enabled
         }
     }
 }

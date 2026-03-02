@@ -106,7 +106,11 @@ struct StatusPanel: View {
                             Button(action: {
                                 viewModel.requestOverride(for: lastRecord.path)
                             }) {
-                                Text("临时放行此文件 (\(viewModel.autoRevokeMinutes)分钟)")
+                                Text(
+                                    viewModel.autoRevokeMinutes > 0
+                                        ? "临时放行此文件 (\(viewModel.autoRevokeMinutes)分钟)"
+                                        : "放行此文件（不过期，危险）"
+                                )
                                     .bold()
                             }
                             .buttonStyle(.borderedProminent)

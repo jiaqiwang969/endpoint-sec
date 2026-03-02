@@ -1,24 +1,102 @@
 #!/bin/bash
 # es-guard-override: Request temporary file deletion/move override for ES Guard
-# Usage: es-guard-override <path>
+# Usage: es-guard-override [--minutes N | --no-expire] <path>
 
 set -euo pipefail
+umask 077
 
 POLICY="$HOME/.codex/es_policy.json"
 FEEDBACK="$HOME/.codex/es-guard/last_denial.txt"
+DEFAULT_MINUTES="${ES_GUARD_OVERRIDE_MINUTES:-3}"
+MAX_MINUTES="${ES_GUARD_OVERRIDE_MAX_MINUTES:-30}"
+LOCK_DIR="${POLICY}.lock"
 
-if [ $# -lt 1 ]; then
-    echo "Usage: es-guard-override <path>"
+usage() {
+    echo "Usage: es-guard-override [--minutes N | --no-expire] <path>"
     echo "Tip: safer first step is es-guard-quarantine <path> (move to ./temp)."
-    echo ""
     if [ -f "$FEEDBACK" ]; then
+        echo ""
         echo "Last denial:"
         cat "$FEEDBACK"
     fi
+}
+
+normalize_path() {
+    local raw="$1"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$raw" <<'PY'
+import os
+import sys
+
+target = sys.argv[1]
+if os.path.exists(target) or os.path.islink(target):
+    print(os.path.realpath(target))
+else:
+    print(os.path.abspath(target))
+PY
+    else
+        echo "$raw"
+    fi
+}
+
+minutes=""
+target=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --minutes|-m)
+            shift
+            if [ $# -eq 0 ]; then
+                echo "Error: --minutes requires a value" >&2
+                usage
+                exit 1
+            fi
+            minutes="$1"
+            ;;
+        --no-expire)
+            minutes="0"
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        -*)
+            echo "Error: unknown option: $1" >&2
+            usage
+            exit 1
+            ;;
+        *)
+            if [ -n "$target" ]; then
+                echo "Error: only one target path is allowed" >&2
+                usage
+                exit 1
+            fi
+            target="$1"
+            ;;
+    esac
+    shift
+done
+
+if [ -z "$target" ]; then
+    usage
     exit 1
 fi
 
-TARGET="$1"
+if [ -z "$minutes" ]; then
+    minutes="$DEFAULT_MINUTES"
+fi
+
+if ! [[ "$minutes" =~ ^[0-9]+$ ]]; then
+    echo "Error: minutes must be a non-negative integer" >&2
+    exit 1
+fi
+if ! [[ "$MAX_MINUTES" =~ ^[0-9]+$ ]]; then
+    echo "Error: ES_GUARD_OVERRIDE_MAX_MINUTES must be a non-negative integer" >&2
+    exit 1
+fi
+if [ "$minutes" -gt 0 ] && [ "$minutes" -gt "$MAX_MINUTES" ]; then
+    echo "Error: minutes exceeds max allowed ($MAX_MINUTES)" >&2
+    exit 1
+fi
 
 if [ ! -f "$POLICY" ]; then
     echo "Error: Policy file not found: $POLICY"
@@ -30,17 +108,97 @@ if ! command -v jq &>/dev/null; then
     exit 1
 fi
 
-# Check if already overridden
-if jq -e --arg path "$TARGET" '.temporary_overrides | index($path)' "$POLICY" &>/dev/null; then
-    echo "Path already in temporary_overrides: $TARGET"
-    exit 0
+target="$(normalize_path "$target")"
+if [[ "$target" != /* ]]; then
+    echo "Error: target must resolve to an absolute path" >&2
+    exit 1
+fi
+if [ "$target" = "/" ]; then
+    echo "Error: refusing to override root path '/'" >&2
+    exit 1
 fi
 
-# Add to temporary_overrides
-jq --arg path "$TARGET" '.temporary_overrides += [$path]' "$POLICY" > "$POLICY.tmp" \
-    && mv "$POLICY.tmp" "$POLICY"
+if ! jq -e --arg path "$target" '
+  def trim_slash:
+    if . == "/" then "/" else sub("/+$"; "") end;
+  def prefix_match($p; $z):
+    ($p | trim_slash) as $np
+    | ($z | trim_slash) as $nz
+    | if $nz == "/" then
+        ($np | startswith("/"))
+      else
+        ($np == $nz) or ($np | startswith($nz + "/"))
+      end;
+  (.protected_zones // []) | any(. as $zone | prefix_match($path; $zone))
+' "$POLICY" >/dev/null; then
+    echo "Error: target is outside protected_zones, refusing broad override" >&2
+    exit 1
+fi
 
-echo "Override granted: $TARGET"
+now_ts="$(date +%s)"
+expires_json="null"
+if [ "$minutes" -gt 0 ]; then
+    expires_at=$((now_ts + (minutes * 60)))
+    expires_json="$expires_at"
+fi
+
+policy_dir="$(dirname "$POLICY")"
+for _ in $(seq 1 100); do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        break
+    fi
+    sleep 0.05
+done
+if [ ! -d "$LOCK_DIR" ]; then
+    echo "Error: policy file is busy, please retry" >&2
+    exit 1
+fi
+
+tmp_file=""
+trap 'if [ -n "${tmp_file:-}" ]; then rm -f "$tmp_file"; fi; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+tmp_file="$(mktemp "$policy_dir/es_policy.json.tmp.XXXXXX")"
+
+# Convert legacy string entries into object entries.
+# Also prune already-expired entries while writing.
+jq --arg path "$target" \
+   --argjson now "$now_ts" \
+   --argjson expires "$expires_json" '
+  def normalize:
+    if type == "string" then
+      { path: ., expires_at: null, created_at: null, created_by: "legacy" }
+    elif type == "object" then
+      {
+        path: (.path // ""),
+        expires_at: (.expires_at // null),
+        created_at: (.created_at // null),
+        created_by: (.created_by // null)
+      }
+    else
+      empty
+    end;
+  def still_active($ts):
+    (.expires_at == null) or (.expires_at > $ts);
+  .temporary_overrides = (
+    (.temporary_overrides // [])
+    | map(normalize)
+    | map(select(.path != "" and still_active($now)))
+    | map(select(.path != $path))
+    + [{
+      path: $path,
+      expires_at: $expires,
+      created_at: $now,
+      created_by: "es-guard-override"
+    }]
+  )
+' "$POLICY" > "$tmp_file" && mv "$tmp_file" "$POLICY"
+trap - EXIT
+rmdir "$LOCK_DIR" 2>/dev/null || true
+
+if [ "$minutes" -eq 0 ]; then
+    echo "Override granted (manual cleanup required): $target"
+else
+    echo "Override granted for $minutes minute(s): $target"
+fi
 echo "Waiting for policy reload (2s)..."
 sleep 2
 echo "Ready. You can now retry the operation."

@@ -6,7 +6,9 @@ Deleting or moving protected files will return "Operation not permitted".
 When you encounter this error:
 1. Read `~/.codex/es-guard/last_denial.txt` to understand why
 2. First use `es-guard-quarantine <path>` to move target into `./temp` in current directory
-3. Only if permanent deletion is still needed, ask human approval then run `es-guard-override <path>`
+3. Only if permanent deletion is still needed, ask human approval then run `es-guard-override --minutes 3 <path>` (or another short TTL)
+   - Never request override for broad paths like `/`, `$HOME`, or repository root unless human explicitly confirms emergency cleanup
+   - Do not attempt bypass via `git rm`, `git clean`, or language-level file APIs; these are treated as destructive flows too
 4. After override reloads, retry the original operation
 
 # 🛡️ Agent 独立安全审计与响应条约 (Security Code of Conduct)
@@ -22,5 +24,5 @@ When you encounter this error:
 4. **独立审查**：当内核拦截发生时，你必须立即停止当前执行的工作流，并执行以下审计：
    - 【宣读】：向用户明确说明你刚刚试图操作什么文件被系统判定为危险。
    - 【审视】：独立思考并评估该文件是否真的有必要被删除（是不是核心代码？有没有保留的备选方案？）。
-   - 【请示】：如果你确认该操作安全且必要，并且**完全不在上述红线范围内**，请先建议用户执行 `es-guard-quarantine <路径>`。仅在确认必须永久删除时，再请用户在 ESGuard 面板中放行或手动调用 `es-guard-override <路径>`。
+   - 【请示】：如果你确认该操作安全且必要，并且**完全不在上述红线范围内**，请先建议用户执行 `es-guard-quarantine <路径>`。仅在确认必须永久删除时，再请用户在 ESGuard 面板中放行或手动调用 `es-guard-override --minutes 3 <路径>`。
 5. **重试机制**：只有在用户明确回复你“已经放行”之后，你才可以再次尝试原本的文件操作。

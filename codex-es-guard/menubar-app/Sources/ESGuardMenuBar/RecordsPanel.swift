@@ -172,7 +172,11 @@ struct RecordRow: View {
             Button("先隔离到 temp") {
                 viewModel.requestQuarantine(for: record.path)
             }
-            Button("临时放行此文件 (\(viewModel.autoRevokeMinutes)分钟)") {
+            Button(
+                viewModel.autoRevokeMinutes > 0
+                    ? "临时放行此文件 (\(viewModel.autoRevokeMinutes)分钟)"
+                    : "放行此文件（不过期，危险）"
+            ) {
                 viewModel.requestOverride(for: record.path)
             }
         }

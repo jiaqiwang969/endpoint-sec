@@ -137,16 +137,33 @@
               POLICY_DIR="${homeDir}/.codex"
               POLICY_FILE="$POLICY_DIR/es_policy.json"
               mkdir -p "$POLICY_DIR"
+              chown ${cfg.user}:staff "$POLICY_DIR"
 
               EXISTING_OVERRIDES="[]"
+              EXISTING_TRUSTED_TOOLS="null"
+              EXISTING_AI_PATTERNS="null"
+              EXISTING_ALLOW_VCS_META_IN_AI="null"
+              EXISTING_ALLOW_TRUSTED_IN_AI="null"
               if [ -f "$POLICY_FILE" ]; then
                 EXISTING_OVERRIDES=$(${pkgs.jq}/bin/jq -c '.temporary_overrides // []' "$POLICY_FILE" 2>/dev/null || echo "[]")
+                EXISTING_TRUSTED_TOOLS=$(${pkgs.jq}/bin/jq -c '.trusted_tools // null' "$POLICY_FILE" 2>/dev/null || echo "null")
+                EXISTING_AI_PATTERNS=$(${pkgs.jq}/bin/jq -c '.ai_agent_patterns // null' "$POLICY_FILE" 2>/dev/null || echo "null")
+                EXISTING_ALLOW_VCS_META_IN_AI=$(${pkgs.jq}/bin/jq -c '.allow_vcs_metadata_in_ai_context // null' "$POLICY_FILE" 2>/dev/null || echo "null")
+                EXISTING_ALLOW_TRUSTED_IN_AI=$(${pkgs.jq}/bin/jq -c '.allow_trusted_tools_in_ai_context // null' "$POLICY_FILE" 2>/dev/null || echo "null")
               fi
 
               ${pkgs.jq}/bin/jq -n \
                 --argjson zones '${protectedZonesJson}' \
                 --argjson overrides "$EXISTING_OVERRIDES" \
-                '{protected_zones: $zones, temporary_overrides: $overrides}' \
+                --argjson trustedTools "$EXISTING_TRUSTED_TOOLS" \
+                --argjson aiPatterns "$EXISTING_AI_PATTERNS" \
+                --argjson allowVcsMetaInAi "$EXISTING_ALLOW_VCS_META_IN_AI" \
+                --argjson allowTrustedInAi "$EXISTING_ALLOW_TRUSTED_IN_AI" \
+                '({protected_zones: $zones, temporary_overrides: $overrides}
+                  + (if $trustedTools == null then {} else {trusted_tools: $trustedTools} end)
+                  + (if $aiPatterns == null then {} else {ai_agent_patterns: $aiPatterns} end)
+                  + (if $allowVcsMetaInAi == null then {} else {allow_vcs_metadata_in_ai_context: $allowVcsMetaInAi} end)
+                  + (if $allowTrustedInAi == null then {} else {allow_trusted_tools_in_ai_context: $allowTrustedInAi} end))' \
                 > "$POLICY_FILE"
               chown ${cfg.user}:staff "$POLICY_FILE"
               echo "codex-es-guard: policy synced ($(echo '${protectedZonesJson}' | ${pkgs.jq}/bin/jq length) zones)"
