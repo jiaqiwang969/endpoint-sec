@@ -143,6 +143,8 @@ rm /path/to/file  # 成功
 ```
 
 > 安全限流：`--minutes` 默认上限 30 分钟（可通过环境变量 `ES_GUARD_OVERRIDE_MAX_MINUTES` 调整），`--no-expire` 自动请求已禁用。
+>
+> root helper 还会校验 `requester_pid`：来自 AI 祖先进程的自动放行请求将被拒绝（避免 Agent 自行给自己放行）。
 
 ### es-guard-quarantine 命令（推荐第一步）
 
@@ -211,6 +213,8 @@ es-guard-quarantine /path/to/file
 - 策略文件支持 **热重载**（1 秒轮询），修改即生效
 - 守护进程会自动清理已过期的 runtime `temporary_overrides`，并镜像回策略文件给 UI 展示
 - root helper 会拒绝过长路径、超大请求文件，并限制最多 512 条同时生效的 runtime overrides
+- 请求队列增加每分钟速率限制（默认 120 条）与单轮处理上限（默认 256 条）以降低滥用风险
+- 所有放行请求都会写入 `~/.codex/es-guard/override-audit.jsonl` 审计日志（成功/失败都记录）
 - 默认兼顾效率与安全：允许 AI 的 git/jj 维护 `.git/.jj` 元数据，但 `git rm/git clean` 这类工作区删除仍会拦截
 - 默认更安全：AI 上下文不再因为 trusted_tools 自动放行；如需兼容可显式开启 `allow_trusted_tools_in_ai_context`
 - 路径匹配使用“目录边界匹配”：`/Users/you/0` 不会匹配 `/Users/you/01-agent`

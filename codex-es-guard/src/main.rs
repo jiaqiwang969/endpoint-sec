@@ -1,7 +1,7 @@
 use endpoint_sec::sys::{es_auth_result_t, es_event_type_t};
 use endpoint_sec::{Client, Event, EventRenameDestinationFile, Message};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -23,7 +23,10 @@ const OVERRIDE_STORE_DIR: &str = "/var/db/codex-es-guard";
 const MAX_OVERRIDE_PATH_LEN: usize = 4096;
 const MAX_RUNTIME_OVERRIDES: usize = 512;
 const MAX_OVERRIDE_REQUEST_SIZE_BYTES: u64 = 8192;
+const MAX_OVERRIDE_REQUESTS_PER_MINUTE: usize = 120;
+const MAX_OVERRIDE_REQUEST_FILES_PER_CYCLE: usize = 256;
 const STALE_RESPONSE_RETENTION_SECS: u64 = 300;
+const OVERRIDE_AUDIT_MAX_BYTES: u64 = 1_000_000;
 
 #[derive(Debug, Deserialize)]
 struct OverrideRequest {
@@ -33,6 +36,8 @@ struct OverrideRequest {
     path: Option<String>,
     #[serde(default)]
     minutes: Option<u64>,
+    #[serde(default)]
+    requester_pid: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -378,6 +383,19 @@ struct DenialRecord {
     zone: String,
     process: String,
     ancestor: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OverrideAuditRecord {
+    ts: u64,
+    request_id: String,
+    action: String,
+    path: Option<String>,
+    minutes: Option<u64>,
+    status: String,
+    message: String,
+    requester_pid: Option<i32>,
+    requester_process: Option<String>,
 }
 
 impl SecurityPolicy {
@@ -977,6 +995,49 @@ fn apply_override_request(
     }
 }
 
+fn consume_override_request_budget(window: &mut VecDeque<u64>, now: u64) -> bool {
+    while let Some(oldest) = window.front().copied() {
+        if now.saturating_sub(oldest) < 60 {
+            break;
+        }
+        let _ = window.pop_front();
+    }
+
+    if window.len() >= MAX_OVERRIDE_REQUESTS_PER_MINUTE {
+        return false;
+    }
+
+    window.push_back(now);
+    true
+}
+
+fn validate_override_request_origin(req: &OverrideRequest, policy: &SecurityPolicy) -> Result<(i32, String), String> {
+    let pid = req.requester_pid.ok_or_else(|| "missing requester_pid".to_string())?;
+    if pid <= 1 {
+        return Err("invalid requester_pid".to_string());
+    }
+
+    let process = get_process_info(pid)
+        .map(|(_, comm)| {
+            if comm.trim().is_empty() {
+                format!("pid:{}", pid)
+            } else {
+                comm
+            }
+        })
+        .ok_or_else(|| format!("requester pid {} is not alive; retry request", pid))?;
+
+    let mut cache = HashMap::new();
+    if let Some(ai_ancestor) = find_ai_ancestor(pid, policy, &mut cache) {
+        return Err(format!(
+            "AI-originated override request is blocked (ancestor: {})",
+            ai_ancestor
+        ));
+    }
+
+    Ok((pid, process))
+}
+
 fn write_override_response(response_path: &Path, response: &OverrideResponse) -> io::Result<()> {
     let mut file = open_truncate_no_follow(response_path, DEFAULT_FILE_MODE)?;
     verify_regular_file(&file, response_path)?;
@@ -1023,11 +1084,36 @@ fn prune_stale_response_files(request_dir: &Path, now: u64) {
     }
 }
 
+fn log_override_audit(home: &str, record: &OverrideAuditRecord) {
+    let guard_dir = match ensure_guard_dirs(home) {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("[audit] cannot use guard dir: {}", err);
+            return;
+        },
+    };
+
+    let log_path = guard_dir.join("override-audit.jsonl");
+    if let Ok(json) = serde_json::to_string(record) {
+        if let Ok(mut file) = open_append_no_follow(&log_path, DEFAULT_FILE_MODE) {
+            if verify_regular_file(&file, &log_path).is_ok() {
+                if let Ok(meta) = file.metadata() {
+                    if meta.len() > OVERRIDE_AUDIT_MAX_BYTES {
+                        let _ = file.set_len(0);
+                    }
+                }
+                let _ = writeln!(file, "{}", json);
+            }
+        }
+    }
+}
+
 fn process_override_requests(
     request_dir: &Path,
     policy: &SecurityPolicy,
     home: &str,
     overrides: &mut Vec<TemporaryOverrideEntry>,
+    request_window: &mut VecDeque<u64>,
 ) -> bool {
     let guard_dir = match ensure_guard_dirs(home) {
         Ok(dir) => dir,
@@ -1066,6 +1152,9 @@ fn process_override_requests(
         },
     };
     request_files.sort();
+    if request_files.len() > MAX_OVERRIDE_REQUEST_FILES_PER_CYCLE {
+        request_files.truncate(MAX_OVERRIDE_REQUEST_FILES_PER_CYCLE);
+    }
 
     let mut changed = false;
     for request_path in request_files {
@@ -1076,6 +1165,39 @@ fn process_override_requests(
             .map(sanitize_component)
             .unwrap_or_else(|| format!("unknown-{}", now_ts()));
         let response_path = request_response_path(active_request_dir, &request_id);
+        let request_action = "unknown".to_string();
+        let request_path_value: Option<String> = None;
+        let request_minutes: Option<u64> = None;
+        let request_pid: Option<i32> = None;
+
+        if !consume_override_request_budget(request_window, now_ts()) {
+            let response = OverrideResponse {
+                id: request_id.clone(),
+                status: "error".to_string(),
+                message: format!(
+                    "override request rate limit exceeded (max {} per minute)",
+                    MAX_OVERRIDE_REQUESTS_PER_MINUTE
+                ),
+                expires_at: None,
+            };
+            let _ = write_override_response(&response_path, &response);
+            log_override_audit(
+                home,
+                &OverrideAuditRecord {
+                    ts: now_ts(),
+                    request_id: request_id.clone(),
+                    action: request_action.clone(),
+                    path: request_path_value.clone(),
+                    minutes: request_minutes,
+                    status: response.status.clone(),
+                    message: response.message.clone(),
+                    requester_pid: request_pid,
+                    requester_process: None,
+                },
+            );
+            let _ = fs::remove_file(&request_path);
+            continue;
+        }
 
         let request = match open_read_no_follow(&request_path).and_then(|mut file| {
             verify_regular_file(&file, &request_path)?;
@@ -1097,13 +1219,25 @@ fn process_override_requests(
         }) {
             Ok(req) => req,
             Err(err) => {
-                let _ = write_override_response(
-                    &response_path,
-                    &OverrideResponse {
-                        id: request_id.clone(),
-                        status: "error".to_string(),
-                        message: format!("invalid request: {}", err),
-                        expires_at: None,
+                let response = OverrideResponse {
+                    id: request_id.clone(),
+                    status: "error".to_string(),
+                    message: format!("invalid request: {}", err),
+                    expires_at: None,
+                };
+                let _ = write_override_response(&response_path, &response);
+                log_override_audit(
+                    home,
+                    &OverrideAuditRecord {
+                        ts: now_ts(),
+                        request_id: request_id.clone(),
+                        action: request_action.clone(),
+                        path: request_path_value.clone(),
+                        minutes: request_minutes,
+                        status: response.status.clone(),
+                        message: response.message.clone(),
+                        requester_pid: request_pid,
+                        requester_process: None,
                     },
                 );
                 let _ = fs::remove_file(&request_path);
@@ -1113,11 +1247,61 @@ fn process_override_requests(
 
         let mut request = request;
         request.id = request_id.clone();
+        let request_action = request.action.clone();
+        let request_path_value = request.path.clone();
+        let request_minutes = request.minutes;
+        let request_pid = request.requester_pid;
+
+        let (requester_pid, requester_process) = match validate_override_request_origin(&request, policy) {
+            Ok((pid, process)) => (Some(pid), Some(process)),
+            Err(err) => {
+                let response = OverrideResponse {
+                    id: request_id.clone(),
+                    status: "error".to_string(),
+                    message: err,
+                    expires_at: None,
+                };
+                let _ = write_override_response(&response_path, &response);
+                log_override_audit(
+                    home,
+                    &OverrideAuditRecord {
+                        ts: now_ts(),
+                        request_id: request_id.clone(),
+                        action: request_action.clone(),
+                        path: request_path_value.clone(),
+                        minutes: request_minutes,
+                        status: response.status.clone(),
+                        message: response.message.clone(),
+                        requester_pid: request_pid,
+                        requester_process: None,
+                    },
+                );
+                if let Err(remove_err) = fs::remove_file(&request_path) {
+                    eprintln!("[override] failed to remove request file: {}", remove_err);
+                }
+                continue;
+            },
+        };
+
         let response_path = request_response_path(active_request_dir, request.id.as_str());
         let (request_changed, response) = apply_override_request(&request, policy, home, overrides);
         if request_changed {
             changed = true;
         }
+        log_override_audit(
+            home,
+            &OverrideAuditRecord {
+                ts: now_ts(),
+                request_id: request.id.clone(),
+                action: request_action,
+                path: request_path_value,
+                minutes: request_minutes,
+                status: response.status.clone(),
+                message: response.message.clone(),
+                requester_pid,
+                requester_process,
+            },
+        );
         if let Err(err) = write_override_response(&response_path, &response) {
             eprintln!("[override] failed to write response: {}", err);
         }
@@ -1725,6 +1909,7 @@ mod tests {
             action: "grant".to_string(),
             path: Some("/Users/jqwang/project/file.txt".to_string()),
             minutes: Some(0),
+            requester_pid: None,
         };
 
         let (changed, response) = apply_override_request(&request, &policy, "/Users/jqwang", &mut overrides);
@@ -1743,6 +1928,7 @@ mod tests {
             action: "grant".to_string(),
             path: Some("/Users/jqwang/project".to_string()),
             minutes: Some(3),
+            requester_pid: None,
         };
 
         let (changed, response) = apply_override_request(&request, &policy, "/Users/jqwang", &mut overrides);
@@ -1762,6 +1948,7 @@ mod tests {
             action: "grant".to_string(),
             path: Some(format!("/Users/jqwang/project/{}", long_suffix)),
             minutes: Some(1),
+            requester_pid: None,
         };
 
         let (changed, response) = apply_override_request(&request, &policy, "/Users/jqwang", &mut overrides);
@@ -1789,6 +1976,7 @@ mod tests {
             action: "grant".to_string(),
             path: Some("/Users/jqwang/project/new-file".to_string()),
             minutes: Some(1),
+            requester_pid: None,
         };
 
         let (changed, response) = apply_override_request(&request, &policy, "/Users/jqwang", &mut overrides);
@@ -1796,6 +1984,40 @@ mod tests {
         assert_eq!(response.status, "error");
         assert!(response.message.contains("too many active overrides"));
         assert_eq!(overrides.len(), MAX_RUNTIME_OVERRIDES);
+    }
+
+    #[test]
+    fn override_request_budget_limits_per_minute() {
+        let mut window = std::collections::VecDeque::new();
+        for _ in 0..MAX_OVERRIDE_REQUESTS_PER_MINUTE {
+            assert!(consume_override_request_budget(&mut window, 100));
+        }
+        assert!(!consume_override_request_budget(&mut window, 100));
+        assert!(consume_override_request_budget(&mut window, 161));
+    }
+
+    #[test]
+    fn validate_override_request_origin_requires_pid() {
+        let policy = test_policy();
+        let missing_pid = OverrideRequest {
+            id: "req-origin-1".to_string(),
+            action: "grant".to_string(),
+            path: Some("/Users/jqwang/project/file.txt".to_string()),
+            minutes: Some(1),
+            requester_pid: None,
+        };
+        let err = validate_override_request_origin(&missing_pid, &policy).expect_err("pid is required");
+        assert!(err.contains("missing requester_pid"));
+
+        let invalid_pid = OverrideRequest {
+            id: "req-origin-2".to_string(),
+            action: "grant".to_string(),
+            path: Some("/Users/jqwang/project/file.txt".to_string()),
+            minutes: Some(1),
+            requester_pid: Some(0),
+        };
+        let err = validate_override_request_origin(&invalid_pid, &policy).expect_err("pid must be positive");
+        assert!(err.contains("invalid requester_pid"));
     }
 }
 
@@ -1850,6 +2072,7 @@ fn main() {
                 Vec::new()
             },
         };
+        let mut request_window: VecDeque<u64> = VecDeque::new();
         let mut last_policy_mtime = fs::metadata(&path_clone)
             .and_then(|meta| meta.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -1899,6 +2122,7 @@ fn main() {
                 &static_policy,
                 &home_for_reload,
                 &mut runtime_overrides,
+                &mut request_window,
             ) {
                 changed = true;
                 overrides_changed = true;

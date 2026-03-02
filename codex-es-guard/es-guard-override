@@ -223,6 +223,7 @@ mkdir -p "$REQUEST_DIR"
 chmod 700 "$REQUEST_DIR" 2>/dev/null || true
 
 request_id="$(make_request_id)"
+requester_pid="$$"
 request_file="$REQUEST_DIR/${request_id}.request.json"
 response_file="$REQUEST_DIR/${request_id}.response.json"
 tmp_request="$(mktemp "$REQUEST_DIR/.request.${request_id}.XXXXXX")"
@@ -236,20 +237,23 @@ case "$action" in
             --arg action "grant" \
             --arg path "$target" \
             --argjson minutes "$minutes" \
-            '{id: $id, action: $action, path: $path, minutes: $minutes}' > "$tmp_request"
+            --argjson requester_pid "$requester_pid" \
+            '{id: $id, action: $action, path: $path, minutes: $minutes, requester_pid: $requester_pid}' > "$tmp_request"
         ;;
     remove)
         jq -n \
             --arg id "$request_id" \
             --arg action "remove" \
             --arg path "$target" \
-            '{id: $id, action: $action, path: $path}' > "$tmp_request"
+            --argjson requester_pid "$requester_pid" \
+            '{id: $id, action: $action, path: $path, requester_pid: $requester_pid}' > "$tmp_request"
         ;;
     clear)
         jq -n \
             --arg id "$request_id" \
             --arg action "clear" \
-            '{id: $id, action: $action}' > "$tmp_request"
+            --argjson requester_pid "$requester_pid" \
+            '{id: $id, action: $action, requester_pid: $requester_pid}' > "$tmp_request"
         ;;
 esac
 
