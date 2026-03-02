@@ -16,6 +16,13 @@ private struct RecordsSnapshot {
     let agentStats: [AgentStats]
 }
 
+private struct LaunchctlServiceStatus {
+    let exists: Bool
+    let running: Bool
+    let state: String?
+    let detail: String
+}
+
 private func runProcessSync(
     launchPath: String,
     arguments: [String],
@@ -153,10 +160,7 @@ private func isUserCanceledMessage(_ message: String) -> Bool {
         || lowered.contains("cancel")
 }
 
-private func shouldRetryLaunchctlWithPrivilege(
-    _ result: ProcessExecutionResult?,
-    arguments: [String]
-) -> Bool {
+private func shouldRetryPrivilegedForResult(_ result: ProcessExecutionResult?) -> Bool {
     guard let result else { return true }
     guard result.status != 0 else { return false }
     let detail = bestProcessDetail(result)
@@ -164,26 +168,72 @@ private func shouldRetryLaunchctlWithPrivilege(
         return true
     }
 
-    let lowered = detail.lowercased()
-    let targetsSystemDomain = arguments.contains("system")
-        || arguments.contains(where: { $0.hasPrefix("system/") })
-
-    if targetsSystemDomain && lowered.contains("input/output error") {
+    if detail.lowercased().contains("input/output error") {
         return true
     }
 
     return false
 }
 
-private func runLaunchctlCommand(arguments: [String]) -> (result: ProcessExecutionResult?, usedPrivilege: Bool) {
-    let direct = runProcessSync(launchPath: "/bin/launchctl", arguments: arguments)
-    guard shouldRetryLaunchctlWithPrivilege(direct, arguments: arguments) else {
+private func runShellTransactionWithPrivilegeFallback(command: String) -> (result: ProcessExecutionResult?, usedPrivilege: Bool) {
+    let direct = runProcessSync(
+        launchPath: "/bin/bash",
+        arguments: ["-lc", command]
+    )
+    guard shouldRetryPrivilegedForResult(direct) else {
         return (direct, false)
     }
-
-    let shellCommand = (["/bin/launchctl"] + arguments).map(shellQuote).joined(separator: " ")
-    let privileged = runPrivilegedShellSync(command: shellCommand)
+    let privileged = runPrivilegedShellSync(command: command)
     return (privileged ?? direct, true)
+}
+
+private func parseLaunchctlState(from output: String) -> String? {
+    for line in output.split(separator: "\n") {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix("state = ") else { continue }
+        return String(trimmed.dropFirst("state = ".count))
+    }
+    return nil
+}
+
+private func queryLaunchctlServiceStatus(serviceTarget: String) -> LaunchctlServiceStatus {
+    let result = runProcessSync(
+        launchPath: "/bin/launchctl",
+        arguments: ["print", serviceTarget]
+    )
+
+    guard let result else {
+        return LaunchctlServiceStatus(
+            exists: false,
+            running: false,
+            state: nil,
+            detail: "无法执行 launchctl print"
+        )
+    }
+
+    if result.status == 0 {
+        let state = parseLaunchctlState(from: result.stdout)
+        let isRunning = (state == "running")
+            || result.stdout.contains("pid = ")
+        return LaunchctlServiceStatus(
+            exists: true,
+            running: isRunning,
+            state: state,
+            detail: ""
+        )
+    }
+
+    let detail = bestProcessDetail(result)
+    let lowered = detail.lowercased()
+    let missing = lowered.contains("could not find service")
+        || lowered.contains("not found")
+        || lowered.contains("does not exist")
+    return LaunchctlServiceStatus(
+        exists: !missing,
+        running: false,
+        state: nil,
+        detail: detail
+    )
 }
 
 private func trimTrailingSlashes(_ path: String) -> String {
@@ -290,10 +340,15 @@ final class ESGuardViewModel: ObservableObject {
     // Services
     private let fileMonitor = FileMonitorService()
     private let logTailer = LogTailService()
+    private let daemonControlQueue = DispatchQueue(
+        label: "dev.codex-es-guard.daemon-control",
+        qos: .userInitiated
+    )
     
     private var previousRecordCount: Int = 0
     private var isFirstLoad: Bool = true
     private var recordsLoadToken: UInt64 = 0
+    private var messageToken: UInt64 = 0
 
     init() {
         if autoRevokeMinutes <= 0 || autoRevokeMinutes > 30 {
@@ -322,12 +377,10 @@ final class ESGuardViewModel: ObservableObject {
     }
     
     private func checkGuardRunning() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let result = runProcessSync(
-                launchPath: "/usr/bin/pgrep",
-                arguments: ["-x", "codex-es-guard"]
-            )
-            let running = (result?.status == 0)
+        let serviceTarget = daemonServiceTarget
+        daemonControlQueue.async {
+            let status = queryLaunchctlServiceStatus(serviceTarget: serviceTarget)
+            let running = status.running
             DispatchQueue.main.async { [weak self] in
                 self?.guardRunning = running
             }
@@ -345,10 +398,14 @@ final class ESGuardViewModel: ObservableObject {
     }
 
     private func presentMessage(_ message: String, success: Bool, clearAfter seconds: TimeInterval = 4.0) {
+        messageToken &+= 1
+        let token = messageToken
         self.overrideMessage = message
         self.overrideSuccess = success
         if seconds > 0 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+                guard let self = self else { return }
+                guard self.messageToken == token else { return }
                 self.overrideMessage = ""
             }
         }
@@ -366,41 +423,34 @@ final class ESGuardViewModel: ObservableObject {
         let serviceTarget = daemonServiceTarget
         let plistPath = daemonPlistPath
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            let enableResult = runLaunchctlCommand(arguments: ["enable", serviceTarget])
-            let kickResult = runLaunchctlCommand(arguments: ["kickstart", "-k", serviceTarget])
+        daemonControlQueue.async {
+            let quotedTarget = shellQuote(serviceTarget)
+            let quotedPlist = shellQuote(plistPath)
+            let command = [
+                "if ! /bin/launchctl print \(quotedTarget) >/dev/null 2>&1; then",
+                "  if [ -f \(quotedPlist) ]; then /bin/launchctl bootstrap system \(quotedPlist) >/dev/null 2>&1 || true; fi",
+                "fi",
+                "/bin/launchctl enable \(quotedTarget)",
+                "/bin/launchctl kickstart -k \(quotedTarget)",
+            ].joined(separator: "; ")
 
-            var usedPrivilege = enableResult.usedPrivilege || kickResult.usedPrivilege
-            var started = (kickResult.result?.status == 0)
-            var details = bestProcessDetail(kickResult.result)
-
-            if !started, FileManager.default.fileExists(atPath: plistPath) {
-                let bootstrapResult = runLaunchctlCommand(arguments: ["bootstrap", "system", plistPath])
-                let retryKickResult = runLaunchctlCommand(arguments: ["kickstart", "-k", serviceTarget])
-                usedPrivilege = usedPrivilege || bootstrapResult.usedPrivilege || retryKickResult.usedPrivilege
-                started = (retryKickResult.result?.status == 0)
-                let retryDetail = bestProcessDetail(retryKickResult.result)
-                if !retryDetail.isEmpty {
-                    details = retryDetail
-                } else {
-                    let bootstrapDetail = bestProcessDetail(bootstrapResult.result)
-                    if !bootstrapDetail.isEmpty {
-                        details = bootstrapDetail
-                    }
-                }
-            }
+            let transaction = runShellTransactionWithPrivilegeFallback(command: command)
+            let status = queryLaunchctlServiceStatus(serviceTarget: serviceTarget)
+            let started = status.running
+            let transactionDetail = bestProcessDetail(transaction.result)
+            let details = transactionDetail.isEmpty ? status.detail : transactionDetail
 
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 self.daemonActionInProgress = false
                 self.refreshGuardRunningAfterDelay()
                 if started {
-                    if usedPrivilege {
+                    if transaction.usedPrivilege {
                         self.presentMessage("守护进程已请求启动（已完成管理员授权）", success: true)
                     } else {
                         self.presentMessage("守护进程已请求启动", success: true)
                     }
-                } else if details.lowercased().contains("could not find service") {
+                } else if !status.exists || details.lowercased().contains("could not find service") {
                     self.presentMessage(
                         "启动失败：系统中未加载 dev.codex-es-guard，请先执行 nix switch/make 再试",
                         success: false,
@@ -422,23 +472,20 @@ final class ESGuardViewModel: ObservableObject {
         daemonActionInProgress = true
         let serviceTarget = daemonServiceTarget
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            let disableResult = runLaunchctlCommand(arguments: ["disable", serviceTarget])
-            let bootoutResult = runLaunchctlCommand(arguments: ["bootout", serviceTarget])
-
-            let usedPrivilege = disableResult.usedPrivilege || bootoutResult.usedPrivilege
-            let details = bestProcessDetail(bootoutResult.result)
-            let likelyAlreadyStopped = details.contains("No such process")
-                || details.contains("not found")
-                || details.contains("No such file or directory")
-            let stopped = (bootoutResult.result?.status == 0) || likelyAlreadyStopped
+        daemonControlQueue.async {
+            let quotedTarget = shellQuote(serviceTarget)
+            let command = "/bin/launchctl disable \(quotedTarget); /bin/launchctl bootout \(quotedTarget)"
+            let transaction = runShellTransactionWithPrivilegeFallback(command: command)
+            let status = queryLaunchctlServiceStatus(serviceTarget: serviceTarget)
+            let details = bestProcessDetail(transaction.result)
+            let stopped = !status.running
 
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 self.daemonActionInProgress = false
                 self.refreshGuardRunningAfterDelay()
                 if stopped {
-                    if usedPrivilege {
+                    if transaction.usedPrivilege {
                         self.presentMessage("守护进程已请求停止（已完成管理员授权）", success: true)
                     } else {
                         self.presentMessage("守护进程已请求停止", success: true)
@@ -461,21 +508,25 @@ final class ESGuardViewModel: ObservableObject {
         daemonActionInProgress = true
         let serviceTarget = daemonServiceTarget
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            let kickResult = runLaunchctlCommand(arguments: ["kickstart", "-k", serviceTarget])
+        daemonControlQueue.async {
+            let quotedTarget = shellQuote(serviceTarget)
+            let command = "/bin/launchctl kickstart -k \(quotedTarget)"
+            let transaction = runShellTransactionWithPrivilegeFallback(command: command)
+            let status = queryLaunchctlServiceStatus(serviceTarget: serviceTarget)
+            let restarted = status.running
+            let detail = bestProcessDetail(transaction.result)
 
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 self.daemonActionInProgress = false
                 self.refreshGuardRunningAfterDelay()
-                if kickResult.result?.status == 0 {
-                    if kickResult.usedPrivilege {
+                if restarted {
+                    if transaction.usedPrivilege {
                         self.presentMessage("守护进程已成功重启（已完成管理员授权）", success: true)
                     } else {
                         self.presentMessage("守护进程已成功重启", success: true)
                     }
                 } else {
-                    let detail = bestProcessDetail(kickResult.result)
                     if isUserCanceledMessage(detail) {
                         self.presentMessage("重启已取消：未完成管理员授权", success: false, clearAfter: 6.0)
                     } else if detail.isEmpty {
