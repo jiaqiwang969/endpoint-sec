@@ -221,11 +221,11 @@ $(render_rules "/var/db/codex-es-guard/egress-${ANCHOR_SAFE}.table" "$TARGET_USE
 EOF
         ;;
     apply)
-        require_root
         if [ -z "$ALLOWLIST_FILE" ]; then
             echo "Error: --apply requires --allowlist FILE (explicit allowlist is mandatory)." >&2
             exit 1
         fi
+        require_root
         mkdir -p "$STATE_DIR"
         chmod 700 "$STATE_DIR"
 
