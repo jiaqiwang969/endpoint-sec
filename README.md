@@ -193,11 +193,22 @@ es-guard-quarantine /path/to/file
       "created_by": "es-guard-helper"
     }
   ],
+  "sensitive_zones": [
+    "/Users/you/.codex"
+  ],
+  "sensitive_export_allow_zones": [
+    "/Users/you/.codex/es-guard/quarantine"
+  ],
   "auto_protect_home_digit_children": true,
   "trusted_tools": ["git", "jj", "cargo", "rustup", "rustc", "swift", "nix", "make", "go", "docker"],
   "ai_agent_patterns": ["codex", "claude", "claude-code"],
   "allow_vcs_metadata_in_ai_context": true,
-  "allow_trusted_tools_in_ai_context": false
+  "allow_trusted_tools_in_ai_context": false,
+  "exec_exfil_tool_blocklist": ["curl", "wget", "scp", "sftp", "rsync", "nc", "ncat", "netcat"],
+  "read_gate_enabled": true,
+  "transfer_gate_enabled": true,
+  "exec_gate_enabled": true,
+  "taint_ttl_seconds": 600
 }
 ```
 
@@ -205,11 +216,18 @@ es-guard-quarantine /path/to/file
 |------|------|--------|
 | `protected_zones` | 受保护目录前缀 | `[]` |
 | `temporary_overrides` | 运行时临时豁免（由 root helper 维护并镜像到本文件） | `[]` |
+| `sensitive_zones` | 敏感目录前缀（受读门禁与外传门禁约束） | `[]` |
+| `sensitive_export_allow_zones` | 允许从敏感目录导出的目的地前缀 | `[]` |
 | `auto_protect_home_digit_children` | 自动保护 HOME 下首层“数字开头”目录（如 `~/01-agent`、`~/0x-lab`） | `true` |
 | `trusted_tools` | 受信任的工具进程名（兼容模式用） | git, jj, cargo, rustup 等 |
 | `ai_agent_patterns` | AI Agent 进程名匹配模式（子字符串匹配） | codex, claude, claude-code |
 | `allow_vcs_metadata_in_ai_context` | 是否允许 AI 的 git/jj 维护 `.git/.jj` 元数据（不包含工作区删除） | `true` |
 | `allow_trusted_tools_in_ai_context` | 是否允许 AI 上下文命中 trusted_tools 后放行 | `false` |
+| `exec_exfil_tool_blocklist` | AI 上下文下禁止执行的外传工具名 | `curl,wget,scp,...` |
+| `read_gate_enabled` | 是否启用敏感读取门禁（`AUTH_OPEN`） | `true` |
+| `transfer_gate_enabled` | 是否启用敏感外传门禁（copy/clone/link/exchange/rename） | `true` |
+| `exec_gate_enabled` | 是否启用外传工具执行门禁（`AUTH_EXEC`） | `true` |
+| `taint_ttl_seconds` | 进程读取敏感数据后的污点有效期（秒） | `600` |
 
 - 策略文件支持 **热重载**（1 秒轮询），修改即生效
 - 守护进程会自动清理已过期的 runtime `temporary_overrides`，并镜像回策略文件给 UI 展示
@@ -222,6 +240,26 @@ es-guard-quarantine /path/to/file
 - 如需覆盖新建的 `0x-*`/`01-*` 目录，开启 `auto_protect_home_digit_children` 更稳妥
 - `trusted_tools` 和 `ai_agent_patterns` 有内置默认值，无需在 JSON 中指定
 - `protected_zones` 由 Nix 激活脚本管理；`temporary_overrides` 不再信任手改 JSON，统一走 `es-guard-override` 请求队列
+
+### 拒绝原因码（denials.jsonl `reason` 字段）
+
+| reason | 含义 |
+|---|---|
+| `SENSITIVE_READ_NON_AI` | 非 AI 上下文尝试读取敏感目录 |
+| `SENSITIVE_TRANSFER_OUT` | 从敏感目录向非允许区域复制/移动/链接 |
+| `TAINT_WRITE_OUT` | 进程读取敏感数据后，在污点 TTL 内向非允许区域写出 |
+| `EXEC_EXFIL_TOOL` | AI 上下文执行外传工具（如 curl/scp）被拒绝 |
+| `PROTECTED_ZONE_AI_DELETE` | AI 在受保护区发起删除/重命名（原有删除防护） |
+
+### ES 能力边界与完整 C 方案
+
+- Endpoint Security 负责**文件/执行授权**（read/transfer/write/exec 事件）。
+- ES 本身不做通用域名/IP 出站策略；完整 C 方案需要额外出站层。
+- 本仓库提供 `es-guard-egress`，配合 PF anchor 实现“显式 allowlist 出站”：
+  - `es-guard-egress --print-rules`
+  - `es-guard-egress --apply --allowlist ~/.codex/es-guard/egress-allowlist.txt`
+  - `es-guard-egress --flush`
+- 参考验证矩阵：`docs/plans/2026-03-03-codex-sensitive-data-guard-c-verification.md`
 
 ## Nix 集成
 
@@ -236,11 +274,16 @@ services.codex-es-guard = {
   enable = true;
   user = "yourname";
   protectedZones = [ "/Users/yourname/projects" ];
+  sensitiveZones = [ "/Users/yourname/.codex" ];
+  sensitiveExportAllowZones = [ "/Users/yourname/.codex/es-guard/quarantine" ];
+  readGateEnabled = true;
+  transferGateEnabled = true;
+  execGateEnabled = true;
   autoProtectHomeDigitChildrenDefault = true;
 };
 ```
 
-激活脚本自动完成：复制二进制 → codesign → 安装 es-guard-override → 启动 LaunchDaemon → 同步策略文件。
+激活脚本自动完成：复制二进制 → codesign → 安装 helper（`es-guard-override` / `es-guard-quarantine` / `es-guard-egress`）→ 启动 LaunchDaemon → 同步策略文件。
 
 ## 手动构建与运行
 
@@ -251,6 +294,8 @@ nix build .#codex-es-guard
 # 签名（需要 ES entitlement）
 sudo cp result/bin/codex-es-guard /usr/local/bin/
 sudo cp result/bin/es-guard-override /usr/local/bin/
+sudo cp result/bin/es-guard-quarantine /usr/local/bin/
+sudo cp result/bin/es-guard-egress /usr/local/bin/
 sudo codesign --entitlements codex-es-guard/es.plist --force -s - /usr/local/bin/codex-es-guard
 
 # 运行（需要 root）
