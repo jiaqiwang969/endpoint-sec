@@ -1833,8 +1833,7 @@ fn is_sensitive_read_observer_path(path: &str, home: &str) -> bool {
 }
 
 fn should_allow_sensitive_read_observer(path: &str, process_name: &str, home: &str) -> bool {
-    is_sensitive_read_observer_process(process_name)
-        && is_sensitive_read_observer_path(path, home)
+    is_sensitive_read_observer_process(process_name) && is_sensitive_read_observer_path(path, home)
 }
 
 fn should_mark_taint_on_sensitive_read(path: &str, policy: &SecurityPolicy, home: &str) -> bool {
@@ -1848,8 +1847,34 @@ fn should_deny_sensitive_transfer(source: &str, dest: &str, policy: &SecurityPol
         && !policy.is_sensitive_path(dest)
 }
 
-fn should_deny_tainted_write(pid: i32, target: &str, now: u64, taint: &TaintState, policy: &SecurityPolicy) -> bool {
-    taint.is_tainted(pid, now) && !policy.is_sensitive_export_allowed(target) && !policy.is_sensitive_path(target)
+fn should_allow_vcs_metadata_tainted_write(
+    target_path: &str,
+    process_name: Option<&str>,
+    policy: &SecurityPolicy,
+) -> bool {
+    if !policy.allow_vcs_metadata_in_ai_context || !is_vcs_metadata_path(target_path) {
+        return false;
+    }
+    let process_name = match process_name {
+        Some(name) => name,
+        None => return false,
+    };
+
+    is_vcs_tool(process_name) && is_trusted_process_name(process_name, policy)
+}
+
+fn should_deny_tainted_write(
+    pid: i32,
+    target: &str,
+    process_name: Option<&str>,
+    now: u64,
+    taint: &TaintState,
+    policy: &SecurityPolicy,
+) -> bool {
+    taint.is_tainted(pid, now)
+        && !policy.is_sensitive_export_allowed(target)
+        && !policy.is_sensitive_path(target)
+        && !should_allow_vcs_metadata_tainted_write(target, process_name, policy)
 }
 
 fn should_deny_exec_in_ai_context(proc_name: &str, is_ai_context: bool, policy: &SecurityPolicy) -> bool {
@@ -2108,6 +2133,37 @@ mod tests {
         assert!(should_deny_tainted_write(
             100,
             "/Users/jqwang/Desktop/out.txt",
+            Some("python3"),
+            1_100,
+            &taint,
+            &policy
+        ));
+    }
+
+    #[test]
+    fn tainted_git_metadata_write_is_allowed() {
+        let policy = test_sensitive_policy();
+        let mut taint = TaintState::new(600);
+        taint.mark(100, 1_000);
+        assert!(!should_deny_tainted_write(
+            100,
+            "/Users/jqwang/00-nixos-config/nixos-config/.git/index.lock",
+            Some("git"),
+            1_100,
+            &taint,
+            &policy
+        ));
+    }
+
+    #[test]
+    fn tainted_non_vcs_metadata_write_is_denied() {
+        let policy = test_sensitive_policy();
+        let mut taint = TaintState::new(600);
+        taint.mark(100, 1_000);
+        assert!(should_deny_tainted_write(
+            100,
+            "/Users/jqwang/00-nixos-config/nixos-config/.git/index.lock",
+            Some("python3"),
             1_100,
             &taint,
             &policy
@@ -2830,11 +2886,8 @@ fn main() {
                 let is_ai_context = ai_ancestor.is_some();
                 let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
                 let is_guard_process = pid == guard_pid;
-                let allow_observer_read = should_allow_sensitive_read_observer(
-                    &path,
-                    process_name.as_str(),
-                    &home_for_handler,
-                );
+                let allow_observer_read =
+                    should_allow_sensitive_read_observer(&path, process_name.as_str(), &home_for_handler);
                 let should_deny = should_deny_sensitive_open_for_process(
                     &path,
                     is_ai_context,
@@ -2919,13 +2972,20 @@ fn main() {
                     },
                     None => String::new(),
                 };
+                let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
                 let deny_taint = {
                     let taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    should_deny_tainted_write(pid, &dest_path, now_ts(), &taint, &current_policy)
+                    should_deny_tainted_write(
+                        pid,
+                        &dest_path,
+                        Some(process_name.as_str()),
+                        now_ts(),
+                        &taint,
+                        &current_policy,
+                    )
                 };
 
                 if deny_taint {
-                    let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
                     println!("[DENY] create(taint) by {}: {}", process_name, dest_path);
                     log_denial(
                         &home_for_handler,
@@ -2947,13 +3007,20 @@ fn main() {
             },
             Some(Event::AuthTruncate(truncate)) => {
                 let target_path = truncate.target().path().to_string_lossy().into_owned();
+                let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
                 let deny_taint = {
                     let taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    should_deny_tainted_write(pid, &target_path, now_ts(), &taint, &current_policy)
+                    should_deny_tainted_write(
+                        pid,
+                        &target_path,
+                        Some(process_name.as_str()),
+                        now_ts(),
+                        &taint,
+                        &current_policy,
+                    )
                 };
 
                 if deny_taint {
-                    let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
                     println!(
                         "[DENY] truncate(taint) by {}: {}",
                         process_name, target_path
