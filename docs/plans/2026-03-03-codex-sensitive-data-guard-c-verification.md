@@ -1,94 +1,67 @@
 # Codex Sensitive Data Guard (Plan C) Verification Matrix
 
-Date: 2026-03-03
+Date: 2026-03-03  
+Host: `macbook-pro-m4` (`jqwang`)  
+Manual test run id: `1772528008`
 
 ## Scope
 
-This matrix verifies Plan C behavior after adding:
+This matrix verifies Plan C behavior after enabling:
 
 - sensitive read gate (`AUTH_OPEN`)
 - sensitive transfer gate (`AUTH_COPYFILE`/`AUTH_CLONE`/`AUTH_LINK`/`AUTH_EXCHANGEDATA`/`AUTH_RENAME`)
 - taint write gate (`AUTH_CREATE`/`AUTH_TRUNCATE`)
 - exec exfil gate (`AUTH_EXEC`)
-- optional outbound egress allowlist helper (`es-guard-egress`, PF anchor)
+- optional outbound egress helper (`es-guard-egress`, PF anchor sync)
 
-## Preconditions
+## Host Policy Snapshot
 
-- macOS host has `codex-es-guard` enabled via nix-darwin.
-- Policy contains:
-  - `sensitive_zones: [ "~/.codex" ]`
-  - `sensitive_export_allow_zones: [ "~/.codex/es-guard/quarantine" ]`
-  - `read_gate_enabled: true`
-  - `transfer_gate_enabled: true`
-  - `exec_gate_enabled: true`
-- Optional egress layer:
-  - `services.codex-egress-guard.enable = true`
-  - allowlist file exists at `~/.codex/es-guard/egress-allowlist.txt`
+Source: `~/.codex/es_policy.json`
 
-## Verification Matrix
+- `sensitive_zones = ["/Users/jqwang/.codex"]`
+- `sensitive_export_allow_zones = ["/Users/jqwang/.codex/es-guard/quarantine"]`
+- `read_gate_enabled = true`
+- `transfer_gate_enabled = true`
+- `exec_gate_enabled = true`
+- `taint_ttl_seconds = 600`
 
-| Scenario | Command | Expected | Reason code |
+## Execution Context Note
+
+- Commands executed directly from this Codex session run in AI context (`ancestor=codex`).
+- To validate true non-AI denial, the read test was executed via `launchctl submit` with a standalone `cat` job (`ancestor=none`).
+
+## Manual Verification Results (Observed)
+
+| Scenario | Command (summary) | Observed result | Evidence |
 |---|---|---|---|
-| Non-AI read sensitive file | `cat ~/.codex/...` from human terminal | DENY | `SENSITIVE_READ_NON_AI` |
-| AI read sensitive file | same read from AI context | ALLOW | n/a |
-| Export sensitive file to external dir | `cp ~/.codex/... ~/Desktop/...` | DENY | `SENSITIVE_TRANSFER_OUT` |
-| Move sensitive file to quarantine allow-zone | `mv ~/.codex/... ~/.codex/es-guard/quarantine/...` | ALLOW | n/a |
-| AI writes outside allow-zone after sensitive read (within TTL) | read sensitive then create/truncate external file | DENY | `TAINT_WRITE_OUT` |
-| AI executes obvious exfil tool | `curl/wget/scp/...` in AI context | DENY | `EXEC_EXFIL_TOOL` |
-| AI delete in protected zone | `rm` in `protected_zones` | DENY | `PROTECTED_ZONE_AI_DELETE` |
-| Egress apply without explicit allowlist | `es-guard-egress --apply` | DENY (cli error) | n/a |
-| Egress print rules | `es-guard-egress --print-rules` | Show PF rules | n/a |
+| Non-AI sensitive read | `launchctl submit ... /bin/cat ~/.codex/es-guard/plan-c-read-1772528008.txt` | DENY (`Operation not permitted`) | `op=open`, `reason=SENSITIVE_READ_NON_AI`, `process=cat`, `ancestor=none` |
+| AI sensitive read | `exec -a codex /bin/cat ~/.codex/es-guard/plan-c-read-1772528008.txt` | ALLOW | exit code `0`, file content printed |
+| Sensitive transfer to external dir | `mv ~/.codex/es-guard/plan-c-rename-1772528008.txt ~/esguard-planc-verify-1772528008/rename-out.txt` | DENY | `op=rename`, `reason=SENSITIVE_TRANSFER_OUT` |
+| Sensitive move to quarantine | `mv ~/.codex/es-guard/plan-c-quarantine-1772528008.txt ~/.codex/es-guard/quarantine/...` | ALLOW | exit code `0`, no new denial |
+| AI taint write-out deny | same AI process reads sensitive then writes external (`python3`) | DENY | `op=create`, `reason=TAINT_WRITE_OUT`, `process=Python`, `ancestor=tainted` |
+| AI exfil tool exec deny | `exec -a codex /usr/bin/curl ...` | DENY | `op=exec`, `reason=EXEC_EXFIL_TOOL`, `process=curl`, `ancestor=codex` |
+
+Notes:
+
+- In the `cp` transfer test, the first deny reason observed was `TAINT_WRITE_OUT` (same-process read->write path), which is expected under taint enforcement.
+- A `launchctl submit` test job was briefly left running and repeatedly triggered read denials; it was cleaned up via `launchctl remove dev.esguard.nonai.read.1772528008`.
 
 ## Automated Checks Run
 
-### 1) Guard unit/integration tests
-
-Command:
-
 ```bash
-cargo test -p codex-es-guard
+cargo test -p codex-es-guard -- --nocapture
+NIXPKGS_ALLOW_UNFREE=1 nix build --impure --extra-experimental-features nix-command --extra-experimental-features flakes ".#darwinConfigurations.macbook-pro-m4.system"
 ```
 
-Expected: pass.
+Observed: both commands passed.
 
-### 2) Build package output
+## Egress Layer Status
 
-Command:
+- `dev.codex-egress-guard-sync` currently shows historical `last exit code = 78 (EX_CONFIG)`.
+- Current sync script behavior is to skip apply and exit `0` when allowlist is absent.
+- Remaining rollout item: create and maintain `~/.codex/es-guard/egress-allowlist.txt`, then re-run daemon sync and confirm clean status.
 
-```bash
-nix build .#codex-es-guard
-```
+## Notes / Boundaries
 
-Expected: pass.
-
-### 3) Egress helper syntax and guardrails
-
-Commands:
-
-```bash
-bash -n codex-es-guard/es-guard-egress
-codex-es-guard/es-guard-egress --print-rules --user "$USER"
-codex-es-guard/es-guard-egress --apply
-```
-
-Expected:
-
-- shell syntax check passes
-- print-rules prints a PF ruleset template or current applied rules
-- apply without allowlist fails with explicit error
-
-## Manual Host Checks (Required)
-
-The following require live host policy + real process ancestry and must be executed manually:
-
-- Non-AI terminal sensitive read deny (`SENSITIVE_READ_NON_AI`)
-- AI-sensitive-read allow
-- AI exfil-tool deny (`EXEC_EXFIL_TOOL`)
-- taint-write deny (`TAINT_WRITE_OUT`)
-
-Use `~/.codex/es-guard/denials.jsonl` and `~/.codex/es-guard/last_denial.txt` to confirm outcomes.
-
-## Notes
-
-- Endpoint Security enforces file and exec authorization decisions.
-- Generic domain/IP outbound control is outside ES scope; it is provided by the separate PF egress layer (`es-guard-egress` + `codex-egress-guard` launchd sync).
+- Endpoint Security handles file/exec authorization decisions for Plan C.
+- Generic outbound domain/IP control is outside ES itself; full C-scope depends on PF-based egress layer (`es-guard-egress` + launchd sync).
