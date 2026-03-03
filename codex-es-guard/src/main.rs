@@ -1793,6 +1793,21 @@ fn should_deny_sensitive_open(path: &str, is_ai_context: bool, fflag: i32, polic
     should_deny_sensitive_open_for_process(path, is_ai_context, fflag, policy, false)
 }
 
+fn is_sensitive_read_observer_process(process_name: &str) -> bool {
+    process_name == "ESGuard"
+}
+
+fn is_sensitive_read_observer_path(path: &str, home: &str) -> bool {
+    let policy_path = format!("{}/.codex/es_policy.json", home);
+    let guard_dir = format!("{}/.codex/es-guard", home);
+    path == policy_path || path_prefix_match(path, &guard_dir)
+}
+
+fn should_allow_sensitive_read_observer(path: &str, process_name: &str, home: &str) -> bool {
+    is_sensitive_read_observer_process(process_name)
+        && is_sensitive_read_observer_path(path, home)
+}
+
 fn should_deny_sensitive_transfer(source: &str, dest: &str, policy: &SecurityPolicy) -> bool {
     policy.transfer_gate_enabled
         && policy.is_sensitive_path(source)
@@ -1970,6 +1985,36 @@ mod tests {
             FFLAG_READ,
             &policy,
             true,
+        ));
+    }
+
+    #[test]
+    fn sensitive_read_observer_allows_policy_and_guard_logs() {
+        let home = "/Users/jqwang";
+        assert!(should_allow_sensitive_read_observer(
+            "/Users/jqwang/.codex/es_policy.json",
+            "ESGuard",
+            home,
+        ));
+        assert!(should_allow_sensitive_read_observer(
+            "/Users/jqwang/.codex/es-guard/denials.jsonl",
+            "ESGuard",
+            home,
+        ));
+    }
+
+    #[test]
+    fn sensitive_read_observer_does_not_allow_chat_history_or_other_process() {
+        let home = "/Users/jqwang";
+        assert!(!should_allow_sensitive_read_observer(
+            "/Users/jqwang/.codex/chat/history.jsonl",
+            "ESGuard",
+            home,
+        ));
+        assert!(!should_allow_sensitive_read_observer(
+            "/Users/jqwang/.codex/es_policy.json",
+            "cat",
+            home,
         ));
     }
 
@@ -2712,17 +2757,22 @@ fn main() {
                 let mut cache = safe_cache.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let ai_ancestor = find_ai_ancestor(pid, &current_policy, &mut cache);
                 let is_ai_context = ai_ancestor.is_some();
+                let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
                 let is_guard_process = pid == guard_pid;
+                let allow_observer_read = should_allow_sensitive_read_observer(
+                    &path,
+                    process_name.as_str(),
+                    &home_for_handler,
+                );
                 let should_deny = should_deny_sensitive_open_for_process(
                     &path,
                     is_ai_context,
                     fflag,
                     &current_policy,
                     is_guard_process,
-                );
+                ) && !allow_observer_read;
 
                 if should_deny {
-                    let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
                     let ancestor = ai_ancestor.unwrap_or_else(|| "none".to_string());
                     let zone = current_policy.matched_sensitive_zone(path.as_str());
                     println!(
