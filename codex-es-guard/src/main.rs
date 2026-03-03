@@ -77,6 +77,9 @@ struct SecurityPolicy {
     #[serde(default)]
     allow_trusted_tools_in_ai_context: bool,
 
+    #[serde(default = "default_exec_exfil_tool_blocklist")]
+    exec_exfil_tool_blocklist: Vec<String>,
+
     #[serde(default = "default_true")]
     read_gate_enabled: bool,
 
@@ -155,6 +158,13 @@ fn default_allow_vcs_metadata_in_ai_context() -> bool {
 
 fn default_ai_agent_patterns() -> Vec<String> {
     ["codex", "claude", "claude-code"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn default_exec_exfil_tool_blocklist() -> Vec<String> {
+    ["curl", "wget", "scp", "sftp", "rsync", "nc", "ncat", "netcat"]
         .iter()
         .map(|s| s.to_string())
         .collect()
@@ -1736,6 +1746,10 @@ fn should_deny_tainted_write(pid: i32, target: &str, now: u64, taint: &TaintStat
     taint.is_tainted(pid, now) && !policy.is_sensitive_export_allowed(target) && !policy.is_sensitive_path(target)
 }
 
+fn should_deny_exec_in_ai_context(proc_name: &str, is_ai_context: bool, policy: &SecurityPolicy) -> bool {
+    policy.exec_gate_enabled && is_ai_context && policy.exec_exfil_tool_blocklist.iter().any(|tool| tool == proc_name)
+}
+
 fn join_path_component(dir: &str, name: &str) -> String {
     let normalized_dir = trim_trailing_slashes(dir);
     if normalized_dir == "/" {
@@ -1882,6 +1896,18 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn exfil_tool_is_denied_in_ai_context() {
+        let policy = test_sensitive_policy();
+        assert!(should_deny_exec_in_ai_context("curl", true, &policy));
+    }
+
+    #[test]
+    fn exfil_tool_is_allowed_outside_ai_context() {
+        let policy = test_sensitive_policy();
+        assert!(!should_deny_exec_in_ai_context("curl", false, &policy));
+    }
+
     #[derive(Debug)]
     struct SensitiveOpenDecision {
         deny: bool,
@@ -1914,6 +1940,7 @@ mod tests {
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
+            exec_exfil_tool_blocklist: default_exec_exfil_tool_blocklist(),
             sensitive_zones: vec![],
             sensitive_export_allow_zones: vec![],
             read_gate_enabled: true,
@@ -1953,6 +1980,7 @@ mod tests {
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
+            exec_exfil_tool_blocklist: default_exec_exfil_tool_blocklist(),
             sensitive_zones: vec![],
             sensitive_export_allow_zones: vec![],
             read_gate_enabled: true,
@@ -1983,6 +2011,7 @@ mod tests {
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
+            exec_exfil_tool_blocklist: default_exec_exfil_tool_blocklist(),
             sensitive_zones: vec![],
             sensitive_export_allow_zones: vec![],
             read_gate_enabled: true,
@@ -2048,6 +2077,7 @@ mod tests {
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
+            exec_exfil_tool_blocklist: default_exec_exfil_tool_blocklist(),
             sensitive_zones: vec![],
             sensitive_export_allow_zones: vec![],
             read_gate_enabled: true,
@@ -2091,6 +2121,7 @@ mod tests {
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
+            exec_exfil_tool_blocklist: default_exec_exfil_tool_blocklist(),
             sensitive_zones: vec![],
             sensitive_export_allow_zones: vec![],
             read_gate_enabled: true,
@@ -2117,6 +2148,7 @@ mod tests {
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
+            exec_exfil_tool_blocklist: default_exec_exfil_tool_blocklist(),
             sensitive_zones: vec![],
             sensitive_export_allow_zones: vec![],
             read_gate_enabled: true,
@@ -2573,6 +2605,37 @@ fn main() {
                     let _ = client.respond_flags_result(&message, fflag as u32, false);
                 }
             },
+            Some(Event::AuthExec(exec)) => {
+                let target_path = exec.target().executable().path().to_string_lossy().into_owned();
+                let target_name = exe_name(&target_path).to_string();
+                let mut cache = safe_cache.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let ai_ancestor = find_ai_ancestor(pid, &current_policy, &mut cache);
+                let is_ai_context = ai_ancestor.is_some();
+                let should_deny = should_deny_exec_in_ai_context(target_name.as_str(), is_ai_context, &current_policy);
+
+                if should_deny {
+                    let ancestor = ai_ancestor.unwrap_or_else(|| "none".to_string());
+                    println!(
+                        "[DENY] exec by {} (via {}): {}",
+                        target_name, ancestor, target_path
+                    );
+                    log_denial(
+                        &home_for_handler,
+                        &DenialRecord {
+                            ts: now_ts(),
+                            op: "exec".into(),
+                            path: target_path,
+                            dest: None,
+                            zone: "exec-blocklist".to_string(),
+                            process: target_name,
+                            ancestor,
+                        },
+                    );
+                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                } else {
+                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                }
+            },
             Some(Event::AuthCreate(create)) => {
                 let dest_path = match create.destination() {
                     Some(EventCreateDestinationFile::ExistingFile(file)) => file.path().to_string_lossy().into_owned(),
@@ -2900,6 +2963,7 @@ fn main() {
     client
         .subscribe(&[
             es_event_type_t::ES_EVENT_TYPE_AUTH_OPEN,
+            es_event_type_t::ES_EVENT_TYPE_AUTH_EXEC,
             es_event_type_t::ES_EVENT_TYPE_AUTH_CREATE,
             es_event_type_t::ES_EVENT_TYPE_AUTH_TRUNCATE,
             es_event_type_t::ES_EVENT_TYPE_AUTH_COPYFILE,
