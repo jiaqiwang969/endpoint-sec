@@ -141,6 +141,78 @@ struct PolicyPanel: View {
                         .foregroundColor(trustedInAI ? ApplePalette.warning : .secondary)
                 }
 
+                Section(header: Text("敏感数据防护 (Plan C)")) {
+                    HStack {
+                        Text("敏感读取门禁 (AUTH_OPEN)")
+                            .font(.caption)
+                        Spacer()
+                        Text(viewModel.policy.readGateEnabled ? "开启" : "关闭")
+                            .font(.caption)
+                            .foregroundColor(viewModel.policy.readGateEnabled ? ApplePalette.success : ApplePalette.warning)
+                    }
+
+                    HStack {
+                        Text("敏感外传门禁 (COPY/CLONE/LINK/RENAME)")
+                            .font(.caption)
+                        Spacer()
+                        Text(viewModel.policy.transferGateEnabled ? "开启" : "关闭")
+                            .font(.caption)
+                            .foregroundColor(viewModel.policy.transferGateEnabled ? ApplePalette.success : ApplePalette.warning)
+                    }
+
+                    HStack {
+                        Text("外传工具执行门禁 (AUTH_EXEC)")
+                            .font(.caption)
+                        Spacer()
+                        Text(viewModel.policy.execGateEnabled ? "开启" : "关闭")
+                            .font(.caption)
+                            .foregroundColor(viewModel.policy.execGateEnabled ? ApplePalette.success : ApplePalette.warning)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("sensitive_zones (\(viewModel.policy.sensitiveZones.count))")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        if viewModel.policy.sensitiveZones.isEmpty {
+                            Text("未配置。建议至少覆盖 ~/.codex")
+                                .font(.caption2)
+                                .foregroundColor(ApplePalette.warning)
+                        } else {
+                            ForEach(viewModel.policy.sensitiveZones, id: \.self) { zone in
+                                Text(zone)
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundColor(.primary)
+                            }
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("sensitive_export_allow_zones (\(viewModel.policy.sensitiveExportAllowZones.count))")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        if viewModel.policy.sensitiveExportAllowZones.isEmpty {
+                            Text("未配置导出白名单，敏感文件将无法复制/移动到外部目录。")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        } else {
+                            ForEach(viewModel.policy.sensitiveExportAllowZones, id: \.self) { zone in
+                                Text(zone)
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundColor(.primary)
+                            }
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("exec_exfil_tool_blocklist (\(viewModel.policy.execExfilToolBlocklist.count))")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text(viewModel.policy.execExfilToolBlocklist.joined(separator: ", "))
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
                 Section(header: Text("高级安全开关")) {
                     let autoProtectHomeDigitChildren = viewModel.policy.autoProtectHomeDigitChildren ?? true
                     let vcsMetaInAI = viewModel.policy.allowVCSMetadataInAIContext ?? true

@@ -16,6 +16,11 @@ let package = Package(
             name: "ESGuardMenuBar",
             dependencies: [],
             path: "Sources/ESGuardMenuBar"
+        ),
+        .testTarget(
+            name: "ESGuardMenuBarTests",
+            dependencies: ["ESGuardMenuBar"],
+            path: "Tests/ESGuardMenuBarTests"
         )
     ]
 )

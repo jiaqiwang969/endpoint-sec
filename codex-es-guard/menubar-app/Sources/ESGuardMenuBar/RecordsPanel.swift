@@ -1,59 +1,87 @@
 import SwiftUI
 import AppKit
 
+private enum RecordFilter: String, CaseIterable, Identifiable {
+    case all
+    case delete
+    case move
+    case sensitiveRead
+    case sensitiveTransfer
+    case taintWrite
+    case execExfil
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .all:
+            return "全部"
+        case .delete:
+            return "仅删除 (DELETE)"
+        case .move:
+            return "仅移动 (MOVE)"
+        case .sensitiveRead:
+            return "敏感读取"
+        case .sensitiveTransfer:
+            return "敏感外传"
+        case .taintWrite:
+            return "污点写出"
+        case .execExfil:
+            return "外传执行"
+        }
+    }
+}
+
 struct RecordsPanel: View {
     @ObservedObject var viewModel: ESGuardViewModel
-    @State private var filterOp: String = "All"
+    @State private var filterOp: RecordFilter = .all
     @State private var searchText: String = ""
-    
+
     var filteredRecords: [DenialRecord] {
         var result = viewModel.records
-        
-        // 1. 类型过滤
-        if filterOp != "All" {
-            result = result.filter {
-                if filterOp == "DELETE" { return $0.op == "unlink" }
-                if filterOp == "MOVE" { return $0.op == "rename" }
-                return true
-            }
+
+        if filterOp != .all {
+            result = result.filter(matchesFilter)
         }
-        
-        // 2. 文本搜索过滤
+
         if !searchText.isEmpty {
             let lowerSearch = searchText.lowercased()
             result = result.filter { record in
-                record.path.lowercased().contains(lowerSearch) ||
-                record.ancestor.lowercased().contains(lowerSearch) ||
-                record.process.lowercased().contains(lowerSearch)
+                record.path.lowercased().contains(lowerSearch)
+                || (record.dest?.lowercased().contains(lowerSearch) ?? false)
+                || record.zone.lowercased().contains(lowerSearch)
+                || record.ancestor.lowercased().contains(lowerSearch)
+                || record.process.lowercased().contains(lowerSearch)
+                || record.op.lowercased().contains(lowerSearch)
+                || record.reason.lowercased().contains(lowerSearch)
             }
         }
-        
+
         return result
     }
-    
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 Text("历史拦截记录")
                     .font(.headline)
                 Spacer()
-                
+
                 Picker("", selection: $filterOp) {
-                    Text("全部").tag("All")
-                    Text("仅删除 (DELETE)").tag("DELETE")
-                    Text("仅移动 (MOVE)").tag("MOVE")
+                    ForEach(RecordFilter.allCases) { filter in
+                        Text(filter.title).tag(filter)
+                    }
                 }
                 .pickerStyle(MenuPickerStyle())
-                .frame(width: 140)
+                .frame(width: 190)
             }
             .padding(.horizontal)
             .padding(.bottom, 8)
-            
-            // 搜索框
+
             HStack {
                 Image(systemName: "magnifyingglass")
                     .foregroundColor(.secondary)
-                TextField("搜索文件名、路径或 Agent...", text: $searchText)
+                TextField("搜索路径、原因码、进程或 Agent...", text: $searchText)
                     .textFieldStyle(PlainTextFieldStyle())
                     .disableAutocorrection(true)
                 if !searchText.isEmpty {
@@ -69,7 +97,7 @@ struct RecordsPanel: View {
             .cornerRadius(6)
             .padding(.horizontal)
             .padding(.bottom, 8)
-            
+
             if filteredRecords.isEmpty {
                 VStack {
                     Spacer()
@@ -90,12 +118,37 @@ struct RecordsPanel: View {
         }
         .padding(.top, 8)
     }
+
+    private func matchesFilter(_ record: DenialRecord) -> Bool {
+        switch filterOp {
+        case .all:
+            return true
+        case .delete:
+            return record.op == "unlink"
+        case .move:
+            return record.op == "rename"
+        case .sensitiveRead:
+            return record.reason == "SENSITIVE_READ_NON_AI"
+        case .sensitiveTransfer:
+            return record.reason == "SENSITIVE_TRANSFER_OUT"
+        case .taintWrite:
+            return record.reason == "TAINT_WRITE_OUT"
+        case .execExfil:
+            return record.reason == "EXEC_EXFIL_TOOL"
+        }
+    }
+}
+
+private struct BadgeVisual {
+    let text: String
+    let tint: Color
+    let fill: Color
 }
 
 struct RecordRow: View {
     let record: DenialRecord
     @ObservedObject var viewModel: ESGuardViewModel
-    
+
     private func getAgentColor(for name: String) -> Color {
         let nameLower = name.lowercased()
         if nameLower.contains("codex") {
@@ -108,41 +161,81 @@ struct RecordRow: View {
             return .secondary
         }
     }
-    
+
+    private func operationBadge(for op: String) -> BadgeVisual {
+        switch op {
+        case "unlink":
+            return BadgeVisual(text: "DELETE", tint: ApplePalette.danger, fill: ApplePalette.subtleDanger)
+        case "rename":
+            return BadgeVisual(text: "MOVE", tint: ApplePalette.info, fill: ApplePalette.subtleInfo)
+        case "open":
+            return BadgeVisual(text: "OPEN", tint: .purple, fill: Color.purple.opacity(0.18))
+        case "copyfile":
+            return BadgeVisual(text: "COPY", tint: .blue, fill: Color.blue.opacity(0.18))
+        case "clone":
+            return BadgeVisual(text: "CLONE", tint: .blue, fill: Color.blue.opacity(0.18))
+        case "link":
+            return BadgeVisual(text: "LINK", tint: .blue, fill: Color.blue.opacity(0.18))
+        case "exchangedata":
+            return BadgeVisual(text: "EXCHANGE", tint: .blue, fill: Color.blue.opacity(0.18))
+        case "create":
+            return BadgeVisual(text: "CREATE", tint: .orange, fill: Color.orange.opacity(0.18))
+        case "truncate":
+            return BadgeVisual(text: "TRUNCATE", tint: .orange, fill: Color.orange.opacity(0.18))
+        case "exec":
+            return BadgeVisual(text: "EXEC", tint: .red, fill: Color.red.opacity(0.18))
+        default:
+            return BadgeVisual(text: op.uppercased(), tint: .secondary, fill: Color.secondary.opacity(0.18))
+        }
+    }
+
+    private func reasonBadge(for reason: String) -> BadgeVisual {
+        switch reason {
+        case "SENSITIVE_READ_NON_AI":
+            return BadgeVisual(text: "敏感读取", tint: .purple, fill: Color.purple.opacity(0.18))
+        case "SENSITIVE_TRANSFER_OUT":
+            return BadgeVisual(text: "敏感外传", tint: .blue, fill: Color.blue.opacity(0.18))
+        case "TAINT_WRITE_OUT":
+            return BadgeVisual(text: "污点写出", tint: .orange, fill: Color.orange.opacity(0.18))
+        case "EXEC_EXFIL_TOOL":
+            return BadgeVisual(text: "外传执行", tint: .red, fill: Color.red.opacity(0.18))
+        case "PROTECTED_ZONE_AI_DELETE":
+            return BadgeVisual(text: "保护区删除", tint: ApplePalette.danger, fill: ApplePalette.subtleDanger)
+        default:
+            return BadgeVisual(text: reason, tint: .secondary, fill: Color.secondary.opacity(0.18))
+        }
+    }
+
     var body: some View {
-        let isDelete = record.op == "unlink"
-        let opTint = isDelete ? ApplePalette.danger : ApplePalette.info
-        let opFill = isDelete ? ApplePalette.subtleDanger : ApplePalette.subtleInfo
+        let opBadge = operationBadge(for: record.op)
+        let reasonBadge = reasonBadge(for: record.reason)
         let agentTint = getAgentColor(for: record.ancestor)
 
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                TagBadge(
-                    text: isDelete ? "DELETE" : "MOVE",
-                    tint: opTint,
-                    fill: opFill
-                )
-                
+            HStack(spacing: 6) {
+                TagBadge(text: opBadge.text, tint: opBadge.tint, fill: opBadge.fill)
+                TagBadge(text: reasonBadge.text, tint: reasonBadge.tint, fill: reasonBadge.fill)
+
                 Text(URL(fileURLWithPath: record.path).lastPathComponent)
                     .font(.callout.bold())
-                
+
                 Spacer()
-                
+
                 TagBadge(
                     text: record.ancestor,
                     tint: agentTint,
                     fill: agentTint.opacity(0.18)
                 )
             }
-            
+
             Text(record.path)
                 .font(.system(.caption, design: .monospaced))
                 .foregroundColor(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .textSelection(.enabled) // 允许复制路径
-            
-            if record.op == "rename", let dest = record.dest {
+                .textSelection(.enabled)
+
+            if let dest = record.dest, !dest.isEmpty {
                 HStack(spacing: 4) {
                     Image(systemName: "arrow.right")
                         .font(.caption2)
@@ -154,7 +247,7 @@ struct RecordRow: View {
                         .truncationMode(.middle)
                 }
             }
-            
+
             HStack {
                 Text(Date(timeIntervalSince1970: TimeInterval(record.ts)).formatted(date: .omitted, time: .standard))
                     .font(.caption2)
@@ -163,7 +256,6 @@ struct RecordRow: View {
             }
         }
         .padding(.vertical, 4)
-        // 右键上下文菜单
         .contextMenu {
             Button("复制文件路径") {
                 let pasteboard = NSPasteboard.general
