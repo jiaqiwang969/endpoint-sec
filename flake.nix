@@ -87,6 +87,50 @@
               description = "Directory prefixes to protect from deletion/move.";
             };
 
+            sensitiveZones = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [];
+              example = [ "/Users/me/.codex" ];
+              description = "Directory prefixes treated as sensitive data zones.";
+            };
+
+            sensitiveExportAllowZones = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [];
+              example = [ "/Users/me/.codex/es-guard/quarantine" ];
+              description = "Allowed destination prefixes for exporting files from sensitive zones.";
+            };
+
+            execExfilToolBlocklist = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ "curl" "wget" "scp" "sftp" "rsync" "nc" "ncat" "netcat" ];
+              description = "Executable names denied in AI context when exec gate is enabled.";
+            };
+
+            readGateEnabled = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              description = "Enable sensitive read gating (AUTH_OPEN).";
+            };
+
+            transferGateEnabled = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              description = "Enable sensitive transfer gating (copy/clone/link/exchange/rename).";
+            };
+
+            execGateEnabled = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              description = "Enable AUTH_EXEC hardening against exfiltration tools in AI context.";
+            };
+
+            taintTTLSeconds = lib.mkOption {
+              type = lib.types.ints.positive;
+              default = 600;
+              description = "TTL in seconds for sensitive-read taint tracking.";
+            };
+
             autoProtectHomeDigitChildrenDefault = lib.mkOption {
               type = lib.types.bool;
               default = true;
@@ -115,9 +159,16 @@
             };
 
             system.activationScripts.postActivation.text = let
-              # Nix is the source of truth for protected_zones.
+              # Nix is the source of truth for static guard zones and DLP gate knobs.
               # temporary_overrides is runtime-only and managed by codex-es-guard root helper.
               protectedZonesJson = builtins.toJSON cfg.protectedZones;
+              sensitiveZonesJson = builtins.toJSON cfg.sensitiveZones;
+              sensitiveExportAllowZonesJson = builtins.toJSON cfg.sensitiveExportAllowZones;
+              execExfilToolBlocklistJson = builtins.toJSON cfg.execExfilToolBlocklist;
+              readGateEnabledJson = if cfg.readGateEnabled then "true" else "false";
+              transferGateEnabledJson = if cfg.transferGateEnabled then "true" else "false";
+              execGateEnabledJson = if cfg.execGateEnabled then "true" else "false";
+              taintTTLSecondsJson = builtins.toJSON cfg.taintTTLSeconds;
               autoProtectHomeDigitChildrenDefaultJson =
                 if cfg.autoProtectHomeDigitChildrenDefault then "true" else "false";
             in ''
@@ -173,6 +224,13 @@
 
               ${pkgs.jq}/bin/jq -n \
                 --argjson zones '${protectedZonesJson}' \
+                --argjson sensitiveZones '${sensitiveZonesJson}' \
+                --argjson sensitiveExportAllowZones '${sensitiveExportAllowZonesJson}' \
+                --argjson execExfilToolBlocklist '${execExfilToolBlocklistJson}' \
+                --argjson readGateEnabled ${readGateEnabledJson} \
+                --argjson transferGateEnabled ${transferGateEnabledJson} \
+                --argjson execGateEnabled ${execGateEnabledJson} \
+                --argjson taintTTLSeconds '${taintTTLSecondsJson}' \
                 --argjson trustedTools "$EXISTING_TRUSTED_TOOLS" \
                 --argjson aiPatterns "$EXISTING_AI_PATTERNS" \
                 --argjson allowVcsMetaInAi "$EXISTING_ALLOW_VCS_META_IN_AI" \
@@ -180,6 +238,13 @@
                 --argjson autoProtectHomeDigitChildren "$EXISTING_AUTO_PROTECT_HOME_DIGIT_CHILDREN" \
                 --argjson autoProtectHomeDigitChildrenDefault ${autoProtectHomeDigitChildrenDefaultJson} \
                 '({protected_zones: $zones, temporary_overrides: []}
+                  + {sensitive_zones: $sensitiveZones}
+                  + {sensitive_export_allow_zones: $sensitiveExportAllowZones}
+                  + {exec_exfil_tool_blocklist: $execExfilToolBlocklist}
+                  + {read_gate_enabled: $readGateEnabled}
+                  + {transfer_gate_enabled: $transferGateEnabled}
+                  + {exec_gate_enabled: $execGateEnabled}
+                  + {taint_ttl_seconds: $taintTTLSeconds}
                   + {auto_protect_home_digit_children: (
                       if $autoProtectHomeDigitChildren == null
                       then $autoProtectHomeDigitChildrenDefault
