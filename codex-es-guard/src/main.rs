@@ -1775,8 +1775,22 @@ fn is_read_intent(fflag: i32) -> bool {
     (fflag & FFLAG_READ) != 0
 }
 
+fn should_deny_sensitive_open_for_process(
+    path: &str,
+    is_ai_context: bool,
+    fflag: i32,
+    policy: &SecurityPolicy,
+    is_guard_process: bool,
+) -> bool {
+    policy.read_gate_enabled
+        && policy.is_sensitive_path(path)
+        && is_read_intent(fflag)
+        && !is_ai_context
+        && !is_guard_process
+}
+
 fn should_deny_sensitive_open(path: &str, is_ai_context: bool, fflag: i32, policy: &SecurityPolicy) -> bool {
-    policy.read_gate_enabled && policy.is_sensitive_path(path) && is_read_intent(fflag) && !is_ai_context
+    should_deny_sensitive_open_for_process(path, is_ai_context, fflag, policy, false)
 }
 
 fn should_deny_sensitive_transfer(source: &str, dest: &str, policy: &SecurityPolicy) -> bool {
@@ -1945,6 +1959,18 @@ mod tests {
             &policy,
         );
         assert!(!decision.deny);
+    }
+
+    #[test]
+    fn open_read_on_sensitive_path_allows_guard_process() {
+        let policy = test_sensitive_policy();
+        assert!(!should_deny_sensitive_open_for_process(
+            "/Users/jqwang/.codex/es_policy.json",
+            false,
+            FFLAG_READ,
+            &policy,
+            true,
+        ));
     }
 
     #[test]
@@ -2668,6 +2694,7 @@ fn main() {
     let safe_cache = AssertUnwindSafe(ancestor_cache);
     let safe_taint = AssertUnwindSafe(taint_state);
     let home_for_handler = home.clone();
+    let guard_pid = std::process::id() as i32;
 
     let handler = move |client: &mut Client<'_>, message: Message| {
         let current_policy = safe_policy
@@ -2685,7 +2712,14 @@ fn main() {
                 let mut cache = safe_cache.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let ai_ancestor = find_ai_ancestor(pid, &current_policy, &mut cache);
                 let is_ai_context = ai_ancestor.is_some();
-                let should_deny = should_deny_sensitive_open(&path, is_ai_context, fflag, &current_policy);
+                let is_guard_process = pid == guard_pid;
+                let should_deny = should_deny_sensitive_open_for_process(
+                    &path,
+                    is_ai_context,
+                    fflag,
+                    &current_policy,
+                    is_guard_process,
+                );
 
                 if should_deny {
                     let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
