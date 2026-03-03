@@ -1460,43 +1460,72 @@ fn log_denial(home: &str, record: &DenialRecord) {
         }
     }
 
-    // Write human-readable feedback for AI agents
-    let dest_info = record
-        .dest
-        .as_deref()
-        .map(|d| format!("\nDest: {}", d))
-        .unwrap_or_default();
-    let feedback = format!(
-        "[ES-GUARD DENIED]\n\
-         Operation: {}\n\
-         Reason: {}\n\
-         Path: {}{}\n\
-         Zone: {}\n\
-         Process: {} (via {})\n\
-         \n\
-         Recommended (safer first step): es-guard-quarantine {}\n\
-         This moves the target into ./temp under your CURRENT working directory.\n\
-         \n\
-         If you must permanently delete via AI, request one-time override with TTL:\n\
-         es-guard-override --minutes 3 {}\n\
-         (Short TTL only; no-expire is rejected by helper)\n\
-         Then retry the operation.\n",
-        record.op,
-        record.reason,
-        record.path,
-        dest_info,
-        record.zone,
-        record.process,
-        record.ancestor,
-        record.path,
-        record.path
-    );
+    let feedback = build_denial_feedback(home, record);
     if let Ok(mut file) = open_truncate_no_follow(&feedback_path, DEFAULT_FILE_MODE) {
         if verify_regular_file(&file, &feedback_path).is_ok() {
             let _ = file.write_all(feedback.as_bytes());
             let _ = file.sync_data();
         }
     }
+}
+
+fn build_denial_feedback(home: &str, record: &DenialRecord) -> String {
+    let dest_info = record
+        .dest
+        .as_deref()
+        .map(|d| format!("\nDest: {}", d))
+        .unwrap_or_default();
+    let header = format!(
+        "[ES-GUARD DENIED]\n\
+         Operation: {}\n\
+         Reason: {}\n\
+         Path: {}{}\n\
+         Zone: {}\n\
+         Process: {} (via {})\n\
+         \n",
+        record.op, record.reason, record.path, dest_info, record.zone, record.process, record.ancestor,
+    );
+
+    let quarantine_dir = format!("{}/.codex/es-guard/quarantine", home);
+    let guidance = match record.reason.as_str() {
+        REASON_SENSITIVE_READ_NON_AI => format!(
+            "Recommended next step:\n\
+             - Sensitive read gate: non-AI reads are denied.\n\
+             - Retry from AI context (Codex/Claude ancestor).\n\
+             - If human review is required, export reviewed data only into: {}\n",
+            quarantine_dir
+        ),
+        REASON_SENSITIVE_TRANSFER_OUT => format!(
+            "Recommended next step:\n\
+             - Sensitive export is blocked outside allow-zones.\n\
+             - Move/copy only into quarantine allow-zone: {}\n\
+             - Example: mv {} {}/\n",
+            quarantine_dir, record.path, quarantine_dir
+        ),
+        REASON_TAINT_WRITE_OUT => format!(
+            "Recommended next step:\n\
+             - This process is tainted by a prior sensitive read.\n\
+             - Write outputs only into: {}\n\
+             - Or retry after taint TTL expires.\n",
+            quarantine_dir
+        ),
+        REASON_EXEC_EXFIL_TOOL => "Recommended next step:\n\
+             - Exfil tooling is blocked in AI context.\n\
+             - Keep processing inside allowed local zones or approved channels.\n"
+            .to_string(),
+        _ => format!(
+            "Recommended (safer first step): es-guard-quarantine {}\n\
+             This moves the target into ./temp under your CURRENT working directory.\n\
+             \n\
+             If you must permanently delete via AI, request one-time override with TTL:\n\
+             es-guard-override --minutes 3 {}\n\
+             (Short TTL only; no-expire is rejected by helper)\n\
+             Then retry the operation.\n",
+            record.path, record.path
+        ),
+    };
+
+    format!("{}{}", header, guidance)
 }
 
 fn now_ts() -> u64 {
@@ -1808,6 +1837,10 @@ fn should_allow_sensitive_read_observer(path: &str, process_name: &str, home: &s
         && is_sensitive_read_observer_path(path, home)
 }
 
+fn should_mark_taint_on_sensitive_read(path: &str, policy: &SecurityPolicy, home: &str) -> bool {
+    policy.is_sensitive_path(path) && !is_sensitive_read_observer_path(path, home)
+}
+
 fn should_deny_sensitive_transfer(source: &str, dest: &str, policy: &SecurityPolicy) -> bool {
     policy.transfer_gate_enabled
         && policy.is_sensitive_path(source)
@@ -2019,6 +2052,27 @@ mod tests {
     }
 
     #[test]
+    fn observer_metadata_reads_do_not_mark_taint() {
+        let policy = test_sensitive_policy();
+        let home = "/Users/jqwang";
+        assert!(!should_mark_taint_on_sensitive_read(
+            "/Users/jqwang/.codex/es_policy.json",
+            &policy,
+            home,
+        ));
+        assert!(!should_mark_taint_on_sensitive_read(
+            "/Users/jqwang/.codex/es-guard/denials.jsonl",
+            &policy,
+            home,
+        ));
+        assert!(should_mark_taint_on_sensitive_read(
+            "/Users/jqwang/.codex/chat/history.jsonl",
+            &policy,
+            home,
+        ));
+    }
+
+    #[test]
     fn sensitive_source_to_desktop_is_denied() {
         let policy = test_sensitive_policy();
         assert!(should_deny_sensitive_transfer(
@@ -2077,6 +2131,23 @@ mod tests {
         let record = DenialRecord::for_test_reason("SENSITIVE_READ_NON_AI");
         let json = serde_json::to_string(&record).expect("serialize");
         assert!(json.contains("SENSITIVE_READ_NON_AI"));
+    }
+
+    #[test]
+    fn denial_feedback_for_sensitive_read_has_read_specific_guidance() {
+        let record = DenialRecord::for_test_reason(REASON_SENSITIVE_READ_NON_AI);
+        let feedback = build_denial_feedback("/Users/jqwang", &record);
+        assert!(feedback.contains("non-AI reads are denied"));
+        assert!(feedback.contains("AI context"));
+        assert!(!feedback.contains("es-guard-override --minutes 3"));
+    }
+
+    #[test]
+    fn denial_feedback_for_protected_delete_keeps_override_guidance() {
+        let record = DenialRecord::for_test_reason(REASON_PROTECTED_ZONE_AI_DELETE);
+        let feedback = build_denial_feedback("/Users/jqwang", &record);
+        assert!(feedback.contains("es-guard-override --minutes 3"));
+        assert!(feedback.contains("es-guard-quarantine"));
     }
 
     #[derive(Debug)]
@@ -2794,7 +2865,10 @@ fn main() {
                     );
                     let _ = client.respond_flags_result(&message, 0, false);
                 } else {
-                    if is_ai_context && current_policy.is_sensitive_path(path.as_str()) && is_read_intent(fflag) {
+                    if is_ai_context
+                        && is_read_intent(fflag)
+                        && should_mark_taint_on_sensitive_read(path.as_str(), &current_policy, &home_for_handler)
+                    {
                         let mut taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         taint.mark(pid, now_ts());
                     }
