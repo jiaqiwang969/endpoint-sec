@@ -54,6 +54,9 @@ struct SecurityPolicy {
     protected_zones: Vec<String>,
     temporary_overrides: Vec<TemporaryOverrideEntry>,
 
+    #[serde(default)]
+    sensitive_zones: Vec<String>,
+
     #[serde(default = "default_auto_protect_home_digit_children")]
     auto_protect_home_digit_children: bool,
 
@@ -68,6 +71,15 @@ struct SecurityPolicy {
 
     #[serde(default)]
     allow_trusted_tools_in_ai_context: bool,
+
+    #[serde(default = "default_true")]
+    read_gate_enabled: bool,
+
+    #[serde(default = "default_true")]
+    transfer_gate_enabled: bool,
+
+    #[serde(default = "default_true")]
+    exec_gate_enabled: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -125,6 +137,10 @@ fn default_trusted_tools() -> Vec<String> {
 }
 
 fn default_auto_protect_home_digit_children() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -1696,6 +1712,16 @@ fn should_deny(
 mod tests {
     use super::*;
 
+    #[test]
+    fn sensitive_policy_defaults_are_safe() {
+        let policy: SecurityPolicy =
+            serde_json::from_str(r#"{"protected_zones":[],"temporary_overrides":[]}"#).expect("default policy json");
+        assert!(policy.sensitive_zones.is_empty());
+        assert!(policy.read_gate_enabled);
+        assert!(policy.transfer_gate_enabled);
+        assert!(policy.exec_gate_enabled);
+    }
+
     fn test_policy() -> SecurityPolicy {
         SecurityPolicy {
             protected_zones: vec!["/Users/jqwang/project".to_string()],
@@ -1705,6 +1731,10 @@ mod tests {
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
+            sensitive_zones: vec![],
+            read_gate_enabled: true,
+            transfer_gate_enabled: true,
+            exec_gate_enabled: true,
         }
     }
 
@@ -1739,6 +1769,10 @@ mod tests {
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
+            sensitive_zones: vec![],
+            read_gate_enabled: true,
+            transfer_gate_enabled: true,
+            exec_gate_enabled: true,
         };
 
         let changed = policy.sanitize_overrides(100, "/Users/jqwang");
@@ -1764,6 +1798,10 @@ mod tests {
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
+            sensitive_zones: vec![],
+            read_gate_enabled: true,
+            transfer_gate_enabled: true,
+            exec_gate_enabled: true,
         };
 
         let changed = policy.sanitize_overrides(1, "/Users/jqwang");
@@ -1824,6 +1862,10 @@ mod tests {
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
+            sensitive_zones: vec![],
+            read_gate_enabled: true,
+            transfer_gate_enabled: true,
+            exec_gate_enabled: true,
         };
 
         let changed = policy.sanitize_overrides(1, "/Users/jqwang");
@@ -1862,6 +1904,10 @@ mod tests {
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
+            sensitive_zones: vec![],
+            read_gate_enabled: true,
+            transfer_gate_enabled: true,
+            exec_gate_enabled: true,
         };
 
         assert!(policy.is_protected("/Users/jqwang/01-agent/file.txt", "/Users/jqwang"));
@@ -1883,6 +1929,10 @@ mod tests {
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
+            sensitive_zones: vec![],
+            read_gate_enabled: true,
+            transfer_gate_enabled: true,
+            exec_gate_enabled: true,
         };
 
         let changed = policy.sanitize_overrides(1, "/Users/jqwang");
