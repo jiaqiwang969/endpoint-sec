@@ -27,6 +27,7 @@ const MAX_OVERRIDE_REQUESTS_PER_MINUTE: usize = 120;
 const MAX_OVERRIDE_REQUEST_FILES_PER_CYCLE: usize = 256;
 const STALE_RESPONSE_RETENTION_SECS: u64 = 300;
 const OVERRIDE_AUDIT_MAX_BYTES: u64 = 1_000_000;
+const FFLAG_READ: i32 = 0x0000_0001;
 
 #[derive(Debug, Deserialize)]
 struct OverrideRequest {
@@ -1682,6 +1683,14 @@ fn should_allow_vcs_metadata_rename_in_ai_context(
     is_vcs_tool(process_name) && is_trusted_process_name(process_name, policy)
 }
 
+fn is_read_intent(fflag: i32) -> bool {
+    (fflag & FFLAG_READ) != 0
+}
+
+fn should_deny_sensitive_open(path: &str, is_ai_context: bool, fflag: i32, policy: &SecurityPolicy) -> bool {
+    policy.read_gate_enabled && policy.is_sensitive_path(path) && is_read_intent(fflag) && !is_ai_context
+}
+
 /// Core decision: should this operation be denied?
 /// Returns Some((process_name, ancestor_name)) if denied, None if allowed.
 fn should_deny(
@@ -1751,6 +1760,53 @@ mod tests {
         policy.sensitive_export_allow_zones = vec!["/Users/jqwang/.codex/es-guard/quarantine".to_string()];
         assert!(policy.is_sensitive_export_allowed("/Users/jqwang/.codex/es-guard/quarantine/a"));
         assert!(!policy.is_sensitive_export_allowed("/Users/jqwang/Desktop/a"));
+    }
+
+    #[test]
+    fn open_read_on_sensitive_path_denies_non_ai_context() {
+        let policy = test_sensitive_policy();
+        let decision = decide_sensitive_open_for_test(
+            "/Users/jqwang/.codex/chat/history.jsonl",
+            false,
+            FFLAG_READ,
+            &policy,
+        );
+        assert!(decision.deny);
+    }
+
+    #[test]
+    fn open_read_on_sensitive_path_allows_ai_context() {
+        let policy = test_sensitive_policy();
+        let decision = decide_sensitive_open_for_test(
+            "/Users/jqwang/.codex/chat/history.jsonl",
+            true,
+            FFLAG_READ,
+            &policy,
+        );
+        assert!(!decision.deny);
+    }
+
+    #[derive(Debug)]
+    struct SensitiveOpenDecision {
+        deny: bool,
+    }
+
+    fn decide_sensitive_open_for_test(
+        path: &str,
+        is_ai_context: bool,
+        fflag: i32,
+        policy: &SecurityPolicy,
+    ) -> SensitiveOpenDecision {
+        SensitiveOpenDecision {
+            deny: should_deny_sensitive_open(path, is_ai_context, fflag, policy),
+        }
+    }
+
+    fn test_sensitive_policy() -> SecurityPolicy {
+        let mut policy = test_policy();
+        policy.sensitive_zones = vec!["/Users/jqwang/.codex".to_string()];
+        policy.sensitive_export_allow_zones = vec!["/Users/jqwang/.codex/es-guard/quarantine".to_string()];
+        policy
     }
 
     fn test_policy() -> SecurityPolicy {
@@ -2381,6 +2437,45 @@ fn main() {
         let pid = message.process().audit_token().pid();
 
         match message.event() {
+            Some(Event::AuthOpen(open)) => {
+                let path = open.file().path().to_string_lossy().into_owned();
+                let fflag = open.fflag();
+
+                let mut cache = safe_cache.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let ai_ancestor = find_ai_ancestor(pid, &current_policy, &mut cache);
+                let is_ai_context = ai_ancestor.is_some();
+                let should_deny = should_deny_sensitive_open(&path, is_ai_context, fflag, &current_policy);
+
+                if should_deny {
+                    let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
+                    let ancestor = ai_ancestor.unwrap_or_else(|| "none".to_string());
+                    let zone = current_policy
+                        .sensitive_zones
+                        .iter()
+                        .find(|zone| path_prefix_match(path.as_str(), zone.as_str()))
+                        .cloned()
+                        .unwrap_or_default();
+                    println!(
+                        "[DENY] open(read) by {} (via {}): {}",
+                        process_name, ancestor, path
+                    );
+                    log_denial(
+                        &home_for_handler,
+                        &DenialRecord {
+                            ts: now_ts(),
+                            op: "open".into(),
+                            path: path.clone(),
+                            dest: None,
+                            zone,
+                            process: process_name,
+                            ancestor,
+                        },
+                    );
+                    let _ = client.respond_flags_result(&message, 0, false);
+                } else {
+                    let _ = client.respond_flags_result(&message, fflag as u32, false);
+                }
+            },
             Some(Event::AuthUnlink(unlink)) => {
                 let path = unlink.target().path().to_string_lossy();
 
@@ -2487,6 +2582,7 @@ fn main() {
 
     client
         .subscribe(&[
+            es_event_type_t::ES_EVENT_TYPE_AUTH_OPEN,
             es_event_type_t::ES_EVENT_TYPE_AUTH_UNLINK,
             es_event_type_t::ES_EVENT_TYPE_AUTH_RENAME,
         ])
