@@ -57,6 +57,9 @@ struct SecurityPolicy {
     #[serde(default)]
     sensitive_zones: Vec<String>,
 
+    #[serde(default)]
+    sensitive_export_allow_zones: Vec<String>,
+
     #[serde(default = "default_auto_protect_home_digit_children")]
     auto_protect_home_digit_children: bool,
 
@@ -415,6 +418,18 @@ struct OverrideAuditRecord {
 }
 
 impl SecurityPolicy {
+    fn is_sensitive_path(&self, target_path: &str) -> bool {
+        self.sensitive_zones
+            .iter()
+            .any(|zone| path_prefix_match(target_path, zone))
+    }
+
+    fn is_sensitive_export_allowed(&self, target_path: &str) -> bool {
+        self.sensitive_export_allow_zones
+            .iter()
+            .any(|zone| path_prefix_match(target_path, zone))
+    }
+
     fn is_override_active_for_path(&self, target_path: &str, now: u64) -> bool {
         self.temporary_overrides
             .iter()
@@ -1722,6 +1737,22 @@ mod tests {
         assert!(policy.exec_gate_enabled);
     }
 
+    #[test]
+    fn sensitive_zone_boundary_match_is_correct() {
+        let mut policy = test_policy();
+        policy.sensitive_zones = vec!["/Users/jqwang/.codex".to_string()];
+        assert!(policy.is_sensitive_path("/Users/jqwang/.codex/sessions/a.json"));
+        assert!(!policy.is_sensitive_path("/Users/jqwang/.codexx/sessions/a.json"));
+    }
+
+    #[test]
+    fn sensitive_destination_allows_only_allowlist() {
+        let mut policy = test_policy();
+        policy.sensitive_export_allow_zones = vec!["/Users/jqwang/.codex/es-guard/quarantine".to_string()];
+        assert!(policy.is_sensitive_export_allowed("/Users/jqwang/.codex/es-guard/quarantine/a"));
+        assert!(!policy.is_sensitive_export_allowed("/Users/jqwang/Desktop/a"));
+    }
+
     fn test_policy() -> SecurityPolicy {
         SecurityPolicy {
             protected_zones: vec!["/Users/jqwang/project".to_string()],
@@ -1732,6 +1763,7 @@ mod tests {
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
             sensitive_zones: vec![],
+            sensitive_export_allow_zones: vec![],
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
@@ -1770,6 +1802,7 @@ mod tests {
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
             sensitive_zones: vec![],
+            sensitive_export_allow_zones: vec![],
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
@@ -1799,6 +1832,7 @@ mod tests {
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
             sensitive_zones: vec![],
+            sensitive_export_allow_zones: vec![],
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
@@ -1863,6 +1897,7 @@ mod tests {
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
             sensitive_zones: vec![],
+            sensitive_export_allow_zones: vec![],
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
@@ -1905,6 +1940,7 @@ mod tests {
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
             sensitive_zones: vec![],
+            sensitive_export_allow_zones: vec![],
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
@@ -1930,6 +1966,7 @@ mod tests {
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
             sensitive_zones: vec![],
+            sensitive_export_allow_zones: vec![],
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
