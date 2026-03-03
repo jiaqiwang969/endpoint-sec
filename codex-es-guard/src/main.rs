@@ -29,6 +29,11 @@ const STALE_RESPONSE_RETENTION_SECS: u64 = 300;
 const OVERRIDE_AUDIT_MAX_BYTES: u64 = 1_000_000;
 const FFLAG_READ: i32 = 0x0000_0001;
 const DEFAULT_TAINT_TTL_SECS: u64 = 600;
+const REASON_SENSITIVE_READ_NON_AI: &str = "SENSITIVE_READ_NON_AI";
+const REASON_SENSITIVE_TRANSFER_OUT: &str = "SENSITIVE_TRANSFER_OUT";
+const REASON_TAINT_WRITE_OUT: &str = "TAINT_WRITE_OUT";
+const REASON_EXEC_EXFIL_TOOL: &str = "EXEC_EXFIL_TOOL";
+const REASON_PROTECTED_ZONE_AI_DELETE: &str = "PROTECTED_ZONE_AI_DELETE";
 
 #[derive(Debug, Deserialize)]
 struct OverrideRequest {
@@ -439,6 +444,23 @@ struct DenialRecord {
     zone: String,
     process: String,
     ancestor: String,
+    reason: String,
+}
+
+impl DenialRecord {
+    #[cfg(test)]
+    fn for_test_reason(reason: &str) -> Self {
+        Self {
+            ts: 0,
+            op: "test".to_string(),
+            path: "/tmp/test".to_string(),
+            dest: None,
+            zone: "test-zone".to_string(),
+            process: "test-proc".to_string(),
+            ancestor: "test-ancestor".to_string(),
+            reason: reason.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1434,6 +1456,7 @@ fn log_denial(home: &str, record: &DenialRecord) {
     let feedback = format!(
         "[ES-GUARD DENIED]\n\
          Operation: {}\n\
+         Reason: {}\n\
          Path: {}{}\n\
          Zone: {}\n\
          Process: {} (via {})\n\
@@ -1445,7 +1468,15 @@ fn log_denial(home: &str, record: &DenialRecord) {
          es-guard-override --minutes 3 {}\n\
          (Short TTL only; no-expire is rejected by helper)\n\
          Then retry the operation.\n",
-        record.op, record.path, dest_info, record.zone, record.process, record.ancestor, record.path, record.path
+        record.op,
+        record.reason,
+        record.path,
+        dest_info,
+        record.zone,
+        record.process,
+        record.ancestor,
+        record.path,
+        record.path
     );
     if let Ok(mut file) = open_truncate_no_follow(&feedback_path, DEFAULT_FILE_MODE) {
         if verify_regular_file(&file, &feedback_path).is_ok() {
@@ -1906,6 +1937,13 @@ mod tests {
     fn exfil_tool_is_allowed_outside_ai_context() {
         let policy = test_sensitive_policy();
         assert!(!should_deny_exec_in_ai_context("curl", false, &policy));
+    }
+
+    #[test]
+    fn denial_record_includes_reason_code() {
+        let record = DenialRecord::for_test_reason("SENSITIVE_READ_NON_AI");
+        let json = serde_json::to_string(&record).expect("serialize");
+        assert!(json.contains("SENSITIVE_READ_NON_AI"));
     }
 
     #[derive(Debug)]
@@ -2594,6 +2632,7 @@ fn main() {
                             zone,
                             process: process_name,
                             ancestor,
+                            reason: REASON_SENSITIVE_READ_NON_AI.to_string(),
                         },
                     );
                     let _ = client.respond_flags_result(&message, 0, false);
@@ -2629,6 +2668,7 @@ fn main() {
                             zone: "exec-blocklist".to_string(),
                             process: target_name,
                             ancestor,
+                            reason: REASON_EXEC_EXFIL_TOOL.to_string(),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -2666,6 +2706,7 @@ fn main() {
                             zone: "taint".to_string(),
                             process: process_name,
                             ancestor: "tainted".to_string(),
+                            reason: REASON_TAINT_WRITE_OUT.to_string(),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -2696,6 +2737,7 @@ fn main() {
                             zone: "taint".to_string(),
                             process: process_name,
                             ancestor: "tainted".to_string(),
+                            reason: REASON_TAINT_WRITE_OUT.to_string(),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -2731,6 +2773,7 @@ fn main() {
                             zone,
                             process: process_name,
                             ancestor: "n/a".to_string(),
+                            reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -2762,6 +2805,7 @@ fn main() {
                             zone,
                             process: process_name,
                             ancestor: "n/a".to_string(),
+                            reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -2793,6 +2837,7 @@ fn main() {
                             zone,
                             process: process_name,
                             ancestor: "n/a".to_string(),
+                            reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -2828,6 +2873,7 @@ fn main() {
                             zone,
                             process: process_name,
                             ancestor: "n/a".to_string(),
+                            reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -2857,6 +2903,7 @@ fn main() {
                             zone,
                             process: proc_name,
                             ancestor,
+                            reason: REASON_PROTECTED_ZONE_AI_DELETE.to_string(),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -2893,6 +2940,7 @@ fn main() {
                             zone,
                             process: process_name,
                             ancestor: "n/a".to_string(),
+                            reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -2943,6 +2991,7 @@ fn main() {
                             zone,
                             process: proc_name,
                             ancestor,
+                            reason: REASON_PROTECTED_ZONE_AI_DELETE.to_string(),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
