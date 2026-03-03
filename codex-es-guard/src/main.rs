@@ -425,6 +425,14 @@ impl SecurityPolicy {
             .any(|zone| path_prefix_match(target_path, zone))
     }
 
+    fn matched_sensitive_zone(&self, target_path: &str) -> String {
+        self.sensitive_zones
+            .iter()
+            .find(|zone| path_prefix_match(target_path, zone))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn is_sensitive_export_allowed(&self, target_path: &str) -> bool {
         self.sensitive_export_allow_zones
             .iter()
@@ -1691,6 +1699,22 @@ fn should_deny_sensitive_open(path: &str, is_ai_context: bool, fflag: i32, polic
     policy.read_gate_enabled && policy.is_sensitive_path(path) && is_read_intent(fflag) && !is_ai_context
 }
 
+fn should_deny_sensitive_transfer(source: &str, dest: &str, policy: &SecurityPolicy) -> bool {
+    policy.transfer_gate_enabled
+        && policy.is_sensitive_path(source)
+        && !policy.is_sensitive_export_allowed(dest)
+        && !policy.is_sensitive_path(dest)
+}
+
+fn join_path_component(dir: &str, name: &str) -> String {
+    let normalized_dir = trim_trailing_slashes(dir);
+    if normalized_dir == "/" {
+        format!("/{}", name)
+    } else {
+        format!("{}/{}", normalized_dir, name)
+    }
+}
+
 /// Core decision: should this operation be denied?
 /// Returns Some((process_name, ancestor_name)) if denied, None if allowed.
 fn should_deny(
@@ -1784,6 +1808,26 @@ mod tests {
             &policy,
         );
         assert!(!decision.deny);
+    }
+
+    #[test]
+    fn sensitive_source_to_desktop_is_denied() {
+        let policy = test_sensitive_policy();
+        assert!(should_deny_sensitive_transfer(
+            "/Users/jqwang/.codex/sessions/a.json",
+            "/Users/jqwang/Desktop/a.json",
+            &policy
+        ));
+    }
+
+    #[test]
+    fn sensitive_source_to_quarantine_is_allowed() {
+        let policy = test_sensitive_policy();
+        assert!(!should_deny_sensitive_transfer(
+            "/Users/jqwang/.codex/sessions/a.json",
+            "/Users/jqwang/.codex/es-guard/quarantine/a.json",
+            &policy
+        ));
     }
 
     #[derive(Debug)]
@@ -2449,12 +2493,7 @@ fn main() {
                 if should_deny {
                     let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
                     let ancestor = ai_ancestor.unwrap_or_else(|| "none".to_string());
-                    let zone = current_policy
-                        .sensitive_zones
-                        .iter()
-                        .find(|zone| path_prefix_match(path.as_str(), zone.as_str()))
-                        .cloned()
-                        .unwrap_or_default();
+                    let zone = current_policy.matched_sensitive_zone(path.as_str());
                     println!(
                         "[DENY] open(read) by {} (via {}): {}",
                         process_name, ancestor, path
@@ -2474,6 +2513,138 @@ fn main() {
                     let _ = client.respond_flags_result(&message, 0, false);
                 } else {
                     let _ = client.respond_flags_result(&message, fflag as u32, false);
+                }
+            },
+            Some(Event::AuthCopyFile(copyfile)) => {
+                let source_path = copyfile.source().path().to_string_lossy().into_owned();
+                let dest_path = if let Some(target_file) = copyfile.target_file() {
+                    target_file.path().to_string_lossy().into_owned()
+                } else {
+                    let target_dir = copyfile.target_dir().path().to_string_lossy().into_owned();
+                    let target_name = copyfile.target_name().to_string_lossy().into_owned();
+                    join_path_component(&target_dir, &target_name)
+                };
+                let should_deny = should_deny_sensitive_transfer(&source_path, &dest_path, &current_policy);
+
+                if should_deny {
+                    let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
+                    let zone = current_policy.matched_sensitive_zone(&source_path);
+                    println!(
+                        "[DENY] copyfile by {}: {} -> {}",
+                        process_name, source_path, dest_path
+                    );
+                    log_denial(
+                        &home_for_handler,
+                        &DenialRecord {
+                            ts: now_ts(),
+                            op: "copyfile".into(),
+                            path: source_path,
+                            dest: Some(dest_path),
+                            zone,
+                            process: process_name,
+                            ancestor: "n/a".to_string(),
+                        },
+                    );
+                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                } else {
+                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                }
+            },
+            Some(Event::AuthClone(clone)) => {
+                let source_path = clone.source().path().to_string_lossy().into_owned();
+                let target_dir = clone.target_dir().path().to_string_lossy().into_owned();
+                let target_name = clone.target_name().to_string_lossy().into_owned();
+                let dest_path = join_path_component(&target_dir, &target_name);
+                let should_deny = should_deny_sensitive_transfer(&source_path, &dest_path, &current_policy);
+
+                if should_deny {
+                    let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
+                    let zone = current_policy.matched_sensitive_zone(&source_path);
+                    println!(
+                        "[DENY] clone by {}: {} -> {}",
+                        process_name, source_path, dest_path
+                    );
+                    log_denial(
+                        &home_for_handler,
+                        &DenialRecord {
+                            ts: now_ts(),
+                            op: "clone".into(),
+                            path: source_path,
+                            dest: Some(dest_path),
+                            zone,
+                            process: process_name,
+                            ancestor: "n/a".to_string(),
+                        },
+                    );
+                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                } else {
+                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                }
+            },
+            Some(Event::AuthLink(link)) => {
+                let source_path = link.source().path().to_string_lossy().into_owned();
+                let target_dir = link.target_dir().path().to_string_lossy().into_owned();
+                let target_name = link.target_filename().to_string_lossy().into_owned();
+                let dest_path = join_path_component(&target_dir, &target_name);
+                let should_deny = should_deny_sensitive_transfer(&source_path, &dest_path, &current_policy);
+
+                if should_deny {
+                    let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
+                    let zone = current_policy.matched_sensitive_zone(&source_path);
+                    println!(
+                        "[DENY] link by {}: {} -> {}",
+                        process_name, source_path, dest_path
+                    );
+                    log_denial(
+                        &home_for_handler,
+                        &DenialRecord {
+                            ts: now_ts(),
+                            op: "link".into(),
+                            path: source_path,
+                            dest: Some(dest_path),
+                            zone,
+                            process: process_name,
+                            ancestor: "n/a".to_string(),
+                        },
+                    );
+                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                } else {
+                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                }
+            },
+            Some(Event::AuthExchangeData(exchange)) => {
+                let path1 = exchange.file1().path().to_string_lossy().into_owned();
+                let path2 = exchange.file2().path().to_string_lossy().into_owned();
+                let deny_pair = if should_deny_sensitive_transfer(&path1, &path2, &current_policy) {
+                    Some((path1.clone(), path2.clone()))
+                } else if should_deny_sensitive_transfer(&path2, &path1, &current_policy) {
+                    Some((path2.clone(), path1.clone()))
+                } else {
+                    None
+                };
+
+                if let Some((source_path, dest_path)) = deny_pair {
+                    let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
+                    let zone = current_policy.matched_sensitive_zone(&source_path);
+                    println!(
+                        "[DENY] exchangedata by {}: {} <-> {}",
+                        process_name, path1, path2
+                    );
+                    log_denial(
+                        &home_for_handler,
+                        &DenialRecord {
+                            ts: now_ts(),
+                            op: "exchangedata".into(),
+                            path: source_path,
+                            dest: Some(dest_path),
+                            zone,
+                            process: process_name,
+                            ancestor: "n/a".to_string(),
+                        },
+                    );
+                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                } else {
+                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
                 }
             },
             Some(Event::AuthUnlink(unlink)) => {
@@ -2506,22 +2677,43 @@ fn main() {
                 }
             },
             Some(Event::AuthRename(rename)) => {
-                let source_path = rename.source().path().to_string_lossy();
+                let source_path = rename.source().path().to_string_lossy().into_owned();
                 let dest_path_str = match rename.destination() {
                     Some(EventRenameDestinationFile::ExistingFile(file)) => file.path().to_string_lossy().into_owned(),
                     Some(EventRenameDestinationFile::NewPath { directory, filename }) => {
-                        format!(
-                            "{}/{}",
-                            directory.path().to_string_lossy(),
-                            filename.to_string_lossy()
-                        )
+                        let dest_dir = directory.path().to_string_lossy().into_owned();
+                        let dest_name = filename.to_string_lossy().into_owned();
+                        join_path_component(&dest_dir, &dest_name)
                     },
                     None => String::new(),
                 };
 
+                if should_deny_sensitive_transfer(&source_path, &dest_path_str, &current_policy) {
+                    let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
+                    let zone = current_policy.matched_sensitive_zone(&source_path);
+                    println!(
+                        "[DENY] rename(sensitive) by {}: {} -> {}",
+                        process_name, source_path, dest_path_str
+                    );
+                    log_denial(
+                        &home_for_handler,
+                        &DenialRecord {
+                            ts: now_ts(),
+                            op: "rename".into(),
+                            path: source_path.clone(),
+                            dest: Some(dest_path_str),
+                            zone,
+                            process: process_name,
+                            ancestor: "n/a".to_string(),
+                        },
+                    );
+                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    return;
+                }
+
                 // For rename: deny if moving OUT of protected zone in AI context
                 let mut cache = safe_cache.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                let deny_reason = if !current_policy.is_protected(&source_path, &home_for_handler)
+                let deny_reason = if !current_policy.is_protected(source_path.as_str(), &home_for_handler)
                     || is_system_temp(&source_path, &home_for_handler)
                 {
                     None
@@ -2558,7 +2750,7 @@ fn main() {
                         &DenialRecord {
                             ts: now_ts(),
                             op: "rename".into(),
-                            path: source_path.to_string(),
+                            path: source_path,
                             dest: Some(dest_path_str),
                             zone,
                             process: proc_name,
@@ -2583,6 +2775,10 @@ fn main() {
     client
         .subscribe(&[
             es_event_type_t::ES_EVENT_TYPE_AUTH_OPEN,
+            es_event_type_t::ES_EVENT_TYPE_AUTH_COPYFILE,
+            es_event_type_t::ES_EVENT_TYPE_AUTH_CLONE,
+            es_event_type_t::ES_EVENT_TYPE_AUTH_LINK,
+            es_event_type_t::ES_EVENT_TYPE_AUTH_EXCHANGEDATA,
             es_event_type_t::ES_EVENT_TYPE_AUTH_UNLINK,
             es_event_type_t::ES_EVENT_TYPE_AUTH_RENAME,
         ])
