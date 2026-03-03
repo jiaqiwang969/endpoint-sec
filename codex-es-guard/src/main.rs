@@ -1,5 +1,5 @@
 use endpoint_sec::sys::{es_auth_result_t, es_event_type_t};
-use endpoint_sec::{Client, Event, EventRenameDestinationFile, Message};
+use endpoint_sec::{Client, Event, EventCreateDestinationFile, EventRenameDestinationFile, Message};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -28,6 +28,7 @@ const MAX_OVERRIDE_REQUEST_FILES_PER_CYCLE: usize = 256;
 const STALE_RESPONSE_RETENTION_SECS: u64 = 300;
 const OVERRIDE_AUDIT_MAX_BYTES: u64 = 1_000_000;
 const FFLAG_READ: i32 = 0x0000_0001;
+const DEFAULT_TAINT_TTL_SECS: u64 = 600;
 
 #[derive(Debug, Deserialize)]
 struct OverrideRequest {
@@ -163,6 +164,31 @@ fn default_ai_agent_patterns() -> Vec<String> {
 struct CachedAncestor {
     ai_ancestor: Option<String>,
     updated_at: u64,
+}
+
+#[derive(Debug, Default)]
+struct TaintState {
+    ttl_secs: u64,
+    touched: HashMap<i32, u64>,
+}
+
+impl TaintState {
+    fn new(ttl_secs: u64) -> Self {
+        Self {
+            ttl_secs,
+            touched: HashMap::new(),
+        }
+    }
+
+    fn mark(&mut self, pid: i32, ts: u64) {
+        self.touched.insert(pid, ts);
+    }
+
+    fn is_tainted(&self, pid: i32, now: u64) -> bool {
+        self.touched
+            .get(&pid)
+            .is_some_and(|ts| now.saturating_sub(*ts) <= self.ttl_secs)
+    }
 }
 
 struct LockDirGuard {
@@ -1706,6 +1732,10 @@ fn should_deny_sensitive_transfer(source: &str, dest: &str, policy: &SecurityPol
         && !policy.is_sensitive_path(dest)
 }
 
+fn should_deny_tainted_write(pid: i32, target: &str, now: u64, taint: &TaintState, policy: &SecurityPolicy) -> bool {
+    taint.is_tainted(pid, now) && !policy.is_sensitive_export_allowed(target) && !policy.is_sensitive_path(target)
+}
+
 fn join_path_component(dir: &str, name: &str) -> String {
     let normalized_dir = trim_trailing_slashes(dir);
     if normalized_dir == "/" {
@@ -1826,6 +1856,28 @@ mod tests {
         assert!(!should_deny_sensitive_transfer(
             "/Users/jqwang/.codex/sessions/a.json",
             "/Users/jqwang/.codex/es-guard/quarantine/a.json",
+            &policy
+        ));
+    }
+
+    #[test]
+    fn taint_expires_after_ttl() {
+        let mut taint = TaintState::new(60);
+        taint.mark(100, 1_000);
+        assert!(taint.is_tainted(100, 1_030));
+        assert!(!taint.is_tainted(100, 1_061));
+    }
+
+    #[test]
+    fn tainted_process_write_outside_allow_zone_is_denied() {
+        let policy = test_sensitive_policy();
+        let mut taint = TaintState::new(600);
+        taint.mark(100, 1_000);
+        assert!(should_deny_tainted_write(
+            100,
+            "/Users/jqwang/Desktop/out.txt",
+            1_100,
+            &taint,
             &policy
         ));
     }
@@ -2349,6 +2401,7 @@ fn main() {
 
     // Process ancestry cache (cleared on policy reload)
     let ancestor_cache: Arc<Mutex<HashMap<i32, CachedAncestor>>> = Arc::new(Mutex::new(HashMap::new()));
+    let taint_state = Arc::new(Mutex::new(TaintState::new(DEFAULT_TAINT_TTL_SECS)));
 
     // Policy hot-reload thread (1s polling)
     let policy_clone = global_policy.clone();
@@ -2470,6 +2523,7 @@ fn main() {
 
     let safe_policy = AssertUnwindSafe(global_policy);
     let safe_cache = AssertUnwindSafe(ancestor_cache);
+    let safe_taint = AssertUnwindSafe(taint_state);
     let home_for_handler = home.clone();
 
     let handler = move |client: &mut Client<'_>, message: Message| {
@@ -2512,7 +2566,78 @@ fn main() {
                     );
                     let _ = client.respond_flags_result(&message, 0, false);
                 } else {
+                    if is_ai_context && current_policy.is_sensitive_path(path.as_str()) && is_read_intent(fflag) {
+                        let mut taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        taint.mark(pid, now_ts());
+                    }
                     let _ = client.respond_flags_result(&message, fflag as u32, false);
+                }
+            },
+            Some(Event::AuthCreate(create)) => {
+                let dest_path = match create.destination() {
+                    Some(EventCreateDestinationFile::ExistingFile(file)) => file.path().to_string_lossy().into_owned(),
+                    Some(EventCreateDestinationFile::NewPath {
+                        directory, filename, ..
+                    }) => {
+                        let dest_dir = directory.path().to_string_lossy().into_owned();
+                        let dest_name = filename.to_string_lossy().into_owned();
+                        join_path_component(&dest_dir, &dest_name)
+                    },
+                    None => String::new(),
+                };
+                let deny_taint = {
+                    let taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    should_deny_tainted_write(pid, &dest_path, now_ts(), &taint, &current_policy)
+                };
+
+                if deny_taint {
+                    let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
+                    println!("[DENY] create(taint) by {}: {}", process_name, dest_path);
+                    log_denial(
+                        &home_for_handler,
+                        &DenialRecord {
+                            ts: now_ts(),
+                            op: "create".into(),
+                            path: dest_path,
+                            dest: None,
+                            zone: "taint".to_string(),
+                            process: process_name,
+                            ancestor: "tainted".to_string(),
+                        },
+                    );
+                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                } else {
+                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                }
+            },
+            Some(Event::AuthTruncate(truncate)) => {
+                let target_path = truncate.target().path().to_string_lossy().into_owned();
+                let deny_taint = {
+                    let taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    should_deny_tainted_write(pid, &target_path, now_ts(), &taint, &current_policy)
+                };
+
+                if deny_taint {
+                    let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
+                    println!(
+                        "[DENY] truncate(taint) by {}: {}",
+                        process_name, target_path
+                    );
+                    log_denial(
+                        &home_for_handler,
+                        &DenialRecord {
+                            ts: now_ts(),
+                            op: "truncate".into(),
+                            path: target_path,
+                            dest: None,
+                            zone: "taint".to_string(),
+                            process: process_name,
+                            ancestor: "tainted".to_string(),
+                        },
+                    );
+                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                } else {
+                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
                 }
             },
             Some(Event::AuthCopyFile(copyfile)) => {
@@ -2775,6 +2900,8 @@ fn main() {
     client
         .subscribe(&[
             es_event_type_t::ES_EVENT_TYPE_AUTH_OPEN,
+            es_event_type_t::ES_EVENT_TYPE_AUTH_CREATE,
+            es_event_type_t::ES_EVENT_TYPE_AUTH_TRUNCATE,
             es_event_type_t::ES_EVENT_TYPE_AUTH_COPYFILE,
             es_event_type_t::ES_EVENT_TYPE_AUTH_CLONE,
             es_event_type_t::ES_EVENT_TYPE_AUTH_LINK,
