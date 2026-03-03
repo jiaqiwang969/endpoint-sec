@@ -727,6 +727,10 @@ final class ESGuardViewModel: ObservableObject {
             && homeDigitRoot(path: path, home: homeDir) != nil
     }
 
+    private func isInSensitiveZone(_ path: String) -> Bool {
+        policy.sensitiveZones.contains(where: { pathPrefixMatch(path, prefix: $0) })
+    }
+
     private func isDangerousBroadPath(_ path: String) -> Bool {
         let normalized = trimTrailingSlashes(path)
         let home = trimTrailingSlashes(homeDir)
@@ -734,6 +738,9 @@ final class ESGuardViewModel: ObservableObject {
             return true
         }
         if policy.protectedZones.contains(where: { trimTrailingSlashes($0) == normalized }) {
+            return true
+        }
+        if policy.sensitiveZones.contains(where: { trimTrailingSlashes($0) == normalized }) {
             return true
         }
         if (policy.autoProtectHomeDigitChildren ?? true),
@@ -836,6 +843,61 @@ final class ESGuardViewModel: ObservableObject {
                     }
                 } else {
                     self.presentMessage("放行程序调用出错，请检查 es-guard-override 是否可执行", success: false)
+                }
+            }
+        }
+    }
+
+    func requestSensitiveReadOverride(for path: String) {
+        guard let cleanPath = normalizedAbsolutePath(from: path) else {
+            presentMessage("临时访问失败：路径必须是绝对路径", success: false, clearAfter: 6.0)
+            return
+        }
+        guard isInSensitiveZone(cleanPath) else {
+            presentMessage("临时访问失败：该路径不在 sensitive_zones 中", success: false, clearAfter: 6.0)
+            return
+        }
+        guard !isDangerousBroadPath(cleanPath) else {
+            presentMessage("临时访问失败：禁止对根目录/家目录/sensitive 根目录整段放行", success: false, clearAfter: 7.0)
+            return
+        }
+
+        let revokeMinutes = min(max(autoRevokeMinutes, 1), 30)
+        if revokeMinutes != autoRevokeMinutes {
+            autoRevokeMinutes = revokeMinutes
+        }
+        guard revokeMinutes > 0 else {
+            presentMessage("临时访问失败：已禁用不过期放行，请选择 1-30 分钟", success: false, clearAfter: 7.0)
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let env = ["ES_GUARD_OVERRIDE_MINUTES": "\(max(revokeMinutes, 1))"]
+            let result = runProcessSync(
+                launchPath: "/usr/local/bin/es-guard-override",
+                arguments: ["--sensitive-read", cleanPath],
+                environment: env
+            )
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                if let result, result.status == 0 {
+                    self.presentMessage(
+                        "已授权人工临时访问 \(URL(fileURLWithPath: cleanPath).lastPathComponent)（\(revokeMinutes) 分钟）",
+                        success: true
+                    )
+                    self.refresh()
+                    return
+                }
+
+                if let result {
+                    let detail = result.stderr.isEmpty ? result.stdout : result.stderr
+                    if detail.isEmpty {
+                        self.presentMessage("临时访问执行失败 (退出码: \(result.status))", success: false)
+                    } else {
+                        self.presentMessage("临时访问执行失败: \(detail)", success: false)
+                    }
+                } else {
+                    self.presentMessage("临时访问调用失败，请检查 es-guard-override 是否可执行", success: false)
                 }
             }
         }

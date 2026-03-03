@@ -4,6 +4,7 @@ import AppKit
 struct PolicyPanel: View {
     @ObservedObject var viewModel: ESGuardViewModel
     @State private var manualOverridePath: String = ""
+    @State private var manualSensitiveReadPath: String = ""
     @State private var showEnableTrustedToolsAlert: Bool = false
     @State private var showClearOverridesAlert: Bool = false
     
@@ -31,7 +32,11 @@ struct PolicyPanel: View {
                 .foregroundColor(.secondary)
                 .padding(.horizontal)
             
-            // 手动添加 Override 的输入框
+            Text("临时删除/移动放行（protected_zones）")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding(.horizontal)
+
             HStack {
                 TextField("输入绝对路径...", text: $manualOverridePath)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
@@ -47,7 +52,7 @@ struct PolicyPanel: View {
             }
             .padding(.horizontal)
 
-            Text("仅允许受保护目录内的绝对路径；禁止对根目录/家目录/保护目录根做整段放行。")
+            Text("仅允许 protected_zones 内绝对路径；禁止对根目录/家目录/保护目录根做整段放行。")
                 .font(.caption2)
                 .foregroundColor(.secondary)
                 .padding(.horizontal)
@@ -201,6 +206,27 @@ struct PolicyPanel: View {
                         }
                     }
 
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("临时人工访问目录（仅敏感读取）")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        HStack {
+                            TextField("输入 sensitive 子路径...", text: $manualSensitiveReadPath)
+                                .textFieldStyle(RoundedBorderTextFieldStyle())
+                                .font(.system(size: 11, design: .monospaced))
+                                .onSubmit {
+                                    submitManualSensitiveReadOverride()
+                                }
+                            Button(action: submitManualSensitiveReadOverride) {
+                                Text("授权临时访问")
+                            }
+                            .disabled(manualSensitiveReadPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+                        Text("仅允许 sensitive_zones 内具体子路径；禁止对 ~/.codex 等 sensitive 根目录整段放行。")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+
                     VStack(alignment: .leading, spacing: 4) {
                         Text("sensitive_export_allow_zones (\(viewModel.policy.sensitiveExportAllowZones.count))")
                             .font(.caption)
@@ -347,6 +373,14 @@ struct PolicyPanel: View {
         if !path.isEmpty {
             viewModel.requestOverride(for: path)
             manualOverridePath = ""
+        }
+    }
+
+    private func submitManualSensitiveReadOverride() {
+        let path = manualSensitiveReadPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !path.isEmpty {
+            viewModel.requestSensitiveReadOverride(for: path)
+            manualSensitiveReadPath = ""
         }
     }
 

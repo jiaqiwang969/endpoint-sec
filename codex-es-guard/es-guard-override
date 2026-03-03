@@ -2,6 +2,7 @@
 # es-guard-override: request temporary file deletion/move override via root helper queue
 # Usage:
 #   es-guard-override [--minutes N] <path>
+#   es-guard-override --sensitive-read [--minutes N] <path>
 #   es-guard-override --remove <path>
 #   es-guard-override --clear
 #   es-guard-override --list
@@ -20,6 +21,7 @@ MAX_PATH_LEN="${ES_GUARD_OVERRIDE_MAX_PATH_LEN:-4096}"
 usage() {
     echo "Usage:"
     echo "  es-guard-override [--minutes N] <path>"
+    echo "  es-guard-override --sensitive-read [--minutes N] <path>"
     echo "  es-guard-override --remove <path>"
     echo "  es-guard-override --clear"
     echo "  es-guard-override --list"
@@ -103,6 +105,9 @@ while [ $# -gt 0 ]; do
         --no-expire)
             minutes="0"
             ;;
+        --sensitive-read)
+            action="grant-sensitive-read"
+            ;;
         --remove)
             action="remove"
             shift
@@ -156,7 +161,7 @@ case "$action" in
         ;;
     clear)
         ;;
-    remove|grant)
+    remove|grant|grant-sensitive-read)
         if [ -z "$target" ]; then
             echo "Error: missing target path" >&2
             usage
@@ -186,12 +191,12 @@ case "$action" in
         ;;
 esac
 
-if [ "$action" != "grant" ] && [ -n "$minutes" ]; then
-    echo "Error: --minutes/--no-expire is only valid for grant mode" >&2
+if [ "$action" != "grant" ] && [ "$action" != "grant-sensitive-read" ] && [ -n "$minutes" ]; then
+    echo "Error: --minutes/--no-expire is only valid for grant/sensitive-read mode" >&2
     exit 1
 fi
 
-if [ "$action" = "grant" ]; then
+if [ "$action" = "grant" ] || [ "$action" = "grant-sensitive-read" ]; then
     if [ -z "$minutes" ]; then
         minutes="$DEFAULT_MINUTES"
     fi
@@ -240,6 +245,15 @@ case "$action" in
             --argjson requester_pid "$requester_pid" \
             '{id: $id, action: $action, path: $path, minutes: $minutes, requester_pid: $requester_pid}' > "$tmp_request"
         ;;
+    grant-sensitive-read)
+        jq -n \
+            --arg id "$request_id" \
+            --arg action "grant-sensitive-read" \
+            --arg path "$target" \
+            --argjson minutes "$minutes" \
+            --argjson requester_pid "$requester_pid" \
+            '{id: $id, action: $action, path: $path, minutes: $minutes, requester_pid: $requester_pid}' > "$tmp_request"
+        ;;
     remove)
         jq -n \
             --arg id "$request_id" \
@@ -282,6 +296,17 @@ case "$action" in
             echo "Expires at: $expires"
         else
             echo "Override granted for $minutes minute(s): $target"
+        fi
+        echo "Waiting for policy reload (2s)..."
+        sleep 2
+        echo "Ready. You can now retry the operation."
+        ;;
+    grant-sensitive-read)
+        if [ -n "$expires" ]; then
+            echo "Sensitive-read override granted for $minutes minute(s): $target"
+            echo "Expires at: $expires"
+        else
+            echo "Sensitive-read override granted for $minutes minute(s): $target"
         fi
         echo "Waiting for policy reload (2s)..."
         sleep 2

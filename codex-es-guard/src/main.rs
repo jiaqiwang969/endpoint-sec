@@ -27,6 +27,8 @@ const MAX_OVERRIDE_REQUESTS_PER_MINUTE: usize = 120;
 const MAX_OVERRIDE_REQUEST_FILES_PER_CYCLE: usize = 256;
 const STALE_RESPONSE_RETENTION_SECS: u64 = 300;
 const OVERRIDE_AUDIT_MAX_BYTES: u64 = 1_000_000;
+const OVERRIDE_CREATED_BY_HELPER: &str = "es-guard-helper";
+const OVERRIDE_CREATED_BY_SENSITIVE_READ_HELPER: &str = "es-guard-helper-sensitive-read";
 const FFLAG_READ: i32 = 0x0000_0001;
 const DEFAULT_TAINT_TTL_SECS: u64 = 600;
 const REASON_SENSITIVE_READ_NON_AI: &str = "SENSITIVE_READ_NON_AI";
@@ -511,9 +513,15 @@ impl SecurityPolicy {
     }
 
     fn is_override_active_for_path(&self, target_path: &str, now: u64) -> bool {
-        self.temporary_overrides
-            .iter()
-            .any(|entry| !entry.is_expired(now) && path_prefix_match(target_path, entry.path()))
+        self.temporary_overrides.iter().any(|entry| {
+            !entry.is_expired(now) && !entry.is_sensitive_read_only() && path_prefix_match(target_path, entry.path())
+        })
+    }
+
+    fn is_sensitive_read_override_active_for_path(&self, target_path: &str, now: u64) -> bool {
+        self.temporary_overrides.iter().any(|entry| {
+            !entry.is_expired(now) && entry.is_sensitive_read_only() && path_prefix_match(target_path, entry.path())
+        })
     }
 
     fn is_in_configured_zone(&self, target_path: &str) -> bool {
@@ -577,10 +585,14 @@ impl SecurityPolicy {
     fn sanitize_overrides(&mut self, now: u64, home: &str) -> bool {
         let before = self.temporary_overrides.len();
         let protected_zones = self.protected_zones.clone();
+        let sensitive_zones = self.sensitive_zones.clone();
         let auto_home_digit = self.auto_protect_home_digit_children;
         self.temporary_overrides.retain(|entry| {
             let path = entry.path();
             let in_configured_zone = protected_zones
+                .iter()
+                .any(|zone| path_prefix_match(path, zone.as_str()));
+            let in_sensitive_zone = sensitive_zones
                 .iter()
                 .any(|zone| path_prefix_match(path, zone.as_str()));
             let in_auto_zone = auto_home_digit && home_digit_root(path, home).is_some();
@@ -588,7 +600,7 @@ impl SecurityPolicy {
                 && !path.is_empty()
                 && path.starts_with('/')
                 && path != "/"
-                && (in_configured_zone || in_auto_zone)
+                && (in_configured_zone || in_auto_zone || in_sensitive_zone)
         });
 
         let mut seen_paths: HashSet<String> = HashSet::new();
@@ -620,6 +632,17 @@ impl TemporaryOverrideEntry {
             TemporaryOverrideEntry::Path(_) => None,
             TemporaryOverrideEntry::Rule(rule) => rule.expires_at,
         }
+    }
+
+    fn created_by(&self) -> Option<&str> {
+        match self {
+            TemporaryOverrideEntry::Path(_) => None,
+            TemporaryOverrideEntry::Rule(rule) => rule.created_by.as_deref(),
+        }
+    }
+
+    fn is_sensitive_read_only(&self) -> bool {
+        self.created_by() == Some(OVERRIDE_CREATED_BY_SENSITIVE_READ_HELPER)
     }
 
     fn is_expired(&self, now: u64) -> bool {
@@ -878,6 +901,13 @@ fn is_dangerous_override_path(path: &str, policy: &SecurityPolicy, home: &str) -
     {
         return true;
     }
+    if policy
+        .sensitive_zones
+        .iter()
+        .any(|zone| trim_trailing_slashes(zone.as_str()) == normalized)
+    {
+        return true;
+    }
     if policy.auto_protect_home_digit_children {
         if let Some(auto_root) = home_digit_root(normalized, home) {
             if trim_trailing_slashes(auto_root.as_str()) == normalized {
@@ -896,7 +926,8 @@ fn apply_override_request(
 ) -> (bool, OverrideResponse) {
     let action = req.action.trim().to_lowercase();
     match action.as_str() {
-        "grant" => {
+        "grant" | "grant-sensitive-read" => {
+            let is_sensitive_read_grant = action == "grant-sensitive-read";
             let raw_path = match req.path.as_deref() {
                 Some(path) => path.trim(),
                 None => "",
@@ -948,13 +979,23 @@ fn apply_override_request(
                     },
                 );
             }
-            if !policy.is_in_any_zone(path.as_str(), home) {
+            let path_in_scope = if is_sensitive_read_grant {
+                policy.is_sensitive_path(path.as_str())
+            } else {
+                policy.is_in_any_zone(path.as_str(), home)
+            };
+            if !path_in_scope {
+                let message = if is_sensitive_read_grant {
+                    "path outside sensitive zones".to_string()
+                } else {
+                    "path outside protected zones".to_string()
+                };
                 return (
                     false,
                     OverrideResponse {
                         id: req.id.clone(),
                         status: "error".to_string(),
-                        message: "path outside protected zones".to_string(),
+                        message,
                         expires_at: None,
                     },
                 );
@@ -1014,15 +1055,25 @@ fn apply_override_request(
                 path,
                 expires_at: Some(expires_at),
                 created_at: Some(now),
-                created_by: Some("es-guard-helper".to_string()),
+                created_by: Some(if is_sensitive_read_grant {
+                    OVERRIDE_CREATED_BY_SENSITIVE_READ_HELPER.to_string()
+                } else {
+                    OVERRIDE_CREATED_BY_HELPER.to_string()
+                }),
             }));
+
+            let message = if is_sensitive_read_grant {
+                format!("sensitive read override granted for {} minute(s)", minutes)
+            } else {
+                format!("override granted for {} minute(s)", minutes)
+            };
 
             (
                 true,
                 OverrideResponse {
                     id: req.id.clone(),
                     status: "ok".to_string(),
-                    message: format!("override granted for {} minute(s)", minutes),
+                    message,
                     expires_at: Some(expires_at),
                 },
             )
@@ -1816,6 +1867,7 @@ fn should_deny_sensitive_open_for_process(
         && is_read_intent(fflag)
         && !is_ai_context
         && !is_guard_process
+        && !policy.is_sensitive_read_override_active_for_path(path, now_ts())
 }
 
 fn should_deny_sensitive_open(path: &str, is_ai_context: bool, fflag: i32, policy: &SecurityPolicy) -> bool {
@@ -2028,6 +2080,25 @@ mod tests {
         let decision = decide_sensitive_open_for_test(
             "/Users/jqwang/.codex/chat/history.jsonl",
             true,
+            FFLAG_READ,
+            &policy,
+        );
+        assert!(!decision.deny);
+    }
+
+    #[test]
+    fn open_read_on_sensitive_path_allows_temporary_override_for_human_read() {
+        let mut policy = test_sensitive_policy();
+        policy.temporary_overrides = vec![TemporaryOverrideEntry::Rule(TemporaryOverrideRule {
+            path: "/Users/jqwang/.codex/chat".to_string(),
+            expires_at: Some(now_ts().saturating_add(300)),
+            created_at: Some(now_ts()),
+            created_by: Some(OVERRIDE_CREATED_BY_SENSITIVE_READ_HELPER.to_string()),
+        })];
+
+        let decision = decide_sensitive_open_for_test(
+            "/Users/jqwang/.codex/chat/history.jsonl",
+            false,
             FFLAG_READ,
             &policy,
         );
@@ -2470,6 +2541,37 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_overrides_keeps_sensitive_zone_entries() {
+        let mut policy = SecurityPolicy {
+            protected_zones: vec![],
+            temporary_overrides: vec![
+                TemporaryOverrideEntry::Path("/Users/jqwang/.codex/chat/history.jsonl".to_string()),
+                TemporaryOverrideEntry::Path("/Users/jqwang/other/file.txt".to_string()),
+            ],
+            auto_protect_home_digit_children: false,
+            allow_vcs_metadata_in_ai_context: true,
+            trusted_tools: default_trusted_tools(),
+            ai_agent_patterns: default_ai_agent_patterns(),
+            allow_trusted_tools_in_ai_context: false,
+            exec_exfil_tool_blocklist: default_exec_exfil_tool_blocklist(),
+            sensitive_zones: vec!["/Users/jqwang/.codex".to_string()],
+            sensitive_export_allow_zones: vec![],
+            read_gate_enabled: true,
+            transfer_gate_enabled: true,
+            exec_gate_enabled: true,
+            taint_ttl_seconds: None,
+        };
+
+        let changed = policy.sanitize_overrides(1, "/Users/jqwang");
+        assert!(changed, "outside sensitive-zone entries should be removed");
+        assert_eq!(policy.temporary_overrides.len(), 1);
+        assert_eq!(
+            policy.temporary_overrides[0].path(),
+            "/Users/jqwang/.codex/chat/history.jsonl"
+        );
+    }
+
+    #[test]
     fn vcs_metadata_path_detection_respects_component_boundary() {
         assert!(is_vcs_metadata_path("/Users/jqwang/repo/.git/index.lock"));
         assert!(is_vcs_metadata_path("/Users/jqwang/repo/.jj/working_copy"));
@@ -2563,6 +2665,82 @@ mod tests {
         assert_eq!(response.status, "error");
         assert!(response.message.contains("broad path"));
         assert!(overrides.is_empty());
+    }
+
+    #[test]
+    fn apply_override_request_allows_sensitive_zone_subpath() {
+        let policy = test_sensitive_policy();
+        let mut overrides = Vec::new();
+        let request = OverrideRequest {
+            id: "req-sensitive-allow".to_string(),
+            action: "grant-sensitive-read".to_string(),
+            path: Some("/Users/jqwang/.codex/chat/history.jsonl".to_string()),
+            minutes: Some(3),
+            requester_pid: None,
+        };
+
+        let (changed, response) = apply_override_request(&request, &policy, "/Users/jqwang", &mut overrides);
+        assert!(changed);
+        assert_eq!(response.status, "ok");
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(
+            overrides[0].path(),
+            "/Users/jqwang/.codex/chat/history.jsonl"
+        );
+    }
+
+    #[test]
+    fn apply_override_request_rejects_sensitive_zone_root_path() {
+        let policy = test_sensitive_policy();
+        let mut overrides = Vec::new();
+        let request = OverrideRequest {
+            id: "req-sensitive-root".to_string(),
+            action: "grant-sensitive-read".to_string(),
+            path: Some("/Users/jqwang/.codex".to_string()),
+            minutes: Some(3),
+            requester_pid: None,
+        };
+
+        let (changed, response) = apply_override_request(&request, &policy, "/Users/jqwang", &mut overrides);
+        assert!(!changed);
+        assert_eq!(response.status, "error");
+        assert!(response.message.contains("broad path"));
+        assert!(overrides.is_empty());
+    }
+
+    #[test]
+    fn apply_override_request_rejects_sensitive_read_grant_outside_sensitive_zone() {
+        let policy = test_sensitive_policy();
+        let mut overrides = Vec::new();
+        let request = OverrideRequest {
+            id: "req-sensitive-outside".to_string(),
+            action: "grant-sensitive-read".to_string(),
+            path: Some("/Users/jqwang/project/file.txt".to_string()),
+            minutes: Some(3),
+            requester_pid: None,
+        };
+
+        let (changed, response) = apply_override_request(&request, &policy, "/Users/jqwang", &mut overrides);
+        assert!(!changed);
+        assert_eq!(response.status, "error");
+        assert!(response.message.contains("outside sensitive"));
+        assert!(overrides.is_empty());
+    }
+
+    #[test]
+    fn sensitive_read_override_does_not_disable_protected_delete_gate() {
+        let mut policy = test_policy();
+        policy.temporary_overrides = vec![TemporaryOverrideEntry::Rule(TemporaryOverrideRule {
+            path: "/Users/jqwang/project/file.txt".to_string(),
+            expires_at: Some(now_ts().saturating_add(300)),
+            created_at: Some(now_ts()),
+            created_by: Some(OVERRIDE_CREATED_BY_SENSITIVE_READ_HELPER.to_string()),
+        })];
+
+        assert!(
+            policy.is_protected("/Users/jqwang/project/file.txt", "/Users/jqwang"),
+            "sensitive-read override should not bypass protected delete/move gate"
+        );
     }
 
     #[test]
