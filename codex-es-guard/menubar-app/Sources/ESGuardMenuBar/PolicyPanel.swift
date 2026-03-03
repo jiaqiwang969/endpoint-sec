@@ -169,6 +169,21 @@ struct PolicyPanel: View {
                             .foregroundColor(viewModel.policy.execGateEnabled ? ApplePalette.success : ApplePalette.warning)
                     }
 
+                    HStack {
+                        Text("污点 TTL (秒)")
+                            .font(.caption)
+                        Spacer()
+                        if let taintTTLSeconds = viewModel.policy.taintTTLSeconds {
+                            Text("\(taintTTLSeconds)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else {
+                            Text("默认(600)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
                     VStack(alignment: .leading, spacing: 4) {
                         Text("sensitive_zones (\(viewModel.policy.sensitiveZones.count))")
                             .font(.caption)

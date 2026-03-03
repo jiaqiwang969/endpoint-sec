@@ -121,6 +121,7 @@ struct SecurityPolicy: Codable {
     var readGateEnabled: Bool
     var transferGateEnabled: Bool
     var execGateEnabled: Bool
+    var taintTTLSeconds: Int?
     
     enum CodingKeys: String, CodingKey {
         case protectedZones = "protected_zones"
@@ -136,6 +137,7 @@ struct SecurityPolicy: Codable {
         case readGateEnabled = "read_gate_enabled"
         case transferGateEnabled = "transfer_gate_enabled"
         case execGateEnabled = "exec_gate_enabled"
+        case taintTTLSeconds = "taint_ttl_seconds"
     }
 
     init(
@@ -151,7 +153,8 @@ struct SecurityPolicy: Codable {
         execExfilToolBlocklist: [String] = SecurityPolicy.defaultExecExfilToolBlocklist,
         readGateEnabled: Bool = true,
         transferGateEnabled: Bool = true,
-        execGateEnabled: Bool = true
+        execGateEnabled: Bool = true,
+        taintTTLSeconds: Int? = nil
     ) {
         self.protectedZones = protectedZones
         self.temporaryOverrides = temporaryOverrides
@@ -166,6 +169,7 @@ struct SecurityPolicy: Codable {
         self.readGateEnabled = readGateEnabled
         self.transferGateEnabled = transferGateEnabled
         self.execGateEnabled = execGateEnabled
+        self.taintTTLSeconds = taintTTLSeconds
     }
 
     init(from decoder: Decoder) throws {
@@ -184,6 +188,7 @@ struct SecurityPolicy: Codable {
         readGateEnabled = try container.decodeIfPresent(Bool.self, forKey: .readGateEnabled) ?? true
         transferGateEnabled = try container.decodeIfPresent(Bool.self, forKey: .transferGateEnabled) ?? true
         execGateEnabled = try container.decodeIfPresent(Bool.self, forKey: .execGateEnabled) ?? true
+        taintTTLSeconds = try container.decodeIfPresent(Int.self, forKey: .taintTTLSeconds)
     }
 
     static let defaultExecExfilToolBlocklist = ["curl", "wget", "scp", "sftp", "rsync", "nc", "ncat", "netcat"]
