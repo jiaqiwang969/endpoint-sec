@@ -44,6 +44,7 @@
           install -Dm644 codex-es-guard/es.plist $out/share/codex-es-guard/es.plist
           install -Dm755 codex-es-guard/es-guard-override $out/bin/es-guard-override
           install -Dm755 codex-es-guard/es-guard-quarantine $out/bin/es-guard-quarantine
+          install -Dm755 codex-es-guard/es-guard-egress $out/bin/es-guard-egress
         '';
 
         meta = {
@@ -190,6 +191,8 @@
                 chmod 755 /usr/local/bin/es-guard-override
                 cp -f "${cfg.package}/bin/es-guard-quarantine" /usr/local/bin/es-guard-quarantine
                 chmod 755 /usr/local/bin/es-guard-quarantine
+                cp -f "${cfg.package}/bin/es-guard-egress" /usr/local/bin/es-guard-egress
+                chmod 755 /usr/local/bin/es-guard-egress
 
                 # Restart daemon so it picks up the freshly signed binary
                 /bin/launchctl kickstart -k system/${daemonLabel} 2>/dev/null || true
