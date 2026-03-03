@@ -93,6 +93,9 @@ struct SecurityPolicy {
 
     #[serde(default = "default_true")]
     exec_gate_enabled: bool,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    taint_ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -193,6 +196,10 @@ impl TaintState {
             ttl_secs,
             touched: HashMap::new(),
         }
+    }
+
+    fn set_ttl_secs(&mut self, ttl_secs: u64) {
+        self.ttl_secs = ttl_secs;
     }
 
     fn mark(&mut self, pid: i32, ts: u64) {
@@ -495,6 +502,12 @@ impl SecurityPolicy {
         self.sensitive_export_allow_zones
             .iter()
             .any(|zone| path_prefix_match(target_path, zone))
+    }
+
+    fn taint_ttl_seconds_or_default(&self) -> u64 {
+        self.taint_ttl_seconds
+            .filter(|ttl| *ttl > 0)
+            .unwrap_or(DEFAULT_TAINT_TTL_SECS)
     }
 
     fn is_override_active_for_path(&self, target_path: &str, now: u64) -> bool {
@@ -1843,6 +1856,55 @@ mod tests {
         assert!(policy.read_gate_enabled);
         assert!(policy.transfer_gate_enabled);
         assert!(policy.exec_gate_enabled);
+        assert_eq!(
+            policy.taint_ttl_seconds_or_default(),
+            DEFAULT_TAINT_TTL_SECS
+        );
+    }
+
+    #[test]
+    fn policy_taint_ttl_seconds_can_be_overridden() {
+        let policy: SecurityPolicy = serde_json::from_str(
+            r#"{
+                "protected_zones":[],
+                "temporary_overrides":[],
+                "taint_ttl_seconds":42
+            }"#,
+        )
+        .expect("policy json");
+        assert_eq!(policy.taint_ttl_seconds_or_default(), 42);
+    }
+
+    #[test]
+    fn save_policy_preserves_taint_ttl_seconds_field() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "es-guard-policy-roundtrip-{}-{}",
+            std::process::id(),
+            now_ts()
+        ));
+        fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let policy_path = tmp_dir.join("es_policy.json");
+        fs::write(
+            &policy_path,
+            r#"{
+              "protected_zones": [],
+              "temporary_overrides": [],
+              "taint_ttl_seconds": 42
+            }"#,
+        )
+        .expect("write policy json");
+
+        let policy = load_policy(policy_path.to_str().expect("utf8 path")).expect("load policy");
+        save_policy(policy_path.to_str().expect("utf8 path"), &policy).expect("save policy");
+
+        let persisted = fs::read_to_string(&policy_path).expect("read persisted policy");
+        let persisted_json: serde_json::Value = serde_json::from_str(&persisted).expect("decode persisted policy");
+        assert_eq!(
+            persisted_json.get("taint_ttl_seconds").and_then(|value| value.as_u64()),
+            Some(42)
+        );
+
+        let _ = fs::remove_dir_all(tmp_dir);
     }
 
     #[test]
@@ -1984,6 +2046,7 @@ mod tests {
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
+            taint_ttl_seconds: None,
         }
     }
 
@@ -2024,6 +2087,7 @@ mod tests {
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
+            taint_ttl_seconds: None,
         };
 
         let changed = policy.sanitize_overrides(100, "/Users/jqwang");
@@ -2055,6 +2119,7 @@ mod tests {
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
+            taint_ttl_seconds: None,
         };
 
         let changed = policy.sanitize_overrides(1, "/Users/jqwang");
@@ -2121,6 +2186,7 @@ mod tests {
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
+            taint_ttl_seconds: None,
         };
 
         let changed = policy.sanitize_overrides(1, "/Users/jqwang");
@@ -2165,6 +2231,7 @@ mod tests {
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
+            taint_ttl_seconds: None,
         };
 
         assert!(policy.is_protected("/Users/jqwang/01-agent/file.txt", "/Users/jqwang"));
@@ -2192,6 +2259,7 @@ mod tests {
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
+            taint_ttl_seconds: None,
         };
 
         let changed = policy.sanitize_overrides(1, "/Users/jqwang");
@@ -2467,15 +2535,17 @@ fn main() {
         eprintln!("[policy] failed to write initial policy snapshot: {}", err);
     }
 
+    let initial_taint_ttl = initial_policy.taint_ttl_seconds_or_default();
     let global_policy = Arc::new(Mutex::new(initial_policy));
 
     // Process ancestry cache (cleared on policy reload)
     let ancestor_cache: Arc<Mutex<HashMap<i32, CachedAncestor>>> = Arc::new(Mutex::new(HashMap::new()));
-    let taint_state = Arc::new(Mutex::new(TaintState::new(DEFAULT_TAINT_TTL_SECS)));
+    let taint_state = Arc::new(Mutex::new(TaintState::new(initial_taint_ttl)));
 
     // Policy hot-reload thread (1s polling)
     let policy_clone = global_policy.clone();
     let cache_clone = ancestor_cache.clone();
+    let taint_clone = taint_state.clone();
     let path_clone = policy_path.clone();
     let override_path_clone = runtime_override_path.clone();
     let request_path_clone = request_dir_path.clone();
@@ -2574,6 +2644,9 @@ fn main() {
                     if let Ok(mut c) = cache_clone.lock() {
                         c.clear();
                     }
+                }
+                if let Ok(mut taint) = taint_clone.lock() {
+                    taint.set_ttl_secs(combined_policy.taint_ttl_seconds_or_default());
                 }
             }
 
