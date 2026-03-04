@@ -4,7 +4,7 @@ import AppKit
 struct PolicyPanel: View {
     @ObservedObject var viewModel: ESGuardViewModel
     @State private var manualOverridePath: String = ""
-    @State private var manualSensitiveReadPath: String = ""
+    @State private var manualSensitiveZonePath: String = ""
     @State private var showEnableTrustedToolsAlert: Bool = false
     @State private var showClearOverridesAlert: Bool = false
     
@@ -198,38 +198,45 @@ struct PolicyPanel: View {
                         Text("sensitive_zones (\(viewModel.policy.sensitiveZones.count))")
                             .font(.caption)
                             .foregroundColor(.secondary)
+
+                        HStack {
+                            TextField("输入绝对路径，例如 /Users/jqwang/.claude ...", text: $manualSensitiveZonePath)
+                                .textFieldStyle(RoundedBorderTextFieldStyle())
+                                .font(.system(size: 11, design: .monospaced))
+                                .onSubmit {
+                                    submitManualSensitiveZone()
+                                }
+                            Button(action: submitManualSensitiveZone) {
+                                Text("添加 sensitive zone")
+                            }
+                            .disabled(manualSensitiveZonePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+
+                        Text("用于管理“人不可读、Agent 可读但受防外传约束”的目录。支持随时添加/撤销。")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+
                         if viewModel.policy.sensitiveZones.isEmpty {
                             Text("未配置。建议至少覆盖 ~/.codex")
                                 .font(.caption2)
                                 .foregroundColor(ApplePalette.warning)
                         } else {
                             ForEach(viewModel.policy.sensitiveZones, id: \.self) { zone in
-                                Text(zone)
-                                    .font(.system(.caption2, design: .monospaced))
-                                    .foregroundColor(.primary)
-                            }
-                        }
-                    }
-
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("临时人工访问目录（仅敏感读取）")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        HStack {
-                            TextField("输入 sensitive 子路径...", text: $manualSensitiveReadPath)
-                                .textFieldStyle(RoundedBorderTextFieldStyle())
-                                .font(.system(size: 11, design: .monospaced))
-                                .onSubmit {
-                                    submitManualSensitiveReadOverride()
+                                HStack {
+                                    Text(zone)
+                                        .font(.system(.caption2, design: .monospaced))
+                                        .foregroundColor(.primary)
+                                    Spacer()
+                                    Button(action: {
+                                        viewModel.removeSensitiveZone(path: zone)
+                                    }) {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .foregroundColor(ApplePalette.danger)
+                                    }
+                                    .buttonStyle(PlainButtonStyle())
                                 }
-                            Button(action: submitManualSensitiveReadOverride) {
-                                Text("授权临时访问")
                             }
-                            .disabled(manualSensitiveReadPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
-                        Text("仅允许 sensitive_zones 内具体子路径；禁止对 ~/.codex 等 sensitive 根目录整段放行。")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
                     }
 
                     VStack(alignment: .leading, spacing: 4) {
@@ -381,11 +388,11 @@ struct PolicyPanel: View {
         }
     }
 
-    private func submitManualSensitiveReadOverride() {
-        let path = manualSensitiveReadPath.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func submitManualSensitiveZone() {
+        let path = manualSensitiveZonePath.trimmingCharacters(in: .whitespacesAndNewlines)
         if !path.isEmpty {
-            viewModel.requestSensitiveReadOverride(for: path)
-            manualSensitiveReadPath = ""
+            viewModel.addSensitiveZone(path: path)
+            manualSensitiveZonePath = ""
         }
     }
 

@@ -67,6 +67,13 @@ struct RecordsPanel: View {
                     .font(.headline)
                 Spacer()
 
+                Toggle("隐藏噪声", isOn: Binding(
+                    get: { viewModel.suppressNoiseRecords },
+                    set: { viewModel.setSuppressNoiseRecords($0) }
+                ))
+                .toggleStyle(SwitchToggleStyle(tint: ApplePalette.accent))
+                .controlSize(.small)
+
                 Picker("", selection: $filterOp) {
                     ForEach(RecordFilter.allCases) { filter in
                         Text(filter.title).tag(filter)
@@ -77,6 +84,14 @@ struct RecordsPanel: View {
             }
             .padding(.horizontal)
             .padding(.bottom, 8)
+
+            if viewModel.suppressNoiseRecords {
+                Text("降噪已开启：当前已隐藏 \(viewModel.hiddenNoiseCount) 条噪声事件")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal)
+                    .padding(.bottom, 6)
+            }
 
             HStack {
                 Image(systemName: "magnifyingglass")

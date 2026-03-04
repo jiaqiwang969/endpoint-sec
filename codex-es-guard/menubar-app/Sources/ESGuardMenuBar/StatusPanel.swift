@@ -20,6 +20,12 @@ struct StatusPanel: View {
                         StatBox(title: "删除 (DELETE)", value: "\(viewModel.totalDeletes)", color: ApplePalette.danger)
                         StatBox(title: "移动 (MOVE)", value: "\(viewModel.totalMoves)", color: ApplePalette.info)
                     }
+
+                    if viewModel.suppressNoiseRecords {
+                        Text("降噪已开启：隐藏 \(viewModel.hiddenNoiseCount) 条噪声事件")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
                 }
                 .padding(.horizontal)
                 

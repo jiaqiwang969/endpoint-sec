@@ -94,6 +94,26 @@ struct DenialRecord: Codable, Identifiable {
         case reason
     }
 
+    init(
+        ts: Int,
+        op: String,
+        path: String,
+        dest: String?,
+        zone: String,
+        process: String,
+        ancestor: String,
+        reason: String
+    ) {
+        self.ts = ts
+        self.op = op
+        self.path = path
+        self.dest = dest
+        self.zone = zone
+        self.process = process
+        self.ancestor = ancestor
+        self.reason = reason
+    }
+
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         ts = try container.decode(Int.self, forKey: .ts)
@@ -204,6 +224,7 @@ struct LogLine: Identifiable {
     let id = UUID()
     let text: String
     let isError: Bool
+    let isNoise: Bool
 }
 
 // 图表数据模型

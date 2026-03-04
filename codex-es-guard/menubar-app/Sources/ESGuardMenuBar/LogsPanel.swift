@@ -5,10 +5,14 @@ struct LogsPanel: View {
     @State private var showOnlyErrors = false
     
     var filteredLogs: [LogLine] {
-        if showOnlyErrors {
-            return viewModel.logLines.filter { $0.isError }
+        var logs = viewModel.logLines
+        if viewModel.suppressNoiseRecords {
+            logs = logs.filter { !$0.isNoise }
         }
-        return viewModel.logLines
+        if showOnlyErrors {
+            return logs.filter { $0.isError }
+        }
+        return logs
     }
     
     var body: some View {
@@ -21,6 +25,13 @@ struct LogsPanel: View {
                 Toggle("仅查看错误", isOn: $showOnlyErrors)
                     .toggleStyle(SwitchToggleStyle(tint: ApplePalette.danger))
                     .controlSize(.small)
+
+                Toggle("隐藏噪声", isOn: Binding(
+                    get: { viewModel.suppressNoiseRecords },
+                    set: { viewModel.setSuppressNoiseRecords($0) }
+                ))
+                .toggleStyle(SwitchToggleStyle(tint: ApplePalette.accent))
+                .controlSize(.small)
                 
                 Button(action: {
                     let text = viewModel.logLines.map { $0.text }.joined(separator: "\n")
@@ -36,6 +47,14 @@ struct LogsPanel: View {
             }
             .padding(.horizontal)
             .padding(.bottom, 8)
+
+            if viewModel.suppressNoiseRecords {
+                Text("降噪已开启：已隐藏噪声型读根目录/设备文件事件")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal)
+                    .padding(.bottom, 4)
+            }
             
             ScrollViewReader { proxy in
                 ScrollView {

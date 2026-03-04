@@ -321,17 +321,57 @@ fn trim_trailing_slashes(path: &str) -> &str {
     path.trim_end_matches('/')
 }
 
+fn path_prefix_match_single(path: &str, prefix: &str) -> bool {
+    if prefix.is_empty() || !prefix.starts_with('/') {
+        return false;
+    }
+    if prefix == "/" {
+        return path.starts_with('/');
+    }
+    path == prefix || path.starts_with(&format!("{}/", prefix))
+}
+
+fn strip_alias_prefix(path: &str, alias_prefix: &str) -> Option<String> {
+    if path == alias_prefix {
+        return Some("/".to_string());
+    }
+    path.strip_prefix(alias_prefix)
+        .filter(|suffix| suffix.starts_with('/'))
+        .map(|suffix| trim_trailing_slashes(suffix).to_string())
+}
+
+fn equivalent_path_variants(path: &str) -> Vec<String> {
+    let mut variants = vec![trim_trailing_slashes(path).to_string()];
+    let mut index = 0usize;
+    while index < variants.len() {
+        let current = variants[index].clone();
+        for alias in ["/System/Volumes/Data", "/private"] {
+            if let Some(candidate) = strip_alias_prefix(current.as_str(), alias) {
+                if candidate.starts_with('/') && !variants.iter().any(|existing| existing == &candidate) {
+                    variants.push(candidate);
+                }
+            }
+        }
+        index += 1;
+    }
+    variants
+}
+
 fn path_prefix_match(path: &str, prefix: &str) -> bool {
     let normalized_path = trim_trailing_slashes(path);
     let normalized_prefix = trim_trailing_slashes(prefix);
 
-    if normalized_prefix.is_empty() || !normalized_prefix.starts_with('/') {
-        return false;
+    let path_variants = equivalent_path_variants(normalized_path);
+    let prefix_variants = equivalent_path_variants(normalized_prefix);
+
+    for path_variant in path_variants.iter() {
+        for prefix_variant in prefix_variants.iter() {
+            if path_prefix_match_single(path_variant.as_str(), prefix_variant.as_str()) {
+                return true;
+            }
+        }
     }
-    if normalized_prefix == "/" {
-        return normalized_path.starts_with('/');
-    }
-    normalized_path == normalized_prefix || normalized_path.starts_with(&format!("{}/", normalized_prefix))
+    false
 }
 
 fn home_digit_root(path: &str, home: &str) -> Option<String> {
@@ -2341,7 +2381,7 @@ fn should_allow_vcs_metadata_rename_in_ai_context(
 }
 
 fn is_read_intent(fflag: i32) -> bool {
-    (fflag & FFLAG_READ) != 0
+    (fflag & FFLAG_READ) != 0 || !is_write_intent(fflag)
 }
 
 fn is_write_intent(fflag: i32) -> bool {
@@ -2373,8 +2413,12 @@ fn is_sensitive_read_observer_process(process_name: &str) -> bool {
 
 fn is_sensitive_read_observer_path(path: &str, home: &str) -> bool {
     let policy_path = format!("{}/.codex/es_policy.json", home);
+    let policy_lock_path = format!("{}.lock", policy_path);
     let guard_dir = format!("{}/.codex/es-guard", home);
-    path == policy_path || path_prefix_match(path, &guard_dir)
+    path == policy_path
+        || path == policy_lock_path
+        || path_prefix_match(path, &policy_lock_path)
+        || path_prefix_match(path, &guard_dir)
 }
 
 fn should_allow_sensitive_read_observer(path: &str, process_name: &str, home: &str) -> bool {
@@ -2620,6 +2664,13 @@ mod tests {
     }
 
     #[test]
+    fn open_read_on_sensitive_path_denies_non_ai_with_zero_flag() {
+        let policy = test_sensitive_policy();
+        let decision = decide_sensitive_open_for_test("/Users/jqwang/.codex/chat/history.jsonl", false, 0, &policy);
+        assert!(decision.deny);
+    }
+
+    #[test]
     fn open_read_on_sensitive_path_allows_ai_context() {
         let policy = test_sensitive_policy();
         let decision = decide_sensitive_open_for_test(
@@ -2667,6 +2718,11 @@ mod tests {
         let home = "/Users/jqwang";
         assert!(should_allow_sensitive_read_observer(
             "/Users/jqwang/.codex/es_policy.json",
+            "ESGuard",
+            home,
+        ));
+        assert!(should_allow_sensitive_read_observer(
+            "/Users/jqwang/.codex/es_policy.json.lock",
             "ESGuard",
             home,
         ));
@@ -2794,6 +2850,14 @@ mod tests {
         assert!(!is_write_intent(FFLAG_READ));
         assert!(is_write_intent(FFLAG_WRITE));
         assert!(is_write_intent(FFLAG_READ | FFLAG_WRITE));
+    }
+
+    #[test]
+    fn read_intent_detection_handles_zero_and_read_flags() {
+        assert!(is_read_intent(0));
+        assert!(is_read_intent(FFLAG_READ));
+        assert!(is_read_intent(FFLAG_READ | FFLAG_WRITE));
+        assert!(!is_read_intent(FFLAG_WRITE));
     }
 
     #[test]
@@ -3025,6 +3089,24 @@ mod tests {
         assert!(!path_prefix_match(
             "/Users/jqwang/projectx",
             "/Users/jqwang/project"
+        ));
+    }
+
+    #[test]
+    fn path_prefix_match_supports_system_volume_and_private_aliases() {
+        assert!(path_prefix_match(
+            "/System/Volumes/Data/Users/jqwang/.codex/config.toml",
+            "/Users/jqwang/.codex"
+        ));
+        assert!(path_prefix_match(
+            "/Users/jqwang/.codex/config.toml",
+            "/System/Volumes/Data/Users/jqwang/.codex"
+        ));
+        assert!(path_prefix_match("/private/tmp/es-guard.tmp", "/tmp"));
+        assert!(path_prefix_match("/tmp/es-guard.tmp", "/private/tmp"));
+        assert!(!path_prefix_match(
+            "/System/Volumes/Data/Users/jqwang/.codex-backup/config.toml",
+            "/Users/jqwang/.codex"
         ));
     }
 

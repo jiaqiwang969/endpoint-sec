@@ -75,7 +75,10 @@ private func runProcessSync(
     )
 }
 
-private func parseDenialsSnapshot(from data: Data) -> RecordsSnapshot {
+private func parseDenialsSnapshot(
+    from data: Data,
+    include: ((DenialRecord) -> Bool)? = nil
+) -> RecordsSnapshot {
     let lines = String(data: data, encoding: .utf8)?.split(separator: "\n") ?? []
     let decoder = JSONDecoder()
     var allParsed: [DenialRecord] = []
@@ -88,6 +91,10 @@ private func parseDenialsSnapshot(from data: Data) -> RecordsSnapshot {
     for line in lines {
         guard let lineData = String(line).data(using: .utf8),
               let record = try? decoder.decode(DenialRecord.self, from: lineData) else {
+            continue
+        }
+
+        if let include, !include(record) {
             continue
         }
 
@@ -166,19 +173,27 @@ private func isUserCanceledMessage(_ message: String) -> Bool {
         || lowered.contains("cancel")
 }
 
-private func shouldRetryPrivilegedForResult(_ result: ProcessExecutionResult?) -> Bool {
-    guard let result else { return true }
-    guard result.status != 0 else { return false }
-    let detail = bestProcessDetail(result)
-    if isPermissionDeniedMessage(detail) {
+func shouldRetryPrivileged(status: Int32, detail: String) -> Bool {
+    let trimmedDetail = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+    if isPermissionDeniedMessage(trimmedDetail) {
         return true
     }
 
-    if detail.lowercased().contains("input/output error") {
+    if trimmedDetail.lowercased().contains("input/output error") {
+        return true
+    }
+
+    if status != 0 && trimmedDetail.isEmpty {
         return true
     }
 
     return false
+}
+
+private func shouldRetryPrivilegedForResult(_ result: ProcessExecutionResult?) -> Bool {
+    guard let result else { return true }
+    let detail = bestProcessDetail(result)
+    return shouldRetryPrivileged(status: result.status, detail: detail)
 }
 
 private func runShellTransactionWithPrivilegeFallback(command: String) -> (result: ProcessExecutionResult?, usedPrivilege: Bool) {
@@ -191,6 +206,35 @@ private func runShellTransactionWithPrivilegeFallback(command: String) -> (resul
     }
     let privileged = runPrivilegedShellSync(command: command)
     return (privileged ?? direct, true)
+}
+
+func buildStartDaemonCommand(serviceTarget: String, plistPath: String) -> String {
+    let quotedTarget = shellQuote(serviceTarget)
+    let quotedPlist = shellQuote(plistPath)
+    return [
+        "if ! /bin/launchctl print \(quotedTarget) >/dev/null 2>&1; then if [ -f \(quotedPlist) ]; then /bin/launchctl bootstrap system \(quotedPlist); fi; fi",
+        "/bin/launchctl enable \(quotedTarget)",
+        "if /bin/launchctl print \(quotedTarget) >/dev/null 2>&1; then /bin/launchctl kickstart -k \(quotedTarget); fi",
+    ].joined(separator: "; ")
+}
+
+func buildStopDaemonCommand(serviceTarget: String, plistPath: String) -> String {
+    let quotedTarget = shellQuote(serviceTarget)
+    let quotedPlist = shellQuote(plistPath)
+    return [
+        "/bin/launchctl disable \(quotedTarget)",
+        "if /bin/launchctl print \(quotedTarget) >/dev/null 2>&1; then /bin/launchctl bootout \(quotedTarget) || /bin/launchctl bootout system \(quotedPlist); fi",
+    ].joined(separator: "; ")
+}
+
+func buildRestartDaemonCommand(serviceTarget: String, plistPath: String) -> String {
+    let quotedTarget = shellQuote(serviceTarget)
+    let quotedPlist = shellQuote(plistPath)
+    return [
+        "if ! /bin/launchctl print \(quotedTarget) >/dev/null 2>&1; then if [ -f \(quotedPlist) ]; then /bin/launchctl bootstrap system \(quotedPlist); fi; fi",
+        "/bin/launchctl enable \(quotedTarget)",
+        "/bin/launchctl kickstart -k \(quotedTarget)",
+    ].joined(separator: "; ")
 }
 
 private func parseLaunchctlState(from output: String) -> String? {
@@ -295,16 +339,42 @@ private func homeDigitRoot(path: String, home: String) -> String? {
     return normalizedHome + "/" + String(firstComponent)
 }
 
-private func acquireDirectoryLock(path: String, retries: Int = 100, sleepMs: UInt32 = 50) -> URL? {
+private func acquireDirectoryLock(
+    path: String,
+    retries: Int = 100,
+    sleepMs: UInt32 = 50,
+    staleAfterSeconds: TimeInterval = 30
+) -> URL? {
     let lockURL = URL(fileURLWithPath: path)
+    let fileManager = FileManager.default
+
+    func removeStaleLockDirectoryIfNeeded() -> Bool {
+        guard let attrs = try? fileManager.attributesOfItem(atPath: lockURL.path),
+              let modifiedAt = attrs[.modificationDate] as? Date else {
+            return false
+        }
+        guard Date().timeIntervalSince(modifiedAt) > staleAfterSeconds else {
+            return false
+        }
+        do {
+            try fileManager.removeItem(at: lockURL)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     for _ in 0..<max(retries, 1) {
         do {
-            try FileManager.default.createDirectory(
+            try fileManager.createDirectory(
                 at: lockURL,
                 withIntermediateDirectories: false
             )
             return lockURL
         } catch {
+            if removeStaleLockDirectoryIfNeeded() {
+                continue
+            }
             usleep(sleepMs * 1_000)
         }
     }
@@ -330,6 +400,8 @@ private func writePolicyFile(_ policy: SecurityPolicy, path: String) throws {
 
 @MainActor
 final class ESGuardViewModel: ObservableObject {
+    private let suppressNoiseDefaultsKey = "esguard.suppressNoiseRecords"
+
     @Published var guardRunning: Bool = false
     @Published var daemonStateHint: String = "launchd: 状态未知"
     @Published var records: [DenialRecord] = [] // UI 列表使用，只保留最新的 500 条
@@ -346,6 +418,8 @@ final class ESGuardViewModel: ObservableObject {
     @Published var totalDeletes: Int = 0
     @Published var totalMoves: Int = 0
     @Published var agentStats: [AgentStats] = []
+    @Published var hiddenNoiseCount: Int = 0
+    @Published var suppressNoiseRecords: Bool = true
     
     // 偏好设置
     @AppStorage("autoRevokeMinutes") var autoRevokeMinutes: Int = 3
@@ -386,6 +460,9 @@ final class ESGuardViewModel: ObservableObject {
     private var daemonStatusPollCancellable: AnyCancellable?
 
     init() {
+        if UserDefaults.standard.object(forKey: suppressNoiseDefaultsKey) != nil {
+            suppressNoiseRecords = UserDefaults.standard.bool(forKey: suppressNoiseDefaultsKey)
+        }
         if autoRevokeMinutes <= 0 || autoRevokeMinutes > 30 {
             autoRevokeMinutes = 3
         }
@@ -476,17 +553,7 @@ final class ESGuardViewModel: ObservableObject {
         let plistPath = daemonPlistPath
 
         daemonControlQueue.async {
-            let quotedTarget = shellQuote(serviceTarget)
-            let quotedPlist = shellQuote(plistPath)
-            let command = [
-                "if ! /bin/launchctl print \(quotedTarget) >/dev/null 2>&1; then",
-                "  if [ -f \(quotedPlist) ]; then /bin/launchctl bootstrap system \(quotedPlist) >/dev/null 2>&1 || true; fi",
-                "fi",
-                "/bin/launchctl enable \(quotedTarget)",
-                "if /bin/launchctl print \(quotedTarget) >/dev/null 2>&1; then",
-                "  /bin/launchctl kickstart -k \(quotedTarget)",
-                "fi",
-            ].joined(separator: "; ")
+            let command = buildStartDaemonCommand(serviceTarget: serviceTarget, plistPath: plistPath)
 
             let transaction = runShellTransactionWithPrivilegeFallback(command: command)
             let status = queryLaunchctlServiceStatus(serviceTarget: serviceTarget)
@@ -531,17 +598,11 @@ final class ESGuardViewModel: ObservableObject {
         let serviceTarget = daemonServiceTarget
 
         daemonControlQueue.async {
-            let quotedTarget = shellQuote(serviceTarget)
-            let quotedPlist = shellQuote(self.daemonPlistPath)
-            let command = [
-                "/bin/launchctl disable \(quotedTarget) >/dev/null 2>&1 || true",
-                "if /bin/launchctl print \(quotedTarget) >/dev/null 2>&1; then",
-                "  /bin/launchctl bootout \(quotedTarget) >/dev/null 2>&1 || /bin/launchctl bootout system \(quotedPlist) >/dev/null 2>&1 || true",
-                "fi",
-            ].joined(separator: "; ")
+            let command = buildStopDaemonCommand(serviceTarget: serviceTarget, plistPath: self.daemonPlistPath)
             let transaction = runShellTransactionWithPrivilegeFallback(command: command)
             let status = queryLaunchctlServiceStatus(serviceTarget: serviceTarget)
-            let details = bestProcessDetail(transaction.result)
+            let transactionDetail = bestProcessDetail(transaction.result)
+            let details = transactionDetail.isEmpty ? status.detail : transactionDetail
             let stopped = !status.running
 
             DispatchQueue.main.async { [weak self] in
@@ -577,19 +638,12 @@ final class ESGuardViewModel: ObservableObject {
         let serviceTarget = daemonServiceTarget
 
         daemonControlQueue.async {
-            let quotedTarget = shellQuote(serviceTarget)
-            let quotedPlist = shellQuote(self.daemonPlistPath)
-            let command = [
-                "if ! /bin/launchctl print \(quotedTarget) >/dev/null 2>&1; then",
-                "  if [ -f \(quotedPlist) ]; then /bin/launchctl bootstrap system \(quotedPlist) >/dev/null 2>&1 || true; fi",
-                "fi",
-                "/bin/launchctl enable \(quotedTarget) >/dev/null 2>&1 || true",
-                "/bin/launchctl kickstart -k \(quotedTarget)",
-            ].joined(separator: "; ")
+            let command = buildRestartDaemonCommand(serviceTarget: serviceTarget, plistPath: self.daemonPlistPath)
             let transaction = runShellTransactionWithPrivilegeFallback(command: command)
             let status = queryLaunchctlServiceStatus(serviceTarget: serviceTarget)
             let restarted = status.running
-            let detail = bestProcessDetail(transaction.result)
+            let transactionDetail = bestProcessDetail(transaction.result)
+            let detail = transactionDetail.isEmpty ? status.detail : transactionDetail
 
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
@@ -630,7 +684,7 @@ final class ESGuardViewModel: ObservableObject {
             Task { @MainActor in self?.loadLastDenial() }
         }
         
-        logTailer.startTailing(path: logPath) { [weak self] newLines in
+        logTailer.startTailing(path: logPath, homeDir: homeDir) { [weak self] newLines in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.logLines.append(contentsOf: newLines)
@@ -645,6 +699,8 @@ final class ESGuardViewModel: ObservableObject {
         recordsLoadToken += 1
         let token = recordsLoadToken
         let path = denialsPath
+        let homeDir = self.homeDir
+        let suppressNoise = self.suppressNoiseRecords
 
         recordsLoadQueue.async {
             guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
@@ -657,12 +713,26 @@ final class ESGuardViewModel: ObservableObject {
                     self.totalDeletes = 0
                     self.totalMoves = 0
                     self.previousRecordCount = 0
+                    self.hiddenNoiseCount = 0
                     self.isFirstLoad = false
                 }
                 return
             }
 
-            let snapshot = parseDenialsSnapshot(from: data)
+            let fullSnapshot = parseDenialsSnapshot(from: data)
+            let snapshot: RecordsSnapshot
+            let hiddenNoiseCount: Int
+            if suppressNoise {
+                let filtered = parseDenialsSnapshot(from: data) { record in
+                    !isNoisyDenialRecord(record, homeDir: homeDir)
+                }
+                snapshot = filtered
+                hiddenNoiseCount = max(fullSnapshot.totalIntercepts - filtered.totalIntercepts, 0)
+            } else {
+                snapshot = fullSnapshot
+                hiddenNoiseCount = 0
+            }
+
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 guard token == self.recordsLoadToken else { return }
@@ -678,6 +748,7 @@ final class ESGuardViewModel: ObservableObject {
                 self.totalDeletes = snapshot.totalDeletes
                 self.totalMoves = snapshot.totalMoves
                 self.agentStats = snapshot.agentStats
+                self.hiddenNoiseCount = hiddenNoiseCount
                 self.isFirstLoad = false
             }
         }
@@ -749,6 +820,17 @@ final class ESGuardViewModel: ObservableObject {
             return true
         }
         return false
+    }
+
+    private func isDisallowedSensitiveZoneRoot(_ path: String) -> Bool {
+        let normalized = trimTrailingSlashes(path)
+        let home = trimTrailingSlashes(homeDir)
+        return normalized == "/" || normalized == home
+    }
+
+    private func sensitiveZoneExists(_ path: String, zones: [String]) -> Bool {
+        let normalized = trimTrailingSlashes(path)
+        return zones.contains(where: { trimTrailingSlashes($0) == normalized })
     }
 
     private func mutatePolicyOnDisk(
@@ -903,6 +985,50 @@ final class ESGuardViewModel: ObservableObject {
         }
     }
 
+    func addSensitiveZone(path: String) {
+        guard let cleanPath = normalizedAbsolutePath(from: path) else {
+            presentMessage("添加失败：路径必须是绝对路径", success: false, clearAfter: 6.0)
+            return
+        }
+        guard !isDisallowedSensitiveZoneRoot(cleanPath) else {
+            presentMessage("添加失败：禁止将 / 或家目录整体设为 sensitive zone", success: false, clearAfter: 7.0)
+            return
+        }
+        guard !sensitiveZoneExists(cleanPath, zones: policy.sensitiveZones) else {
+            presentMessage("该 sensitive zone 已存在，无需重复添加", success: false, clearAfter: 5.0)
+            return
+        }
+
+        let zoneName = URL(fileURLWithPath: cleanPath).lastPathComponent
+        mutatePolicyOnDisk(
+            successMessage: "已添加 sensitive zone：\(zoneName)",
+            successClearAfter: 5.0
+        ) { policy in
+            if !self.sensitiveZoneExists(cleanPath, zones: policy.sensitiveZones) {
+                policy.sensitiveZones.append(cleanPath)
+            }
+        }
+    }
+
+    func removeSensitiveZone(path: String) {
+        guard let cleanPath = normalizedAbsolutePath(from: path) else {
+            presentMessage("移除失败：路径无效", success: false, clearAfter: 6.0)
+            return
+        }
+        guard sensitiveZoneExists(cleanPath, zones: policy.sensitiveZones) else {
+            presentMessage("移除失败：该路径不在 sensitive_zones 中", success: false, clearAfter: 6.0)
+            return
+        }
+
+        let zoneName = URL(fileURLWithPath: cleanPath).lastPathComponent
+        mutatePolicyOnDisk(
+            successMessage: "已移除 sensitive zone：\(zoneName)",
+            successClearAfter: 5.0
+        ) { policy in
+            policy.sensitiveZones.removeAll { trimTrailingSlashes($0) == trimTrailingSlashes(cleanPath) }
+        }
+    }
+
     func requestQuarantine(for path: String) {
         guard let cleanPath = normalizedAbsolutePath(from: path) else {
             presentMessage("隔离失败: 路径必须是绝对路径", success: false, clearAfter: 6.0)
@@ -1034,5 +1160,12 @@ final class ESGuardViewModel: ObservableObject {
         ) {
             $0.autoProtectHomeDigitChildren = enabled
         }
+    }
+
+    func setSuppressNoiseRecords(_ enabled: Bool) {
+        guard suppressNoiseRecords != enabled else { return }
+        suppressNoiseRecords = enabled
+        UserDefaults.standard.set(enabled, forKey: suppressNoiseDefaultsKey)
+        loadRecords()
     }
 }

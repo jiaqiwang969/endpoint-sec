@@ -5,7 +5,7 @@ class LogTailService {
     private var lastOffset: UInt64 = 0
     private let queue = DispatchQueue(label: "dev.codex-es-guard.logtail")
     
-    func startTailing(path: String, onNewLines: @escaping ([LogLine]) -> Void) {
+    func startTailing(path: String, homeDir: String, onNewLines: @escaping ([LogLine]) -> Void) {
         guard FileManager.default.fileExists(atPath: path) else { return }
         
         do {
@@ -23,7 +23,8 @@ class LogTailService {
                 let newLines = cleanText.split(separator: "\n").map { line in
                     let lineStr = String(line)
                     let isErr = lineStr.contains("[DENY]") || lineStr.contains("ERROR") || lineStr.contains("panic")
-                    return LogLine(text: lineStr, isError: isErr)
+                    let isNoise = isNoisyDaemonLogLine(lineStr, homeDir: homeDir)
+                    return LogLine(text: lineStr, isError: isErr, isNoise: isNoise)
                 }
                 
                 onNewLines(newLines)
