@@ -9,11 +9,15 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CACHE_TTL_SECS: u64 = 5;
+const TRUST_CACHE_TTL_SECS: u64 = 300;
+const CODESIGN_BIN: &str = "/usr/bin/codesign";
+const MAXCOMLEN: usize = 16;
 const DEFAULT_FILE_MODE: u32 = 0o644;
 const DEFAULT_DIR_MODE: u32 = 0o700;
 const RUNTIME_OVERRIDE_FILE_MODE: u32 = 0o600;
@@ -27,15 +31,18 @@ const MAX_OVERRIDE_REQUESTS_PER_MINUTE: usize = 120;
 const MAX_OVERRIDE_REQUEST_FILES_PER_CYCLE: usize = 256;
 const STALE_RESPONSE_RETENTION_SECS: u64 = 300;
 const OVERRIDE_AUDIT_MAX_BYTES: u64 = 1_000_000;
+const TAINT_AUDIT_MAX_BYTES: u64 = 1_000_000;
 const OVERRIDE_CREATED_BY_HELPER: &str = "es-guard-helper";
 const OVERRIDE_CREATED_BY_SENSITIVE_READ_HELPER: &str = "es-guard-helper-sensitive-read";
 const FFLAG_READ: i32 = 0x0000_0001;
+const FFLAG_WRITE: i32 = 0x0000_0002;
 const DEFAULT_TAINT_TTL_SECS: u64 = 600;
 const REASON_SENSITIVE_READ_NON_AI: &str = "SENSITIVE_READ_NON_AI";
 const REASON_SENSITIVE_TRANSFER_OUT: &str = "SENSITIVE_TRANSFER_OUT";
 const REASON_TAINT_WRITE_OUT: &str = "TAINT_WRITE_OUT";
 const REASON_EXEC_EXFIL_TOOL: &str = "EXEC_EXFIL_TOOL";
 const REASON_PROTECTED_ZONE_AI_DELETE: &str = "PROTECTED_ZONE_AI_DELETE";
+const REASON_TRUST_IDENTITY_MISMATCH: &str = "TRUST_IDENTITY_MISMATCH";
 
 #[derive(Debug, Deserialize)]
 struct OverrideRequest {
@@ -81,6 +88,9 @@ struct SecurityPolicy {
     #[serde(default = "default_trusted_tools")]
     trusted_tools: Vec<String>,
 
+    #[serde(default)]
+    trusted_tool_identities: Vec<TrustedToolIdentity>,
+
     #[serde(default = "default_ai_agent_patterns")]
     ai_agent_patterns: Vec<String>,
 
@@ -101,6 +111,19 @@ struct SecurityPolicy {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     taint_ttl_seconds: Option<u64>,
+
+    #[serde(default)]
+    trusted_identity_require_cdhash: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+struct TrustedToolIdentity {
+    path: String,
+    signing_identifier: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    team_identifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cdhash: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -191,6 +214,44 @@ fn default_exec_exfil_tool_blocklist() -> Vec<String> {
 struct CachedAncestor {
     ai_ancestor: Option<String>,
     updated_at: u64,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct ProcessIdentityKey {
+    pid: i32,
+    start_tvsec: u64,
+    start_tvusec: u64,
+    executable_path: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedTrustedProcess {
+    decision: TrustedProcessDecision,
+    updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrustedProcessDecision {
+    Trusted,
+    NotTrusted,
+    IdentityMismatch(String),
+}
+
+impl TrustedProcessDecision {
+    fn is_trusted(&self) -> bool {
+        matches!(self, Self::Trusted)
+    }
+
+    fn is_identity_mismatch(&self) -> bool {
+        matches!(self, Self::IdentityMismatch(_))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinaryCodeSignature {
+    signing_identifier: String,
+    team_identifier: Option<String>,
+    cdhash: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -461,6 +522,10 @@ struct DenialRecord {
     process: String,
     ancestor: String,
     reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ppid: Option<i32>,
 }
 
 impl DenialRecord {
@@ -475,6 +540,8 @@ impl DenialRecord {
             process: "test-proc".to_string(),
             ancestor: "test-ancestor".to_string(),
             reason: reason.to_string(),
+            pid: None,
+            ppid: None,
         }
     }
 }
@@ -490,6 +557,17 @@ struct OverrideAuditRecord {
     message: String,
     requester_pid: Option<i32>,
     requester_process: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaintMarkRecord {
+    ts: u64,
+    path: String,
+    process: String,
+    ancestor: String,
+    pid: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ppid: Option<i32>,
 }
 
 impl SecurityPolicy {
@@ -580,6 +658,18 @@ impl SecurityPolicy {
 
     fn is_trusted_tool(&self, exe_name: &str) -> bool {
         self.trusted_tools.iter().any(|tool| exe_name == tool.as_str())
+    }
+
+    fn trusted_identity_candidates_for_process<'a>(&'a self, process_name: &str) -> Vec<&'a TrustedToolIdentity> {
+        self.trusted_tool_identities
+            .iter()
+            .filter(|entry| {
+                Path::new(entry.path.as_str())
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == process_name)
+            })
+            .collect()
     }
 
     fn matches_ai_agent(&self, exe_path: &str) -> bool {
@@ -1527,6 +1617,30 @@ fn log_denial(home: &str, record: &DenialRecord) {
     }
 }
 
+fn log_taint_mark(home: &str, record: &TaintMarkRecord) {
+    let guard_dir = match ensure_guard_dirs(home) {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("[taint] cannot use guard dir: {}", err);
+            return;
+        },
+    };
+
+    let log_path = guard_dir.join("taint-marks.jsonl");
+    if let Ok(json) = serde_json::to_string(record) {
+        if let Ok(mut file) = open_append_no_follow(&log_path, DEFAULT_FILE_MODE) {
+            if verify_regular_file(&file, &log_path).is_ok() {
+                if let Ok(meta) = file.metadata() {
+                    if meta.len() > TAINT_AUDIT_MAX_BYTES {
+                        let _ = file.set_len(0);
+                    }
+                }
+                let _ = writeln!(file, "{}", json);
+            }
+        }
+    }
+}
+
 fn build_denial_feedback(home: &str, record: &DenialRecord) -> String {
     let dest_info = record
         .dest
@@ -1539,9 +1653,17 @@ fn build_denial_feedback(home: &str, record: &DenialRecord) -> String {
          Reason: {}\n\
          Path: {}{}\n\
          Zone: {}\n\
-         Process: {} (via {})\n\
+         Process: {} (via {})\n{}{}\
          \n",
-        record.op, record.reason, record.path, dest_info, record.zone, record.process, record.ancestor,
+        record.op,
+        record.reason,
+        record.path,
+        dest_info,
+        record.zone,
+        record.process,
+        record.ancestor,
+        record.pid.map(|pid| format!("Pid: {}\n", pid)).unwrap_or_default(),
+        record.ppid.map(|ppid| format!("PPid: {}\n", ppid)).unwrap_or_default(),
     );
 
     let quarantine_dir = format!("{}/.codex/es-guard/quarantine", home);
@@ -1571,6 +1693,14 @@ fn build_denial_feedback(home: &str, record: &DenialRecord) -> String {
              - Exfil tooling is blocked in AI context.\n\
              - Keep processing inside allowed local zones or approved channels.\n"
             .to_string(),
+        REASON_TRUST_IDENTITY_MISMATCH => format!(
+            "Recommended next step:\n\
+             - Trusted process identity verification failed.\n\
+             - Check `trusted_tool_identities` for exact path + signing identity.\n\
+             - If high-security mode is on, ensure cdhash is pinned correctly.\n\
+             - Current process: {}\n",
+            record.process
+        ),
         _ => format!(
             "Recommended (safer first step): es-guard-quarantine {}\n\
              This moves the target into ./temp under your CURRENT working directory.\n\
@@ -1716,28 +1846,87 @@ fn is_override_helper_process(pid: i32) -> bool {
 }
 
 /// Query proc_bsdinfo for a process. Returns (ppid, comm_name).
-fn get_process_info(pid: i32) -> Option<(i32, String)> {
+#[repr(C)]
+struct ProcBsdInfo {
+    pbi_flags: u32,
+    pbi_status: u32,
+    pbi_xstatus: u32,
+    pbi_pid: u32,
+    pbi_ppid: u32,
+    pbi_uid: libc::uid_t,
+    pbi_gid: libc::gid_t,
+    pbi_ruid: libc::uid_t,
+    pbi_rgid: libc::gid_t,
+    pbi_svuid: libc::uid_t,
+    pbi_svgid: libc::gid_t,
+    rfu_1: u32,
+    pbi_comm: [libc::c_char; MAXCOMLEN],
+    pbi_name: [libc::c_char; MAXCOMLEN * 2],
+    pbi_nfiles: u32,
+    pbi_pgid: u32,
+    pbi_pjobc: u32,
+    e_tdev: u32,
+    e_tpgid: u32,
+    pbi_nice: i32,
+    pbi_start_tvsec: u64,
+    pbi_start_tvusec: u64,
+}
+
+fn c_char_buf_to_string(buf: &[libc::c_char]) -> String {
+    let bytes: Vec<u8> = buf
+        .iter()
+        .copied()
+        .take_while(|value| *value != 0)
+        .map(|value| value as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+fn get_process_bsd_info(pid: i32) -> Option<ProcBsdInfo> {
     const PROC_PIDTBSDINFO: i32 = 3;
-    let mut buf = [0u8; 256];
+    let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
+    let info_size = std::mem::size_of::<ProcBsdInfo>() as i32;
     let ret = unsafe {
         libc::proc_pidinfo(
             pid,
             PROC_PIDTBSDINFO,
             0,
-            buf.as_mut_ptr() as *mut libc::c_void,
-            buf.len() as i32,
+            &mut info as *mut ProcBsdInfo as *mut libc::c_void,
+            info_size,
         )
     };
-    if ret > 20 {
-        let ppid = u32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]) as i32;
-        let ppid = if ppid > 0 && ppid != pid { ppid } else { 0 };
-        // pbi_comm at offset 48 (16 bytes)
-        let comm_end = buf[48..64].iter().position(|&b| b == 0).unwrap_or(16);
-        let comm = String::from_utf8_lossy(&buf[48..48 + comm_end]).to_string();
-        Some((ppid, comm))
+    if ret == info_size {
+        Some(info)
     } else {
         None
     }
+}
+
+fn get_process_info(pid: i32) -> Option<(i32, String)> {
+    let info = get_process_bsd_info(pid)?;
+    let ppid_raw = info.pbi_ppid as i32;
+    let ppid = if ppid_raw > 0 && ppid_raw != pid { ppid_raw } else { 0 };
+    let comm = c_char_buf_to_string(&info.pbi_comm);
+    Some((ppid, comm))
+}
+
+fn parent_pid_for_pid(pid: i32) -> Option<i32> {
+    get_process_info(pid).map(|(ppid, _)| ppid).filter(|ppid| *ppid > 0)
+}
+
+fn pid_for_record(pid: i32) -> Option<i32> {
+    (pid > 0).then_some(pid)
+}
+
+fn process_identity_key(pid: i32) -> Option<ProcessIdentityKey> {
+    let info = get_process_bsd_info(pid)?;
+    let executable_path = get_process_path(pid)?;
+    Some(ProcessIdentityKey {
+        pid,
+        start_tvsec: info.pbi_start_tvsec,
+        start_tvusec: info.pbi_start_tvusec,
+        executable_path,
+    })
 }
 
 fn exe_name(path: &str) -> &str {
@@ -1807,9 +1996,214 @@ fn process_name_for_pid(pid: i32) -> Option<String> {
     get_process_path(pid).map(|path| exe_name(&path).to_string())
 }
 
-/// Check if the immediate process is a trusted tool.
-fn is_trusted_process_name(process_name: &str, policy: &SecurityPolicy) -> bool {
-    policy.is_trusted_tool(process_name)
+fn canonicalize_executable_path_strict(executable_path: &str) -> Result<String, String> {
+    let normalized = normalize_absolute_path(executable_path)
+        .ok_or_else(|| format!("executable path is not absolute: {}", executable_path))?;
+    let metadata =
+        fs::symlink_metadata(&normalized).map_err(|err| format!("cannot stat executable {}: {}", normalized, err))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "symbolic-link executable path is rejected: {}",
+            normalized
+        ));
+    }
+    let canonical = fs::canonicalize(&normalized)
+        .map_err(|err| format!("cannot canonicalize executable {}: {}", normalized, err))?;
+    let canonical_text = canonical.to_string_lossy().to_string();
+    if canonical_text != normalized {
+        return Err(format!(
+            "executable path must be canonical (got {}, canonical {})",
+            normalized, canonical_text
+        ));
+    }
+    Ok(canonical_text)
+}
+
+fn codesign_field(report: &str, key: &str) -> Option<String> {
+    report
+        .lines()
+        .find_map(|line| line.strip_prefix(key).map(|value| value.trim().to_string()))
+}
+
+fn read_binary_signature(executable_path: &str) -> Result<BinaryCodeSignature, String> {
+    let output = Command::new(CODESIGN_BIN)
+        .args(["-dv", "--verbose=4", executable_path])
+        .output()
+        .map_err(|err| format!("failed to run codesign: {}", err))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let report = format!("{}\n{}", stdout, stderr);
+    if !output.status.success() {
+        return Err(format!(
+            "codesign verification failed for {}: {}",
+            executable_path,
+            report.trim()
+        ));
+    }
+
+    let signing_identifier = codesign_field(&report, "Identifier=")
+        .ok_or_else(|| format!("missing signing identifier for {}", executable_path))?;
+    let team_identifier = match codesign_field(&report, "TeamIdentifier=") {
+        Some(value) if value == "not set" || value.is_empty() => None,
+        Some(value) => Some(value),
+        None => None,
+    };
+    let cdhash = codesign_field(&report, "CDHash=").map(|value| value.to_lowercase());
+
+    Ok(BinaryCodeSignature {
+        signing_identifier,
+        team_identifier,
+        cdhash,
+    })
+}
+
+fn normalized_expected_trusted_identity_path(entry: &TrustedToolIdentity) -> Option<String> {
+    normalize_absolute_path(entry.path.as_str()).map(|path| trim_trailing_slashes(&path).to_string())
+}
+
+fn evaluate_trusted_process_from_path(
+    process_name: &str,
+    executable_path: &str,
+    policy: &SecurityPolicy,
+) -> TrustedProcessDecision {
+    if !policy.is_trusted_tool(process_name) {
+        return TrustedProcessDecision::NotTrusted;
+    }
+
+    let expected_identities = policy.trusted_identity_candidates_for_process(process_name);
+    if expected_identities.is_empty() {
+        return TrustedProcessDecision::IdentityMismatch(format!(
+            "trusted tool {} has no trusted_tool_identities entry",
+            process_name
+        ));
+    }
+
+    let canonical_path = match canonicalize_executable_path_strict(executable_path) {
+        Ok(path) => path,
+        Err(err) => return TrustedProcessDecision::IdentityMismatch(err),
+    };
+    let actual_signature = match read_binary_signature(&canonical_path) {
+        Ok(signature) => signature,
+        Err(err) => return TrustedProcessDecision::IdentityMismatch(err),
+    };
+
+    let matched = expected_identities.iter().any(|entry| {
+        let expected_path = match normalized_expected_trusted_identity_path(entry) {
+            Some(path) => path,
+            None => return false,
+        };
+        if expected_path != canonical_path {
+            return false;
+        }
+        if entry.signing_identifier != actual_signature.signing_identifier {
+            return false;
+        }
+        if entry.team_identifier != actual_signature.team_identifier {
+            return false;
+        }
+
+        let expected_cdhash = entry.cdhash.as_ref().map(|value| value.to_lowercase());
+        if policy.trusted_identity_require_cdhash && expected_cdhash.is_none() {
+            return false;
+        }
+        if let Some(expected) = expected_cdhash {
+            if actual_signature.cdhash.as_deref() != Some(expected.as_str()) {
+                return false;
+            }
+        }
+
+        true
+    });
+    if matched {
+        return TrustedProcessDecision::Trusted;
+    }
+
+    let expected_paths = expected_identities
+        .iter()
+        .filter_map(|entry| normalized_expected_trusted_identity_path(entry))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let expected_signing_ids = expected_identities
+        .iter()
+        .map(|entry| entry.signing_identifier.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let expected_team_ids = expected_identities
+        .iter()
+        .map(|entry| entry.team_identifier.clone().unwrap_or_else(|| "not set".to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    TrustedProcessDecision::IdentityMismatch(format!(
+        "identity mismatch for {}: path={} signing_id={} team_id={} (expected paths=[{}], signing_ids=[{}], team_ids=[{}])",
+        process_name,
+        canonical_path,
+        actual_signature.signing_identifier,
+        actual_signature
+            .team_identifier
+            .unwrap_or_else(|| "not set".to_string()),
+        expected_paths,
+        expected_signing_ids,
+        expected_team_ids
+    ))
+}
+
+fn prune_trust_cache(cache: &mut HashMap<ProcessIdentityKey, CachedTrustedProcess>, now: u64) {
+    cache.retain(|_, entry| now.saturating_sub(entry.updated_at) <= TRUST_CACHE_TTL_SECS);
+}
+
+fn invalidate_trust_cache_for_pid(cache: &mut HashMap<ProcessIdentityKey, CachedTrustedProcess>, pid: i32) {
+    cache.retain(|key, _| key.pid != pid);
+}
+
+fn clear_trust_cache_for_exec(trust_cache: &Arc<Mutex<HashMap<ProcessIdentityKey, CachedTrustedProcess>>>, pid: i32) {
+    let mut cache = trust_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    invalidate_trust_cache_for_pid(&mut cache, pid);
+}
+
+fn evaluate_trusted_process(
+    pid: i32,
+    process_name: &str,
+    policy: &SecurityPolicy,
+    trust_cache: &Arc<Mutex<HashMap<ProcessIdentityKey, CachedTrustedProcess>>>,
+) -> TrustedProcessDecision {
+    let now = now_ts();
+
+    let key = process_identity_key(pid);
+    if let Some(key) = key.as_ref() {
+        let cached = {
+            let mut cache = trust_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            prune_trust_cache(&mut cache, now);
+            cache.get(key).cloned()
+        };
+        if let Some(entry) = cached {
+            return entry.decision.clone();
+        }
+    }
+
+    let executable_path = match get_process_path(pid) {
+        Some(path) => path,
+        None => {
+            return TrustedProcessDecision::IdentityMismatch(format!(
+                "unable to resolve executable path for pid {}",
+                pid
+            ))
+        },
+    };
+    let decision = evaluate_trusted_process_from_path(process_name, &executable_path, policy);
+    if let Some(key) = key {
+        let mut cache = trust_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_trust_cache(&mut cache, now);
+        cache.insert(
+            key,
+            CachedTrustedProcess {
+                decision: decision.clone(),
+                updated_at: now,
+            },
+        );
+    }
+    decision
 }
 
 fn is_vcs_tool(process_name: &str) -> bool {
@@ -1876,15 +2270,21 @@ fn is_git_merge_or_pull_invocation(args: &[String]) -> bool {
 fn should_allow_git_merge_pull_worktree_change_in_ai_context(
     process_name: &str,
     args: &[String],
+    trusted_process: &TrustedProcessDecision,
     policy: &SecurityPolicy,
 ) -> bool {
     policy.allow_git_merge_pull_in_ai_context
         && process_name == "git"
-        && is_trusted_process_name(process_name, policy)
+        && trusted_process.is_trusted()
         && is_git_merge_or_pull_invocation(args)
 }
 
-fn should_allow_git_merge_pull_for_process(pid: i32, process_name: &str, policy: &SecurityPolicy) -> bool {
+fn should_allow_git_merge_pull_for_process(
+    pid: i32,
+    process_name: &str,
+    trusted_process: &TrustedProcessDecision,
+    policy: &SecurityPolicy,
+) -> bool {
     if process_name != "git" {
         return false;
     }
@@ -1893,7 +2293,7 @@ fn should_allow_git_merge_pull_for_process(pid: i32, process_name: &str, policy:
         Some(args) => args,
         None => return false,
     };
-    should_allow_git_merge_pull_worktree_change_in_ai_context(process_name, &args, policy)
+    should_allow_git_merge_pull_worktree_change_in_ai_context(process_name, &args, trusted_process, policy)
 }
 
 fn is_vcs_metadata_path(path: &str) -> bool {
@@ -1905,6 +2305,7 @@ fn is_vcs_metadata_path(path: &str) -> bool {
 fn should_allow_vcs_metadata_unlink_in_ai_context(
     path: &str,
     process_name: Option<&str>,
+    trusted_process: &TrustedProcessDecision,
     policy: &SecurityPolicy,
 ) -> bool {
     if !policy.allow_vcs_metadata_in_ai_context || !is_vcs_metadata_path(path) {
@@ -1915,13 +2316,14 @@ fn should_allow_vcs_metadata_unlink_in_ai_context(
         None => return false,
     };
 
-    is_vcs_tool(process_name) && is_trusted_process_name(process_name, policy)
+    is_vcs_tool(process_name) && trusted_process.is_trusted()
 }
 
 fn should_allow_vcs_metadata_rename_in_ai_context(
     source_path: &str,
     dest_path: &str,
     process_name: Option<&str>,
+    trusted_process: &TrustedProcessDecision,
     policy: &SecurityPolicy,
 ) -> bool {
     if !policy.allow_vcs_metadata_in_ai_context
@@ -1935,11 +2337,15 @@ fn should_allow_vcs_metadata_rename_in_ai_context(
         None => return false,
     };
 
-    is_vcs_tool(process_name) && is_trusted_process_name(process_name, policy)
+    is_vcs_tool(process_name) && trusted_process.is_trusted()
 }
 
 fn is_read_intent(fflag: i32) -> bool {
     (fflag & FFLAG_READ) != 0
+}
+
+fn is_write_intent(fflag: i32) -> bool {
+    (fflag & FFLAG_WRITE) != 0
 }
 
 fn should_deny_sensitive_open_for_process(
@@ -1989,6 +2395,7 @@ fn should_deny_sensitive_transfer(source: &str, dest: &str, policy: &SecurityPol
 fn should_allow_vcs_metadata_tainted_write(
     target_path: &str,
     process_name: Option<&str>,
+    trusted_process: &TrustedProcessDecision,
     policy: &SecurityPolicy,
 ) -> bool {
     if !policy.allow_vcs_metadata_in_ai_context || !is_vcs_metadata_path(target_path) {
@@ -1999,13 +2406,14 @@ fn should_allow_vcs_metadata_tainted_write(
         None => return false,
     };
 
-    is_vcs_tool(process_name) && is_trusted_process_name(process_name, policy)
+    is_vcs_tool(process_name) && trusted_process.is_trusted()
 }
 
 fn should_deny_tainted_write(
     pid: i32,
     target: &str,
     process_name: Option<&str>,
+    trusted_process: &TrustedProcessDecision,
     now: u64,
     taint: &TaintState,
     policy: &SecurityPolicy,
@@ -2013,7 +2421,20 @@ fn should_deny_tainted_write(
     taint.is_tainted(pid, now)
         && !policy.is_sensitive_export_allowed(target)
         && !policy.is_sensitive_path(target)
-        && !should_allow_vcs_metadata_tainted_write(target, process_name, policy)
+        && !should_allow_vcs_metadata_tainted_write(target, process_name, trusted_process, policy)
+}
+
+fn should_deny_tainted_open_write(
+    pid: i32,
+    path: &str,
+    fflag: i32,
+    process_name: Option<&str>,
+    trusted_process: &TrustedProcessDecision,
+    now: u64,
+    taint: &TaintState,
+    policy: &SecurityPolicy,
+) -> bool {
+    is_write_intent(fflag) && should_deny_tainted_write(pid, path, process_name, trusted_process, now, taint, policy)
 }
 
 fn should_deny_exec_in_ai_context(proc_name: &str, is_ai_context: bool, policy: &SecurityPolicy) -> bool {
@@ -2029,15 +2450,23 @@ fn join_path_component(dir: &str, name: &str) -> String {
     }
 }
 
+#[derive(Debug)]
+struct GateDenyDecision {
+    process: String,
+    ancestor: String,
+    reason: &'static str,
+}
+
 /// Core decision: should this operation be denied?
-/// Returns Some((process_name, ancestor_name)) if denied, None if allowed.
+/// Returns Some(decision) if denied, None if allowed.
 fn should_deny(
     path: &str,
     pid: i32,
     home: &str,
     policy: &SecurityPolicy,
     cache: &mut HashMap<i32, CachedAncestor>,
-) -> Option<(String, String)> {
+    trust_cache: &Arc<Mutex<HashMap<ProcessIdentityKey, CachedTrustedProcess>>>,
+) -> Option<GateDenyDecision> {
     // 1. Not in protected zone → ALLOW
     if !policy.is_protected(path, home) {
         return None;
@@ -2055,24 +2484,46 @@ fn should_deny(
     };
 
     let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
+    let trusted_process = evaluate_trusted_process(pid, process_name.as_str(), policy, trust_cache);
 
     // 4. Keep git/jj commit internals workable while still blocking `git rm` on working tree files.
-    if should_allow_vcs_metadata_unlink_in_ai_context(path, Some(process_name.as_str()), policy) {
+    if should_allow_vcs_metadata_unlink_in_ai_context(path, Some(process_name.as_str()), &trusted_process, policy) {
         return None;
     }
+    let vcs_metadata_mismatch = policy.allow_vcs_metadata_in_ai_context
+        && is_vcs_metadata_path(path)
+        && is_vcs_tool(process_name.as_str())
+        && trusted_process.is_identity_mismatch();
 
     // 5. Keep `git merge` / `git pull` workflow writable inside protected zones (no rebase/rm bypass).
-    if should_allow_git_merge_pull_for_process(pid, process_name.as_str(), policy) {
+    if should_allow_git_merge_pull_for_process(pid, process_name.as_str(), &trusted_process, policy) {
         return None;
     }
+    let merge_pull_mismatch = policy.allow_git_merge_pull_in_ai_context
+        && process_name == "git"
+        && trusted_process.is_identity_mismatch()
+        && get_process_argv(pid).is_some_and(|args| is_git_merge_or_pull_invocation(&args));
 
     // 5. Optional compatibility mode for trusted tools in AI context.
-    if policy.allow_trusted_tools_in_ai_context && is_trusted_process_name(process_name.as_str(), policy) {
+    if policy.allow_trusted_tools_in_ai_context && trusted_process.is_trusted() {
         return None;
     }
+    let trusted_tool_mismatch = policy.allow_trusted_tools_in_ai_context
+        && policy.is_trusted_tool(process_name.as_str())
+        && trusted_process.is_identity_mismatch();
+
+    let reason = if vcs_metadata_mismatch || merge_pull_mismatch || trusted_tool_mismatch {
+        REASON_TRUST_IDENTITY_MISMATCH
+    } else {
+        REASON_PROTECTED_ZONE_AI_DELETE
+    };
 
     // 6. In AI agent context and protected path → DENY
-    Some((process_name, ai_ancestor))
+    Some(GateDenyDecision {
+        process: process_name,
+        ancestor: ai_ancestor,
+        reason,
+    })
 }
 
 #[cfg(test)]
@@ -2087,6 +2538,8 @@ mod tests {
         assert!(policy.read_gate_enabled);
         assert!(policy.transfer_gate_enabled);
         assert!(policy.exec_gate_enabled);
+        assert!(policy.trusted_tool_identities.is_empty());
+        assert!(!policy.trusted_identity_require_cdhash);
         assert_eq!(
             policy.taint_ttl_seconds_or_default(),
             DEFAULT_TAINT_TTL_SECS
@@ -2297,6 +2750,7 @@ mod tests {
             100,
             "/Users/jqwang/Desktop/out.txt",
             Some("python3"),
+            &TrustedProcessDecision::NotTrusted,
             1_100,
             &taint,
             &policy
@@ -2312,6 +2766,7 @@ mod tests {
             100,
             "/Users/jqwang/00-nixos-config/nixos-config/.git/index.lock",
             Some("git"),
+            &TrustedProcessDecision::Trusted,
             1_100,
             &taint,
             &policy
@@ -2327,6 +2782,48 @@ mod tests {
             100,
             "/Users/jqwang/00-nixos-config/nixos-config/.git/index.lock",
             Some("python3"),
+            &TrustedProcessDecision::NotTrusted,
+            1_100,
+            &taint,
+            &policy
+        ));
+    }
+
+    #[test]
+    fn write_intent_detection_requires_write_flag() {
+        assert!(!is_write_intent(FFLAG_READ));
+        assert!(is_write_intent(FFLAG_WRITE));
+        assert!(is_write_intent(FFLAG_READ | FFLAG_WRITE));
+    }
+
+    #[test]
+    fn tainted_open_write_outside_allow_zone_is_denied() {
+        let policy = test_sensitive_policy();
+        let mut taint = TaintState::new(600);
+        taint.mark(100, 1_000);
+        assert!(should_deny_tainted_open_write(
+            100,
+            "/Users/jqwang/Desktop/out.txt",
+            FFLAG_WRITE,
+            Some("python3"),
+            &TrustedProcessDecision::NotTrusted,
+            1_100,
+            &taint,
+            &policy
+        ));
+    }
+
+    #[test]
+    fn tainted_open_read_only_outside_allow_zone_is_allowed() {
+        let policy = test_sensitive_policy();
+        let mut taint = TaintState::new(600);
+        taint.mark(100, 1_000);
+        assert!(!should_deny_tainted_open_write(
+            100,
+            "/Users/jqwang/Desktop/out.txt",
+            FFLAG_READ,
+            Some("python3"),
+            &TrustedProcessDecision::NotTrusted,
             1_100,
             &taint,
             &policy
@@ -2369,6 +2866,15 @@ mod tests {
         assert!(feedback.contains("es-guard-quarantine"));
     }
 
+    #[test]
+    fn denial_feedback_for_trust_mismatch_has_identity_guidance() {
+        let mut record = DenialRecord::for_test_reason(REASON_TRUST_IDENTITY_MISMATCH);
+        record.process = "git".to_string();
+        let feedback = build_denial_feedback("/Users/jqwang", &record);
+        assert!(feedback.contains("identity verification failed"));
+        assert!(feedback.contains("trusted_tool_identities"));
+    }
+
     #[derive(Debug)]
     struct SensitiveOpenDecision {
         deny: bool,
@@ -2400,6 +2906,7 @@ mod tests {
             allow_vcs_metadata_in_ai_context: true,
             allow_git_merge_pull_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
+            trusted_tool_identities: vec![],
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
             exec_exfil_tool_blocklist: default_exec_exfil_tool_blocklist(),
@@ -2409,6 +2916,7 @@ mod tests {
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
             taint_ttl_seconds: None,
+            trusted_identity_require_cdhash: false,
         }
     }
 
@@ -2442,6 +2950,7 @@ mod tests {
             allow_vcs_metadata_in_ai_context: true,
             allow_git_merge_pull_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
+            trusted_tool_identities: vec![],
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
             exec_exfil_tool_blocklist: default_exec_exfil_tool_blocklist(),
@@ -2451,6 +2960,7 @@ mod tests {
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
             taint_ttl_seconds: None,
+            trusted_identity_require_cdhash: false,
         };
 
         let changed = policy.sanitize_overrides(100, "/Users/jqwang");
@@ -2475,6 +2985,7 @@ mod tests {
             allow_vcs_metadata_in_ai_context: true,
             allow_git_merge_pull_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
+            trusted_tool_identities: vec![],
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
             exec_exfil_tool_blocklist: default_exec_exfil_tool_blocklist(),
@@ -2484,6 +2995,7 @@ mod tests {
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
             taint_ttl_seconds: None,
+            trusted_identity_require_cdhash: false,
         };
 
         let changed = policy.sanitize_overrides(1, "/Users/jqwang");
@@ -2529,6 +3041,120 @@ mod tests {
         assert_eq!(normalize_absolute_path("relative/path"), None);
     }
 
+    fn trusted_identity_for_path(path: &str) -> TrustedToolIdentity {
+        let signature = read_binary_signature(path).expect("signed binary");
+        TrustedToolIdentity {
+            path: path.to_string(),
+            signing_identifier: signature.signing_identifier,
+            team_identifier: signature.team_identifier,
+            cdhash: signature.cdhash,
+        }
+    }
+
+    #[test]
+    fn trusted_identity_accepts_real_system_git_and_xcrun() {
+        let git_path = canonicalize_executable_path_strict("/usr/bin/git").expect("canonical git");
+        let xcrun_path = canonicalize_executable_path_strict("/usr/bin/xcrun").expect("canonical xcrun");
+
+        let mut policy = test_policy();
+        policy.trusted_tools = vec!["git".to_string(), "xcrun".to_string()];
+        policy.trusted_tool_identities = vec![
+            trusted_identity_for_path(&git_path),
+            trusted_identity_for_path(&xcrun_path),
+        ];
+
+        assert_eq!(
+            evaluate_trusted_process_from_path("git", &git_path, &policy),
+            TrustedProcessDecision::Trusted
+        );
+        assert_eq!(
+            evaluate_trusted_process_from_path("xcrun", &xcrun_path, &policy),
+            TrustedProcessDecision::Trusted
+        );
+    }
+
+    #[test]
+    fn trusted_identity_rejects_basename_spoof_binary() {
+        let git_path = canonicalize_executable_path_strict("/usr/bin/git").expect("canonical git");
+        let mut policy = test_policy();
+        policy.trusted_tools = vec!["git".to_string()];
+        policy.trusted_tool_identities = vec![trusted_identity_for_path(&git_path)];
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "es-guard-trust-spoof-{}-{}",
+            std::process::id(),
+            now_ts()
+        ));
+        fs::create_dir_all(&tmp_dir).expect("create spoof temp dir");
+        let fake_git = tmp_dir.join("git");
+        fs::write(&fake_git, "#!/bin/sh\necho fake-git\n").expect("write fake git");
+        let mut perms = fs::metadata(&fake_git).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_git, perms).expect("chmod fake git");
+
+        let decision = evaluate_trusted_process_from_path("git", fake_git.to_str().expect("utf8 path"), &policy);
+        assert!(matches!(
+            decision,
+            TrustedProcessDecision::IdentityMismatch(_)
+        ));
+
+        let _ = fs::remove_dir_all(tmp_dir);
+    }
+
+    #[test]
+    fn trusted_identity_rejects_signed_binary_with_wrong_identity() {
+        let git_path = canonicalize_executable_path_strict("/usr/bin/git").expect("canonical git");
+        let xcrun_path = canonicalize_executable_path_strict("/usr/bin/xcrun").expect("canonical xcrun");
+
+        let mut policy = test_policy();
+        policy.trusted_tools = vec!["git".to_string()];
+        policy.trusted_tool_identities = vec![trusted_identity_for_path(&git_path)];
+
+        let decision = evaluate_trusted_process_from_path("git", &xcrun_path, &policy);
+        assert!(matches!(
+            decision,
+            TrustedProcessDecision::IdentityMismatch(_)
+        ));
+    }
+
+    #[test]
+    fn trusted_identity_requires_trusted_tools_membership() {
+        let git_path = canonicalize_executable_path_strict("/usr/bin/git").expect("canonical git");
+        let mut policy = test_policy();
+        policy.trusted_tools = vec![];
+        policy.trusted_tool_identities = vec![trusted_identity_for_path(&git_path)];
+
+        assert_eq!(
+            evaluate_trusted_process_from_path("git", &git_path, &policy),
+            TrustedProcessDecision::NotTrusted
+        );
+    }
+
+    #[test]
+    fn trusted_identity_rejects_symlink_executable_path() {
+        let git_path = canonicalize_executable_path_strict("/usr/bin/git").expect("canonical git");
+        let mut policy = test_policy();
+        policy.trusted_tools = vec!["git".to_string()];
+        policy.trusted_tool_identities = vec![trusted_identity_for_path(&git_path)];
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "es-guard-trust-symlink-{}-{}",
+            std::process::id(),
+            now_ts()
+        ));
+        fs::create_dir_all(&tmp_dir).expect("create symlink temp dir");
+        let link_path = tmp_dir.join("git");
+        std::os::unix::fs::symlink("/usr/bin/git", &link_path).expect("create symlink");
+
+        let decision = evaluate_trusted_process_from_path("git", link_path.to_str().expect("utf8 path"), &policy);
+        assert!(matches!(
+            decision,
+            TrustedProcessDecision::IdentityMismatch(_)
+        ));
+
+        let _ = fs::remove_dir_all(tmp_dir);
+    }
+
     #[test]
     fn sanitize_overrides_drops_invalid_or_outside_zone_paths() {
         let mut policy = SecurityPolicy {
@@ -2543,6 +3169,7 @@ mod tests {
             allow_vcs_metadata_in_ai_context: true,
             allow_git_merge_pull_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
+            trusted_tool_identities: vec![],
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
             exec_exfil_tool_blocklist: default_exec_exfil_tool_blocklist(),
@@ -2552,6 +3179,7 @@ mod tests {
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
             taint_ttl_seconds: None,
+            trusted_identity_require_cdhash: false,
         };
 
         let changed = policy.sanitize_overrides(1, "/Users/jqwang");
@@ -2589,6 +3217,7 @@ mod tests {
             allow_vcs_metadata_in_ai_context: true,
             allow_git_merge_pull_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
+            trusted_tool_identities: vec![],
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
             exec_exfil_tool_blocklist: default_exec_exfil_tool_blocklist(),
@@ -2598,6 +3227,7 @@ mod tests {
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
             taint_ttl_seconds: None,
+            trusted_identity_require_cdhash: false,
         };
 
         assert!(policy.is_protected("/Users/jqwang/01-agent/file.txt", "/Users/jqwang"));
@@ -2618,6 +3248,7 @@ mod tests {
             allow_vcs_metadata_in_ai_context: true,
             allow_git_merge_pull_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
+            trusted_tool_identities: vec![],
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
             exec_exfil_tool_blocklist: default_exec_exfil_tool_blocklist(),
@@ -2627,6 +3258,7 @@ mod tests {
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
             taint_ttl_seconds: None,
+            trusted_identity_require_cdhash: false,
         };
 
         let changed = policy.sanitize_overrides(1, "/Users/jqwang");
@@ -2650,6 +3282,7 @@ mod tests {
             allow_vcs_metadata_in_ai_context: true,
             allow_git_merge_pull_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
+            trusted_tool_identities: vec![],
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
             exec_exfil_tool_blocklist: default_exec_exfil_tool_blocklist(),
@@ -2659,6 +3292,7 @@ mod tests {
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
             taint_ttl_seconds: None,
+            trusted_identity_require_cdhash: false,
         };
 
         let changed = policy.sanitize_overrides(1, "/Users/jqwang");
@@ -2687,16 +3321,25 @@ mod tests {
         assert!(should_allow_vcs_metadata_unlink_in_ai_context(
             "/Users/jqwang/repo/.git/index.lock",
             Some("git"),
+            &TrustedProcessDecision::Trusted,
             &policy
         ));
         assert!(!should_allow_vcs_metadata_unlink_in_ai_context(
             "/Users/jqwang/repo/src/main.rs",
             Some("git"),
+            &TrustedProcessDecision::Trusted,
             &policy
         ));
         assert!(!should_allow_vcs_metadata_unlink_in_ai_context(
             "/Users/jqwang/repo/.git/index.lock",
             Some("rm"),
+            &TrustedProcessDecision::Trusted,
+            &policy
+        ));
+        assert!(!should_allow_vcs_metadata_unlink_in_ai_context(
+            "/Users/jqwang/repo/.git/index.lock",
+            Some("git"),
+            &TrustedProcessDecision::IdentityMismatch("sig mismatch".to_string()),
             &policy
         ));
 
@@ -2704,6 +3347,7 @@ mod tests {
         assert!(!should_allow_vcs_metadata_unlink_in_ai_context(
             "/Users/jqwang/repo/.git/index.lock",
             Some("git"),
+            &TrustedProcessDecision::Trusted,
             &policy
         ));
     }
@@ -2718,12 +3362,21 @@ mod tests {
             "/Users/jqwang/repo/.git/index.lock",
             "/Users/jqwang/repo/.git/index",
             Some("git"),
+            &TrustedProcessDecision::Trusted,
             &policy
         ));
         assert!(!should_allow_vcs_metadata_rename_in_ai_context(
             "/Users/jqwang/repo/.git/index.lock",
             "/private/tmp/index.lock",
             Some("git"),
+            &TrustedProcessDecision::Trusted,
+            &policy
+        ));
+        assert!(!should_allow_vcs_metadata_rename_in_ai_context(
+            "/Users/jqwang/repo/.git/index.lock",
+            "/Users/jqwang/repo/.git/index",
+            Some("git"),
+            &TrustedProcessDecision::IdentityMismatch("sig mismatch".to_string()),
             &policy
         ));
     }
@@ -2997,11 +3650,19 @@ mod tests {
         assert!(should_allow_git_merge_pull_worktree_change_in_ai_context(
             "git",
             &merge_args,
+            &TrustedProcessDecision::Trusted,
             &policy
         ));
         assert!(!should_allow_git_merge_pull_worktree_change_in_ai_context(
             "bash",
             &merge_args,
+            &TrustedProcessDecision::Trusted,
+            &policy
+        ));
+        assert!(!should_allow_git_merge_pull_worktree_change_in_ai_context(
+            "git",
+            &merge_args,
+            &TrustedProcessDecision::IdentityMismatch("sig mismatch".to_string()),
             &policy
         ));
 
@@ -3009,8 +3670,55 @@ mod tests {
         assert!(!should_allow_git_merge_pull_worktree_change_in_ai_context(
             "git",
             &merge_args,
+            &TrustedProcessDecision::Trusted,
             &policy
         ));
+    }
+
+    #[test]
+    fn invalidate_trust_cache_for_pid_removes_all_cached_identities_for_pid() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            ProcessIdentityKey {
+                pid: 123,
+                start_tvsec: 11,
+                start_tvusec: 22,
+                executable_path: "/usr/bin/git".to_string(),
+            },
+            CachedTrustedProcess {
+                decision: TrustedProcessDecision::Trusted,
+                updated_at: 100,
+            },
+        );
+        cache.insert(
+            ProcessIdentityKey {
+                pid: 123,
+                start_tvsec: 11,
+                start_tvusec: 22,
+                executable_path: "/usr/bin/xcrun".to_string(),
+            },
+            CachedTrustedProcess {
+                decision: TrustedProcessDecision::IdentityMismatch("mismatch".to_string()),
+                updated_at: 100,
+            },
+        );
+        cache.insert(
+            ProcessIdentityKey {
+                pid: 456,
+                start_tvsec: 33,
+                start_tvusec: 44,
+                executable_path: "/usr/bin/git".to_string(),
+            },
+            CachedTrustedProcess {
+                decision: TrustedProcessDecision::Trusted,
+                updated_at: 100,
+            },
+        );
+
+        invalidate_trust_cache_for_pid(&mut cache, 123);
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.keys().all(|key| key.pid != 123));
     }
 
     #[test]
@@ -3069,11 +3777,14 @@ fn main() {
 
     // Process ancestry cache (cleared on policy reload)
     let ancestor_cache: Arc<Mutex<HashMap<i32, CachedAncestor>>> = Arc::new(Mutex::new(HashMap::new()));
+    let trusted_process_cache: Arc<Mutex<HashMap<ProcessIdentityKey, CachedTrustedProcess>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let taint_state = Arc::new(Mutex::new(TaintState::new(initial_taint_ttl)));
 
     // Policy hot-reload thread (1s polling)
     let policy_clone = global_policy.clone();
     let cache_clone = ancestor_cache.clone();
+    let trust_cache_clone = trusted_process_cache.clone();
     let taint_clone = taint_state.clone();
     let path_clone = policy_path.clone();
     let override_path_clone = runtime_override_path.clone();
@@ -3173,6 +3884,9 @@ fn main() {
                     if let Ok(mut c) = cache_clone.lock() {
                         c.clear();
                     }
+                    if let Ok(mut trust_cache) = trust_cache_clone.lock() {
+                        trust_cache.clear();
+                    }
                 }
                 if let Ok(mut taint) = taint_clone.lock() {
                     taint.set_ttl_secs(combined_policy.taint_ttl_seconds_or_default());
@@ -3195,6 +3909,7 @@ fn main() {
 
     let safe_policy = AssertUnwindSafe(global_policy);
     let safe_cache = AssertUnwindSafe(ancestor_cache);
+    let safe_trust_cache = AssertUnwindSafe(trusted_process_cache);
     let safe_taint = AssertUnwindSafe(taint_state);
     let home_for_handler = home.clone();
     let guard_pid = std::process::id() as i32;
@@ -3245,6 +3960,8 @@ fn main() {
                             process: process_name,
                             ancestor,
                             reason: REASON_SENSITIVE_READ_NON_AI.to_string(),
+                            pid: pid_for_record(pid),
+                            ppid: parent_pid_for_pid(pid),
                         },
                     );
                     let _ = client.respond_flags_result(&message, 0, false);
@@ -3253,13 +3970,84 @@ fn main() {
                         && is_read_intent(fflag)
                         && should_mark_taint_on_sensitive_read(path.as_str(), &current_policy, &home_for_handler)
                     {
+                        let marked_at = now_ts();
                         let mut taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        taint.mark(pid, now_ts());
+                        taint.mark(pid, marked_at);
+                        drop(taint);
+                        let ancestor = ai_ancestor.as_deref().unwrap_or("unknown").to_string();
+                        log_taint_mark(
+                            &home_for_handler,
+                            &TaintMarkRecord {
+                                ts: marked_at,
+                                path: path.clone(),
+                                process: process_name.clone(),
+                                ancestor,
+                                pid,
+                                ppid: parent_pid_for_pid(pid),
+                            },
+                        );
                     }
-                    let _ = client.respond_flags_result(&message, fflag as u32, false);
+
+                    let (deny_taint_write, denial_reason) = if is_write_intent(fflag) {
+                        let trusted_process = evaluate_trusted_process(
+                            pid,
+                            process_name.as_str(),
+                            &current_policy,
+                            &safe_trust_cache.0,
+                        );
+                        let deny_taint_write = {
+                            let taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            should_deny_tainted_open_write(
+                                pid,
+                                &path,
+                                fflag,
+                                Some(process_name.as_str()),
+                                &trusted_process,
+                                now_ts(),
+                                &taint,
+                                &current_policy,
+                            )
+                        };
+                        let reason = if deny_taint_write
+                            && current_policy.allow_vcs_metadata_in_ai_context
+                            && is_vcs_metadata_path(path.as_str())
+                            && is_vcs_tool(process_name.as_str())
+                            && trusted_process.is_identity_mismatch()
+                        {
+                            REASON_TRUST_IDENTITY_MISMATCH
+                        } else {
+                            REASON_TAINT_WRITE_OUT
+                        };
+                        (deny_taint_write, reason)
+                    } else {
+                        (false, REASON_TAINT_WRITE_OUT)
+                    };
+
+                    if deny_taint_write {
+                        println!("[DENY] open(write-taint) by {}: {}", process_name, path);
+                        log_denial(
+                            &home_for_handler,
+                            &DenialRecord {
+                                ts: now_ts(),
+                                op: "open".into(),
+                                path: path.clone(),
+                                dest: None,
+                                zone: "taint".to_string(),
+                                process: process_name.clone(),
+                                ancestor: "tainted".to_string(),
+                                reason: denial_reason.to_string(),
+                                pid: pid_for_record(pid),
+                                ppid: parent_pid_for_pid(pid),
+                            },
+                        );
+                        let _ = client.respond_flags_result(&message, 0, false);
+                    } else {
+                        let _ = client.respond_flags_result(&message, fflag as u32, false);
+                    }
                 }
             },
             Some(Event::AuthExec(exec)) => {
+                clear_trust_cache_for_exec(&safe_trust_cache.0, pid);
                 let target_path = exec.target().executable().path().to_string_lossy().into_owned();
                 let target_name = exe_name(&target_path).to_string();
                 let mut cache = safe_cache.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3284,6 +4072,8 @@ fn main() {
                             process: target_name,
                             ancestor,
                             reason: REASON_EXEC_EXFIL_TOOL.to_string(),
+                            pid: pid_for_record(pid),
+                            ppid: parent_pid_for_pid(pid),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -3304,16 +4094,33 @@ fn main() {
                     None => String::new(),
                 };
                 let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
+                let trusted_process = evaluate_trusted_process(
+                    pid,
+                    process_name.as_str(),
+                    &current_policy,
+                    &safe_trust_cache.0,
+                );
                 let deny_taint = {
                     let taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     should_deny_tainted_write(
                         pid,
                         &dest_path,
                         Some(process_name.as_str()),
+                        &trusted_process,
                         now_ts(),
                         &taint,
                         &current_policy,
                     )
+                };
+                let denial_reason = if deny_taint
+                    && current_policy.allow_vcs_metadata_in_ai_context
+                    && is_vcs_metadata_path(dest_path.as_str())
+                    && is_vcs_tool(process_name.as_str())
+                    && trusted_process.is_identity_mismatch()
+                {
+                    REASON_TRUST_IDENTITY_MISMATCH
+                } else {
+                    REASON_TAINT_WRITE_OUT
                 };
 
                 if deny_taint {
@@ -3328,7 +4135,9 @@ fn main() {
                             zone: "taint".to_string(),
                             process: process_name,
                             ancestor: "tainted".to_string(),
-                            reason: REASON_TAINT_WRITE_OUT.to_string(),
+                            reason: denial_reason.to_string(),
+                            pid: pid_for_record(pid),
+                            ppid: parent_pid_for_pid(pid),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -3339,16 +4148,33 @@ fn main() {
             Some(Event::AuthTruncate(truncate)) => {
                 let target_path = truncate.target().path().to_string_lossy().into_owned();
                 let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
+                let trusted_process = evaluate_trusted_process(
+                    pid,
+                    process_name.as_str(),
+                    &current_policy,
+                    &safe_trust_cache.0,
+                );
                 let deny_taint = {
                     let taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     should_deny_tainted_write(
                         pid,
                         &target_path,
                         Some(process_name.as_str()),
+                        &trusted_process,
                         now_ts(),
                         &taint,
                         &current_policy,
                     )
+                };
+                let denial_reason = if deny_taint
+                    && current_policy.allow_vcs_metadata_in_ai_context
+                    && is_vcs_metadata_path(target_path.as_str())
+                    && is_vcs_tool(process_name.as_str())
+                    && trusted_process.is_identity_mismatch()
+                {
+                    REASON_TRUST_IDENTITY_MISMATCH
+                } else {
+                    REASON_TAINT_WRITE_OUT
                 };
 
                 if deny_taint {
@@ -3366,7 +4192,9 @@ fn main() {
                             zone: "taint".to_string(),
                             process: process_name,
                             ancestor: "tainted".to_string(),
-                            reason: REASON_TAINT_WRITE_OUT.to_string(),
+                            reason: denial_reason.to_string(),
+                            pid: pid_for_record(pid),
+                            ppid: parent_pid_for_pid(pid),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -3403,6 +4231,8 @@ fn main() {
                             process: process_name,
                             ancestor: "n/a".to_string(),
                             reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
+                            pid: pid_for_record(pid),
+                            ppid: parent_pid_for_pid(pid),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -3435,6 +4265,8 @@ fn main() {
                             process: process_name,
                             ancestor: "n/a".to_string(),
                             reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
+                            pid: pid_for_record(pid),
+                            ppid: parent_pid_for_pid(pid),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -3467,6 +4299,8 @@ fn main() {
                             process: process_name,
                             ancestor: "n/a".to_string(),
                             reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
+                            pid: pid_for_record(pid),
+                            ppid: parent_pid_for_pid(pid),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -3503,6 +4337,8 @@ fn main() {
                             process: process_name,
                             ancestor: "n/a".to_string(),
                             reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
+                            pid: pid_for_record(pid),
+                            ppid: parent_pid_for_pid(pid),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -3514,13 +4350,18 @@ fn main() {
                 let path = unlink.target().path().to_string_lossy();
 
                 let mut cache = safe_cache.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some((proc_name, ancestor)) =
-                    should_deny(&path, pid, &home_for_handler, &current_policy, &mut cache)
-                {
+                if let Some(decision) = should_deny(
+                    &path,
+                    pid,
+                    &home_for_handler,
+                    &current_policy,
+                    &mut cache,
+                    &safe_trust_cache.0,
+                ) {
                     let zone = current_policy.matched_zone(&path, &home_for_handler);
                     println!(
                         "[DENY] unlink by {} (via {}): {}",
-                        proc_name, ancestor, path
+                        decision.process, decision.ancestor, path
                     );
                     log_denial(
                         &home_for_handler,
@@ -3530,9 +4371,11 @@ fn main() {
                             path: path.to_string(),
                             dest: None,
                             zone,
-                            process: proc_name,
-                            ancestor,
-                            reason: REASON_PROTECTED_ZONE_AI_DELETE.to_string(),
+                            process: decision.process,
+                            ancestor: decision.ancestor,
+                            reason: decision.reason.to_string(),
+                            pid: pid_for_record(pid),
+                            ppid: parent_pid_for_pid(pid),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -3570,6 +4413,8 @@ fn main() {
                             process: process_name,
                             ancestor: "n/a".to_string(),
                             reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
+                            pid: pid_for_record(pid),
+                            ppid: parent_pid_for_pid(pid),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
@@ -3584,21 +4429,52 @@ fn main() {
                     None
                 } else if let Some(ai_ancestor) = find_ai_ancestor(pid, &current_policy, &mut cache) {
                     let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
+                    let trusted_process = evaluate_trusted_process(
+                        pid,
+                        process_name.as_str(),
+                        &current_policy,
+                        &safe_trust_cache.0,
+                    );
                     if should_allow_vcs_metadata_rename_in_ai_context(
                         &source_path,
                         &dest_path_str,
                         Some(process_name.as_str()),
+                        &trusted_process,
                         &current_policy,
                     ) {
                         None
-                    } else if should_allow_git_merge_pull_for_process(pid, process_name.as_str(), &current_policy) {
+                    } else if should_allow_git_merge_pull_for_process(
+                        pid,
+                        process_name.as_str(),
+                        &trusted_process,
+                        &current_policy,
+                    ) {
                         None
-                    } else if current_policy.allow_trusted_tools_in_ai_context
-                        && is_trusted_process_name(process_name.as_str(), &current_policy)
-                    {
+                    } else if current_policy.allow_trusted_tools_in_ai_context && trusted_process.is_trusted() {
                         None
                     } else if !current_policy.is_in_any_zone(&dest_path_str, &home_for_handler) {
-                        Some((process_name, ai_ancestor))
+                        let reason = if (current_policy.allow_vcs_metadata_in_ai_context
+                            && is_vcs_metadata_path(source_path.as_str())
+                            && is_vcs_metadata_path(dest_path_str.as_str())
+                            && is_vcs_tool(process_name.as_str())
+                            && trusted_process.is_identity_mismatch())
+                            || (current_policy.allow_git_merge_pull_in_ai_context
+                                && process_name == "git"
+                                && trusted_process.is_identity_mismatch()
+                                && get_process_argv(pid).is_some_and(|args| is_git_merge_or_pull_invocation(&args)))
+                            || (current_policy.allow_trusted_tools_in_ai_context
+                                && current_policy.is_trusted_tool(process_name.as_str())
+                                && trusted_process.is_identity_mismatch())
+                        {
+                            REASON_TRUST_IDENTITY_MISMATCH
+                        } else {
+                            REASON_PROTECTED_ZONE_AI_DELETE
+                        };
+                        Some(GateDenyDecision {
+                            process: process_name,
+                            ancestor: ai_ancestor,
+                            reason,
+                        })
                     } else {
                         None
                     }
@@ -3606,11 +4482,11 @@ fn main() {
                     None
                 };
 
-                if let Some((proc_name, ancestor)) = deny_reason {
+                if let Some(decision) = deny_reason {
                     let zone = current_policy.matched_zone(&source_path, &home_for_handler);
                     println!(
                         "[DENY] rename by {} (via {}): {} -> {}",
-                        proc_name, ancestor, source_path, dest_path_str
+                        decision.process, decision.ancestor, source_path, dest_path_str
                     );
                     log_denial(
                         &home_for_handler,
@@ -3620,9 +4496,11 @@ fn main() {
                             path: source_path,
                             dest: Some(dest_path_str),
                             zone,
-                            process: proc_name,
-                            ancestor,
-                            reason: REASON_PROTECTED_ZONE_AI_DELETE.to_string(),
+                            process: decision.process,
+                            ancestor: decision.ancestor,
+                            reason: decision.reason.to_string(),
+                            pid: pid_for_record(pid),
+                            ppid: parent_pid_for_pid(pid),
                         },
                     );
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
