@@ -116,6 +116,7 @@ struct SecurityPolicy: Codable {
     var aiAgentPatterns: [String]?
     var autoProtectHomeDigitChildren: Bool? = nil
     var allowVCSMetadataInAIContext: Bool? = nil
+    var allowGitMergePullInAIContext: Bool? = nil
     var allowTrustedToolsInAIContext: Bool? = nil
     var execExfilToolBlocklist: [String]
     var readGateEnabled: Bool
@@ -132,6 +133,7 @@ struct SecurityPolicy: Codable {
         case aiAgentPatterns = "ai_agent_patterns"
         case autoProtectHomeDigitChildren = "auto_protect_home_digit_children"
         case allowVCSMetadataInAIContext = "allow_vcs_metadata_in_ai_context"
+        case allowGitMergePullInAIContext = "allow_git_merge_pull_in_ai_context"
         case allowTrustedToolsInAIContext = "allow_trusted_tools_in_ai_context"
         case execExfilToolBlocklist = "exec_exfil_tool_blocklist"
         case readGateEnabled = "read_gate_enabled"
@@ -149,6 +151,7 @@ struct SecurityPolicy: Codable {
         aiAgentPatterns: [String]? = nil,
         autoProtectHomeDigitChildren: Bool? = nil,
         allowVCSMetadataInAIContext: Bool? = nil,
+        allowGitMergePullInAIContext: Bool? = nil,
         allowTrustedToolsInAIContext: Bool? = nil,
         execExfilToolBlocklist: [String] = SecurityPolicy.defaultExecExfilToolBlocklist,
         readGateEnabled: Bool = true,
@@ -164,6 +167,7 @@ struct SecurityPolicy: Codable {
         self.aiAgentPatterns = aiAgentPatterns
         self.autoProtectHomeDigitChildren = autoProtectHomeDigitChildren
         self.allowVCSMetadataInAIContext = allowVCSMetadataInAIContext
+        self.allowGitMergePullInAIContext = allowGitMergePullInAIContext
         self.allowTrustedToolsInAIContext = allowTrustedToolsInAIContext
         self.execExfilToolBlocklist = execExfilToolBlocklist
         self.readGateEnabled = readGateEnabled
@@ -182,6 +186,7 @@ struct SecurityPolicy: Codable {
         aiAgentPatterns = try container.decodeIfPresent([String].self, forKey: .aiAgentPatterns)
         autoProtectHomeDigitChildren = try container.decodeIfPresent(Bool.self, forKey: .autoProtectHomeDigitChildren)
         allowVCSMetadataInAIContext = try container.decodeIfPresent(Bool.self, forKey: .allowVCSMetadataInAIContext)
+        allowGitMergePullInAIContext = try container.decodeIfPresent(Bool.self, forKey: .allowGitMergePullInAIContext)
         allowTrustedToolsInAIContext = try container.decodeIfPresent(Bool.self, forKey: .allowTrustedToolsInAIContext)
         execExfilToolBlocklist = try container.decodeIfPresent([String].self, forKey: .execExfilToolBlocklist)
             ?? SecurityPolicy.defaultExecExfilToolBlocklist

@@ -135,6 +135,11 @@ struct PolicyPanel: View {
                         .font(.caption)
                         .foregroundColor(vcsMetaInAI ? .secondary : ApplePalette.warning)
 
+                    let gitMergePullInAI = viewModel.policy.allowGitMergePullInAIContext ?? true
+                    Text("AI 上下文允许 git merge/pull: " + (gitMergePullInAI ? "开启 (推荐)" : "关闭 (更严格)"))
+                        .font(.caption)
+                        .foregroundColor(gitMergePullInAI ? .secondary : ApplePalette.warning)
+
                     let autoProtectHomeDigitChildren = viewModel.policy.autoProtectHomeDigitChildren ?? true
                     Text("HOME 数字前缀目录自动保护: " + (autoProtectHomeDigitChildren ? "开启 (推荐)" : "关闭"))
                         .font(.caption)

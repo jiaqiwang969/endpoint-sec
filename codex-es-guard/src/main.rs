@@ -75,6 +75,9 @@ struct SecurityPolicy {
     #[serde(default = "default_allow_vcs_metadata_in_ai_context")]
     allow_vcs_metadata_in_ai_context: bool,
 
+    #[serde(default = "default_allow_git_merge_pull_in_ai_context")]
+    allow_git_merge_pull_in_ai_context: bool,
+
     #[serde(default = "default_trusted_tools")]
     trusted_tools: Vec<String>,
 
@@ -163,6 +166,10 @@ fn default_true() -> bool {
 }
 
 fn default_allow_vcs_metadata_in_ai_context() -> bool {
+    true
+}
+
+fn default_allow_git_merge_pull_in_ai_context() -> bool {
     true
 }
 
@@ -1809,6 +1816,86 @@ fn is_vcs_tool(process_name: &str) -> bool {
     matches!(process_name, "git" | "jj")
 }
 
+fn git_global_option_takes_value(option: &str) -> bool {
+    matches!(
+        option,
+        "-C" | "-c" | "--exec-path" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix" | "--config-env"
+    )
+}
+
+fn git_subcommand_from_args(args: &[String]) -> Option<&str> {
+    if args.len() < 2 {
+        return None;
+    }
+
+    let mut idx = 1;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        if arg == "--" {
+            idx += 1;
+            break;
+        }
+
+        if arg.starts_with("--") {
+            if let Some((opt, _)) = arg.split_once('=') {
+                if git_global_option_takes_value(opt) {
+                    idx += 1;
+                    continue;
+                }
+            } else if git_global_option_takes_value(arg) {
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            idx += 1;
+            continue;
+        }
+
+        if arg.starts_with('-') {
+            if git_global_option_takes_value(arg) {
+                idx = idx.saturating_add(2);
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+
+        return Some(arg);
+    }
+
+    if idx < args.len() {
+        Some(args[idx].as_str())
+    } else {
+        None
+    }
+}
+
+fn is_git_merge_or_pull_invocation(args: &[String]) -> bool {
+    matches!(git_subcommand_from_args(args), Some("merge" | "pull"))
+}
+
+fn should_allow_git_merge_pull_worktree_change_in_ai_context(
+    process_name: &str,
+    args: &[String],
+    policy: &SecurityPolicy,
+) -> bool {
+    policy.allow_git_merge_pull_in_ai_context
+        && process_name == "git"
+        && is_trusted_process_name(process_name, policy)
+        && is_git_merge_or_pull_invocation(args)
+}
+
+fn should_allow_git_merge_pull_for_process(pid: i32, process_name: &str, policy: &SecurityPolicy) -> bool {
+    if process_name != "git" {
+        return false;
+    }
+
+    let args = match get_process_argv(pid) {
+        Some(args) => args,
+        None => return false,
+    };
+    should_allow_git_merge_pull_worktree_change_in_ai_context(process_name, &args, policy)
+}
+
 fn is_vcs_metadata_path(path: &str) -> bool {
     trim_trailing_slashes(path)
         .split('/')
@@ -1971,6 +2058,11 @@ fn should_deny(
 
     // 4. Keep git/jj commit internals workable while still blocking `git rm` on working tree files.
     if should_allow_vcs_metadata_unlink_in_ai_context(path, Some(process_name.as_str()), policy) {
+        return None;
+    }
+
+    // 5. Keep `git merge` / `git pull` workflow writable inside protected zones (no rebase/rm bypass).
+    if should_allow_git_merge_pull_for_process(pid, process_name.as_str(), policy) {
         return None;
     }
 
@@ -2306,6 +2398,7 @@ mod tests {
             temporary_overrides: vec![],
             auto_protect_home_digit_children: true,
             allow_vcs_metadata_in_ai_context: true,
+            allow_git_merge_pull_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
@@ -2347,6 +2440,7 @@ mod tests {
             })],
             auto_protect_home_digit_children: false,
             allow_vcs_metadata_in_ai_context: true,
+            allow_git_merge_pull_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
@@ -2379,6 +2473,7 @@ mod tests {
             ],
             auto_protect_home_digit_children: false,
             allow_vcs_metadata_in_ai_context: true,
+            allow_git_merge_pull_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
@@ -2446,6 +2541,7 @@ mod tests {
             ],
             auto_protect_home_digit_children: false,
             allow_vcs_metadata_in_ai_context: true,
+            allow_git_merge_pull_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
@@ -2491,6 +2587,7 @@ mod tests {
             temporary_overrides: vec![],
             auto_protect_home_digit_children: true,
             allow_vcs_metadata_in_ai_context: true,
+            allow_git_merge_pull_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
@@ -2519,6 +2616,7 @@ mod tests {
             ],
             auto_protect_home_digit_children: true,
             allow_vcs_metadata_in_ai_context: true,
+            allow_git_merge_pull_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
@@ -2550,6 +2648,7 @@ mod tests {
             ],
             auto_protect_home_digit_children: false,
             allow_vcs_metadata_in_ai_context: true,
+            allow_git_merge_pull_in_ai_context: true,
             trusted_tools: default_trusted_tools(),
             ai_agent_patterns: default_ai_agent_patterns(),
             allow_trusted_tools_in_ai_context: false,
@@ -2858,6 +2957,60 @@ mod tests {
 
         let unrelated_args = vec!["/bin/bash".to_string(), "/tmp/custom-script.sh".to_string()];
         assert!(!is_override_helper_argv(&unrelated_args));
+    }
+
+    #[test]
+    fn git_merge_or_pull_invocation_detects_allowed_subcommands() {
+        let merge_args = vec![
+            "git".to_string(),
+            "-C".to_string(),
+            "/Users/jqwang/00-nixos-config/endpoint-sec".to_string(),
+            "merge".to_string(),
+            "feature/codex-sensitive-dlp-c".to_string(),
+        ];
+        assert!(is_git_merge_or_pull_invocation(&merge_args));
+
+        let pull_args = vec![
+            "git".to_string(),
+            "--work-tree=/Users/jqwang/00-nixos-config/endpoint-sec".to_string(),
+            "pull".to_string(),
+            "--ff-only".to_string(),
+        ];
+        assert!(is_git_merge_or_pull_invocation(&pull_args));
+    }
+
+    #[test]
+    fn git_merge_or_pull_invocation_rejects_other_subcommands() {
+        let rebase_args = vec!["git".to_string(), "rebase".to_string(), "main".to_string()];
+        assert!(!is_git_merge_or_pull_invocation(&rebase_args));
+
+        let rm_args = vec!["git".to_string(), "rm".to_string(), "README.md".to_string()];
+        assert!(!is_git_merge_or_pull_invocation(&rm_args));
+    }
+
+    #[test]
+    fn git_merge_or_pull_allow_requires_git_process_and_policy_flag() {
+        let mut policy = test_policy();
+        policy.allow_git_merge_pull_in_ai_context = true;
+
+        let merge_args = vec!["git".to_string(), "merge".to_string(), "topic".to_string()];
+        assert!(should_allow_git_merge_pull_worktree_change_in_ai_context(
+            "git",
+            &merge_args,
+            &policy
+        ));
+        assert!(!should_allow_git_merge_pull_worktree_change_in_ai_context(
+            "bash",
+            &merge_args,
+            &policy
+        ));
+
+        policy.allow_git_merge_pull_in_ai_context = false;
+        assert!(!should_allow_git_merge_pull_worktree_change_in_ai_context(
+            "git",
+            &merge_args,
+            &policy
+        ));
     }
 
     #[test]
@@ -3437,6 +3590,8 @@ fn main() {
                         Some(process_name.as_str()),
                         &current_policy,
                     ) {
+                        None
+                    } else if should_allow_git_merge_pull_for_process(pid, process_name.as_str(), &current_policy) {
                         None
                     } else if current_policy.allow_trusted_tools_in_ai_context
                         && is_trusted_process_name(process_name.as_str(), &current_policy)
