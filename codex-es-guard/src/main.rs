@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CACHE_TTL_SECS: u64 = 5;
 const TRUST_CACHE_TTL_SECS: u64 = 300;
@@ -46,6 +46,10 @@ const SIGNATURE_CACHE_PRUNE_INTERVAL_SECS: u64 = 60;
 const SIGNATURE_REFRESH_QUEUE_BOUND: usize = 1024;
 const LOG_EVENT_QUEUE_BOUND: usize = 2048;
 const LOG_QUEUE_FULL_WARN_INTERVAL_SECS: u64 = 5;
+const RUNTIME_HEALTH_LOG_INTERVAL_SECS: u64 = 10;
+const CALLBACK_LATENCY_BUCKETS_US: [u64; 12] = [
+    100, 250, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 250_000, 500_000,
+];
 const POLICY_SELF_CHECK_WARNING_INTERVAL_SECS: u64 = 300;
 const REASON_SENSITIVE_READ_NON_AI: &str = "SENSITIVE_READ_NON_AI";
 const REASON_SENSITIVE_TRANSFER_OUT: &str = "SENSITIVE_TRANSFER_OUT";
@@ -57,6 +61,12 @@ const TRUST_SIGNATURE_PENDING_PREFIX: &str = "signature verification pending";
 
 static LOG_EVENT_TX: OnceLock<mpsc::SyncSender<GuardLogMessage>> = OnceLock::new();
 static LOG_QUEUE_FULL_LAST_WARN_TS: AtomicU64 = AtomicU64::new(0);
+static SIGNATURE_QUEUE_PENDING: AtomicU64 = AtomicU64::new(0);
+static SIGNATURE_QUEUE_DROPPED_FULL: AtomicU64 = AtomicU64::new(0);
+static SIGNATURE_QUEUE_DROPPED_DISCONNECTED: AtomicU64 = AtomicU64::new(0);
+static LOG_QUEUE_PENDING: AtomicU64 = AtomicU64::new(0);
+static LOG_QUEUE_DROPPED_FULL: AtomicU64 = AtomicU64::new(0);
+static LOG_QUEUE_DROPPED_DISCONNECTED: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Deserialize)]
 struct OverrideRequest {
@@ -499,6 +509,105 @@ impl CacheWatermarkHighs {
         self.trusted = self.trusted.max(trusted);
         self.taint = self.taint.max(taint);
         (self.ancestor, self.trusted, self.taint)
+    }
+}
+
+#[derive(Debug)]
+struct CallbackLatencyMetrics {
+    counts: [AtomicU64; CALLBACK_LATENCY_BUCKETS_US.len() + 1],
+    total: AtomicU64,
+    max_us: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+struct CallbackLatencySnapshot {
+    counts: [u64; CALLBACK_LATENCY_BUCKETS_US.len() + 1],
+    total: u64,
+    max_us: u64,
+}
+
+impl CallbackLatencySnapshot {
+    fn percentile_upper_bound_us(&self, percentile: u64) -> u64 {
+        if self.total == 0 {
+            return 0;
+        }
+        let target = ((self.total * percentile).saturating_add(99)) / 100;
+        let mut seen = 0u64;
+        for (idx, count) in self.counts.iter().enumerate() {
+            seen = seen.saturating_add(*count);
+            if seen >= target {
+                if idx < CALLBACK_LATENCY_BUCKETS_US.len() {
+                    return CALLBACK_LATENCY_BUCKETS_US[idx];
+                }
+                return CALLBACK_LATENCY_BUCKETS_US[CALLBACK_LATENCY_BUCKETS_US.len() - 1].saturating_add(1);
+            }
+        }
+        self.max_us
+    }
+}
+
+impl CallbackLatencyMetrics {
+    fn new() -> Self {
+        Self {
+            counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            total: AtomicU64::new(0),
+            max_us: AtomicU64::new(0),
+        }
+    }
+
+    fn observe(&self, elapsed: Duration) {
+        let elapsed_us = elapsed.as_micros() as u64;
+        let idx = CALLBACK_LATENCY_BUCKETS_US
+            .iter()
+            .position(|upper| elapsed_us <= *upper)
+            .unwrap_or(CALLBACK_LATENCY_BUCKETS_US.len());
+        self.counts[idx].fetch_add(1, Ordering::Relaxed);
+        self.total.fetch_add(1, Ordering::Relaxed);
+
+        let mut current_max = self.max_us.load(Ordering::Relaxed);
+        while elapsed_us > current_max {
+            match self.max_us.compare_exchange_weak(
+                current_max,
+                elapsed_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current_max = observed,
+            }
+        }
+    }
+
+    fn snapshot_and_reset(&self) -> CallbackLatencySnapshot {
+        let mut counts = [0u64; CALLBACK_LATENCY_BUCKETS_US.len() + 1];
+        for (idx, slot) in counts.iter_mut().enumerate() {
+            *slot = self.counts[idx].swap(0, Ordering::Relaxed);
+        }
+        CallbackLatencySnapshot {
+            counts,
+            total: self.total.swap(0, Ordering::Relaxed),
+            max_us: self.max_us.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+
+struct CallbackLatencyGuard<'a> {
+    started_at: Instant,
+    metrics: &'a CallbackLatencyMetrics,
+}
+
+impl<'a> CallbackLatencyGuard<'a> {
+    fn new(metrics: &'a CallbackLatencyMetrics) -> Self {
+        Self {
+            started_at: Instant::now(),
+            metrics,
+        }
+    }
+}
+
+impl Drop for CallbackLatencyGuard<'_> {
+    fn drop(&mut self) {
+        self.metrics.observe(self.started_at.elapsed());
     }
 }
 
@@ -1943,6 +2052,33 @@ fn format_cache_watermark_log(
     )
 }
 
+fn format_runtime_health_log(
+    ts: u64,
+    signature_queue_pending: u64,
+    signature_queue_dropped_full: u64,
+    signature_queue_dropped_disconnected: u64,
+    log_queue_pending: u64,
+    log_queue_dropped_full: u64,
+    log_queue_dropped_disconnected: u64,
+    callback_latency: &CallbackLatencySnapshot,
+) -> String {
+    format!(
+        "[METRIC] runtime-health ts={} sigq_pending={} sigq_drop_full={} sigq_drop_disconnected={} logq_pending={} logq_drop_full={} logq_drop_disconnected={} cb_count={} cb_p50_us={} cb_p95_us={} cb_p99_us={} cb_max_us={}",
+        ts,
+        signature_queue_pending,
+        signature_queue_dropped_full,
+        signature_queue_dropped_disconnected,
+        log_queue_pending,
+        log_queue_dropped_full,
+        log_queue_dropped_disconnected,
+        callback_latency.total,
+        callback_latency.percentile_upper_bound_us(50),
+        callback_latency.percentile_upper_bound_us(95),
+        callback_latency.percentile_upper_bound_us(99),
+        callback_latency.max_us
+    )
+}
+
 fn emit_cache_watermark_log(
     ancestor_cache: &Arc<Mutex<HashMap<i32, CachedAncestor>>>,
     trust_cache: &Arc<Mutex<TrustedProcessCache>>,
@@ -1976,6 +2112,23 @@ fn emit_cache_watermark_log(
     );
 }
 
+fn emit_runtime_health_log(callback_latency_metrics: &CallbackLatencyMetrics) {
+    let callback_latency = callback_latency_metrics.snapshot_and_reset();
+    println!(
+        "{}",
+        format_runtime_health_log(
+            now_ts(),
+            SIGNATURE_QUEUE_PENDING.load(Ordering::Relaxed),
+            SIGNATURE_QUEUE_DROPPED_FULL.load(Ordering::Relaxed),
+            SIGNATURE_QUEUE_DROPPED_DISCONNECTED.load(Ordering::Relaxed),
+            LOG_QUEUE_PENDING.load(Ordering::Relaxed),
+            LOG_QUEUE_DROPPED_FULL.load(Ordering::Relaxed),
+            LOG_QUEUE_DROPPED_DISCONNECTED.load(Ordering::Relaxed),
+            &callback_latency,
+        )
+    );
+}
+
 fn maybe_warn_log_queue_full(kind: &str) {
     let now = now_ts();
     let last_warn = LOG_QUEUE_FULL_LAST_WARN_TS.load(Ordering::Relaxed);
@@ -1997,16 +2150,31 @@ fn process_log_message_sync(home: &str, message: GuardLogMessage) {
     }
 }
 
+fn decrement_queue_pending(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        value.checked_sub(1)
+    });
+}
+
 fn enqueue_log_message_or_fallback(home: &str, message: GuardLogMessage) {
     if let Some(tx) = LOG_EVENT_TX.get() {
         let kind = match &message {
             GuardLogMessage::Denial(_) => "denial",
             GuardLogMessage::TaintMark(_) => "taint",
         };
+        LOG_QUEUE_PENDING.fetch_add(1, Ordering::Relaxed);
         match tx.try_send(message) {
             Ok(()) => {},
-            Err(mpsc::TrySendError::Full(_)) => maybe_warn_log_queue_full(kind),
-            Err(mpsc::TrySendError::Disconnected(message)) => process_log_message_sync(home, message),
+            Err(mpsc::TrySendError::Full(_)) => {
+                decrement_queue_pending(&LOG_QUEUE_PENDING);
+                LOG_QUEUE_DROPPED_FULL.fetch_add(1, Ordering::Relaxed);
+                maybe_warn_log_queue_full(kind);
+            },
+            Err(mpsc::TrySendError::Disconnected(message)) => {
+                decrement_queue_pending(&LOG_QUEUE_PENDING);
+                LOG_QUEUE_DROPPED_DISCONNECTED.fetch_add(1, Ordering::Relaxed);
+                process_log_message_sync(home, message);
+            },
         }
         return;
     }
@@ -2024,6 +2192,7 @@ fn init_async_log_worker(home: &str) {
     thread::spawn(move || {
         while let Ok(message) = rx.recv() {
             process_log_message_sync(worker_home.as_str(), message);
+            decrement_queue_pending(&LOG_QUEUE_PENDING);
         }
     });
 }
@@ -2640,17 +2809,21 @@ fn request_signature_refresh_if_needed(
         return;
     }
 
+    SIGNATURE_QUEUE_PENDING.fetch_add(1, Ordering::Relaxed);
     if let Err(err) = signature_refresh_tx.try_send(canonical_path.to_string()) {
+        decrement_queue_pending(&SIGNATURE_QUEUE_PENDING);
         let mut cache = signature_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.cancel_in_flight_refresh(canonical_path);
         match err {
             mpsc::TrySendError::Full(_) => {
+                SIGNATURE_QUEUE_DROPPED_FULL.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
                     "[trust] signature refresh queue is full; skipping enqueue for {}",
                     canonical_path
                 );
             },
             mpsc::TrySendError::Disconnected(_) => {
+                SIGNATURE_QUEUE_DROPPED_DISCONNECTED.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
                     "[trust] signature refresh worker disconnected; unable to verify {}",
                     canonical_path
@@ -2687,6 +2860,7 @@ fn spawn_signature_refresh_worker(
             let now = now_ts();
             let mut cache = signature_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             cache.insert(canonical_path, signature, now);
+            decrement_queue_pending(&SIGNATURE_QUEUE_PENDING);
         }
     });
 }
@@ -3538,6 +3712,45 @@ mod tests {
         assert_eq!(
             line,
             "[METRIC] cache-watermark ts=1770000000 ancestor=2/5 trusted=3/7 taint=1/4"
+        );
+    }
+
+    #[test]
+    fn callback_latency_metrics_snapshot_tracks_percentiles_and_resets() {
+        let metrics = CallbackLatencyMetrics::new();
+        metrics.observe(Duration::from_micros(80));
+        metrics.observe(Duration::from_micros(1_200));
+        metrics.observe(Duration::from_micros(700_000));
+
+        let snapshot = metrics.snapshot_and_reset();
+        assert_eq!(snapshot.total, 3);
+        assert_eq!(snapshot.max_us, 700_000);
+        assert_eq!(snapshot.percentile_upper_bound_us(50), 2_000);
+        assert_eq!(snapshot.percentile_upper_bound_us(95), 500_001);
+        assert_eq!(snapshot.percentile_upper_bound_us(99), 500_001);
+
+        let after_reset = metrics.snapshot_and_reset();
+        assert_eq!(after_reset.total, 0);
+        assert_eq!(after_reset.max_us, 0);
+        assert_eq!(after_reset.percentile_upper_bound_us(95), 0);
+    }
+
+    #[test]
+    fn runtime_health_log_format_is_stable() {
+        let mut counts = [0u64; CALLBACK_LATENCY_BUCKETS_US.len() + 1];
+        counts[0] = 1;
+        counts[1] = 1;
+        counts[CALLBACK_LATENCY_BUCKETS_US.len()] = 1;
+        let callback_latency = CallbackLatencySnapshot {
+            counts,
+            total: 3,
+            max_us: 700_000,
+        };
+
+        let line = format_runtime_health_log(1_770_000_000, 4, 1, 2, 9, 3, 5, &callback_latency);
+        assert_eq!(
+            line,
+            "[METRIC] runtime-health ts=1770000000 sigq_pending=4 sigq_drop_full=1 sigq_drop_disconnected=2 logq_pending=9 logq_drop_full=3 logq_drop_disconnected=5 cb_count=3 cb_p50_us=250 cb_p95_us=500001 cb_p99_us=500001 cb_max_us=700000"
         );
     }
 
@@ -5045,6 +5258,8 @@ fn main() {
     let cache_metrics_clone = ancestor_cache.clone();
     let trust_metrics_clone = trusted_process_cache.clone();
     let taint_metrics_clone = taint_state.clone();
+    let callback_latency_metrics = Arc::new(CallbackLatencyMetrics::new());
+    let callback_latency_metrics_clone = callback_latency_metrics.clone();
     thread::spawn(move || {
         let mut highs = CacheWatermarkHighs::default();
         loop {
@@ -5057,6 +5272,10 @@ fn main() {
             thread::sleep(Duration::from_secs(CACHE_WATERMARK_LOG_INTERVAL_SECS));
         }
     });
+    thread::spawn(move || loop {
+        emit_runtime_health_log(callback_latency_metrics_clone.as_ref());
+        thread::sleep(Duration::from_secs(RUNTIME_HEALTH_LOG_INTERVAL_SECS));
+    });
 
     let safe_policy = AssertUnwindSafe(global_policy);
     let safe_cache = AssertUnwindSafe(ancestor_cache);
@@ -5066,8 +5285,10 @@ fn main() {
     let home_for_handler = home.clone();
     let guard_pid = std::process::id() as i32;
     let signature_refresh_tx_for_handler = signature_refresh_tx.clone();
+    let callback_latency_metrics_for_handler = callback_latency_metrics.clone();
 
     let handler = move |client: &mut Client<'_>, message: Message| {
+        let _callback_latency_guard = CallbackLatencyGuard::new(callback_latency_metrics_for_handler.as_ref());
         let current_policy = safe_policy
             .0
             .lock()
