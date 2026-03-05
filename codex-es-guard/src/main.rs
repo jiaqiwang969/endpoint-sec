@@ -365,7 +365,9 @@ impl TaintState {
         }
 
         match entry.process_start {
-            Some(expected_start) => process_start_time_for_pid(pid).is_some_and(|actual_start| actual_start == expected_start),
+            Some(expected_start) => {
+                process_start_time_for_pid(pid).is_some_and(|actual_start| actual_start == expected_start)
+            },
             None => true,
         }
     }
@@ -1829,8 +1831,7 @@ fn emit_cache_watermark_log(
         let taint = taint_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         taint.len()
     };
-    let (ancestor_high, trusted_high, taint_high) =
-        highs.update(ancestor_current, trusted_current, taint_current);
+    let (ancestor_high, trusted_high, taint_high) = highs.update(ancestor_current, trusted_current, taint_current);
     println!(
         "{}",
         format_cache_watermark_log(
@@ -1874,7 +1875,6 @@ fn log_denial(home: &str, record: &DenialRecord) {
     if let Ok(mut file) = open_truncate_no_follow(&feedback_path, DEFAULT_FILE_MODE) {
         if verify_regular_file(&file, &feedback_path).is_ok() {
             let _ = file.write_all(feedback.as_bytes());
-            let _ = file.sync_data();
         }
     }
 }
@@ -2625,6 +2625,10 @@ fn is_write_intent(fflag: i32) -> bool {
     (fflag & FFLAG_WRITE) != 0
 }
 
+fn should_fast_allow_open(path: &str, fflag: i32, policy: &SecurityPolicy) -> bool {
+    !is_write_intent(fflag) && !policy.is_sensitive_path(path)
+}
+
 fn should_deny_sensitive_open_for_process(
     path: &str,
     is_ai_context: bool,
@@ -3197,6 +3201,26 @@ mod tests {
         assert!(is_read_intent(FFLAG_READ));
         assert!(is_read_intent(FFLAG_READ | FFLAG_WRITE));
         assert!(!is_read_intent(FFLAG_WRITE));
+    }
+
+    #[test]
+    fn auth_open_fast_allow_requires_non_sensitive_read_only_path() {
+        let policy = test_sensitive_policy();
+        assert!(should_fast_allow_open(
+            "/Users/jqwang/project/notes.txt",
+            FFLAG_READ,
+            &policy
+        ));
+        assert!(!should_fast_allow_open(
+            "/Users/jqwang/project/notes.txt",
+            FFLAG_WRITE,
+            &policy
+        ));
+        assert!(!should_fast_allow_open(
+            "/Users/jqwang/.codex/config.toml",
+            FFLAG_READ,
+            &policy
+        ));
     }
 
     #[test]
@@ -4529,47 +4553,55 @@ fn main() {
                 let path = open.file().path().to_string_lossy().into_owned();
                 let fflag = open.fflag();
 
-                let mut cache = safe_cache.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                let ai_ancestor = find_ai_ancestor(pid, &current_policy, &mut cache);
-                let is_ai_context = ai_ancestor.is_some();
+                if should_fast_allow_open(path.as_str(), fflag, &current_policy) {
+                    let _ = client.respond_flags_result(&message, fflag as u32, false);
+                    return;
+                }
+
                 let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
                 let is_guard_process = pid == guard_pid;
-                let allow_observer_read =
-                    should_allow_sensitive_read_observer(&path, process_name.as_str(), &home_for_handler);
-                let should_deny = should_deny_sensitive_open_for_process(
-                    &path,
-                    is_ai_context,
-                    fflag,
-                    &current_policy,
-                    is_guard_process,
-                ) && !allow_observer_read;
 
-                if should_deny {
-                    let ancestor = ai_ancestor.unwrap_or_else(|| "none".to_string());
-                    let zone = current_policy.matched_sensitive_zone(path.as_str());
-                    println!(
-                        "[DENY] open(read) by {} (via {}): {}",
-                        process_name, ancestor, path
-                    );
-                    log_denial(
-                        &home_for_handler,
-                        &DenialRecord {
-                            ts: now_ts(),
-                            op: "open".into(),
-                            path: path.clone(),
-                            dest: None,
-                            zone,
-                            process: process_name,
-                            ancestor,
-                            reason: REASON_SENSITIVE_READ_NON_AI.to_string(),
-                            pid: pid_for_record(pid),
-                            ppid: parent_pid_for_pid(pid),
-                        },
-                    );
-                    let _ = client.respond_flags_result(&message, 0, false);
-                } else {
+                if current_policy.is_sensitive_path(path.as_str()) && is_read_intent(fflag) {
+                    let mut cache = safe_cache.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let ai_ancestor = find_ai_ancestor(pid, &current_policy, &mut cache);
+                    let is_ai_context = ai_ancestor.is_some();
+                    let allow_observer_read =
+                        should_allow_sensitive_read_observer(&path, process_name.as_str(), &home_for_handler);
+                    let should_deny = should_deny_sensitive_open_for_process(
+                        &path,
+                        is_ai_context,
+                        fflag,
+                        &current_policy,
+                        is_guard_process,
+                    ) && !allow_observer_read;
+
+                    if should_deny {
+                        let ancestor = ai_ancestor.unwrap_or_else(|| "none".to_string());
+                        let zone = current_policy.matched_sensitive_zone(path.as_str());
+                        println!(
+                            "[DENY] open(read) by {} (via {}): {}",
+                            process_name, ancestor, path
+                        );
+                        log_denial(
+                            &home_for_handler,
+                            &DenialRecord {
+                                ts: now_ts(),
+                                op: "open".into(),
+                                path: path.clone(),
+                                dest: None,
+                                zone,
+                                process: process_name.clone(),
+                                ancestor,
+                                reason: REASON_SENSITIVE_READ_NON_AI.to_string(),
+                                pid: pid_for_record(pid),
+                                ppid: parent_pid_for_pid(pid),
+                            },
+                        );
+                        let _ = client.respond_flags_result(&message, 0, false);
+                        return;
+                    }
+
                     if is_ai_context
-                        && is_read_intent(fflag)
                         && should_mark_taint_on_sensitive_read(path.as_str(), &current_policy, &home_for_handler)
                     {
                         let marked_at = now_ts();
@@ -4590,63 +4622,63 @@ fn main() {
                             },
                         );
                     }
+                }
 
-                    let (deny_taint_write, denial_reason) = if is_write_intent(fflag) {
-                        let trusted_process = evaluate_trusted_process(
+                let (deny_taint_write, denial_reason) = if is_write_intent(fflag) {
+                    let trusted_process = evaluate_trusted_process(
+                        pid,
+                        process_name.as_str(),
+                        &current_policy,
+                        &safe_trust_cache.0,
+                    );
+                    let deny_taint_write = {
+                        let taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        should_deny_tainted_open_write(
                             pid,
-                            process_name.as_str(),
+                            &path,
+                            fflag,
+                            Some(process_name.as_str()),
+                            &trusted_process,
+                            now_ts(),
+                            &taint,
                             &current_policy,
-                            &safe_trust_cache.0,
-                        );
-                        let deny_taint_write = {
-                            let taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                            should_deny_tainted_open_write(
-                                pid,
-                                &path,
-                                fflag,
-                                Some(process_name.as_str()),
-                                &trusted_process,
-                                now_ts(),
-                                &taint,
-                                &current_policy,
-                            )
-                        };
-                        let reason = if deny_taint_write
-                            && current_policy.allow_vcs_metadata_in_ai_context
-                            && is_vcs_metadata_path(path.as_str())
-                            && is_vcs_tool(process_name.as_str())
-                            && trusted_process.is_identity_mismatch()
-                        {
-                            REASON_TRUST_IDENTITY_MISMATCH
-                        } else {
-                            REASON_TAINT_WRITE_OUT
-                        };
-                        (deny_taint_write, reason)
-                    } else {
-                        (false, REASON_TAINT_WRITE_OUT)
+                        )
                     };
-
-                    if deny_taint_write {
-                        println!("[DENY] open(write-taint) by {}: {}", process_name, path);
-                        log_denial(
-                            &home_for_handler,
-                            &DenialRecord {
-                                ts: now_ts(),
-                                op: "open".into(),
-                                path: path.clone(),
-                                dest: None,
-                                zone: "taint".to_string(),
-                                process: process_name.clone(),
-                                ancestor: "tainted".to_string(),
-                                reason: denial_reason.to_string(),
-                                pid: pid_for_record(pid),
-                                ppid: parent_pid_for_pid(pid),
-                            },
-                        );
-                        let _ = client.respond_flags_result(&message, 0, false);
+                    let reason = if deny_taint_write
+                        && current_policy.allow_vcs_metadata_in_ai_context
+                        && is_vcs_metadata_path(path.as_str())
+                        && is_vcs_tool(process_name.as_str())
+                        && trusted_process.is_identity_mismatch()
+                    {
+                        REASON_TRUST_IDENTITY_MISMATCH
                     } else {
-                        let _ = client.respond_flags_result(&message, fflag as u32, false);
-                    }
+                        REASON_TAINT_WRITE_OUT
+                    };
+                    (deny_taint_write, reason)
+                } else {
+                    (false, REASON_TAINT_WRITE_OUT)
+                };
+
+                if deny_taint_write {
+                    println!("[DENY] open(write-taint) by {}: {}", process_name, path);
+                    log_denial(
+                        &home_for_handler,
+                        &DenialRecord {
+                            ts: now_ts(),
+                            op: "open".into(),
+                            path: path.clone(),
+                            dest: None,
+                            zone: "taint".to_string(),
+                            process: process_name.clone(),
+                            ancestor: "tainted".to_string(),
+                            reason: denial_reason.to_string(),
+                            pid: pid_for_record(pid),
+                            ppid: parent_pid_for_pid(pid),
+                        },
+                    );
+                    let _ = client.respond_flags_result(&message, 0, false);
+                } else {
+                    let _ = client.respond_flags_result(&message, fflag as u32, false);
                 }
             },
             Some(Event::AuthExec(exec)) => {
@@ -4713,12 +4745,7 @@ fn main() {
                     taint.inherit_from_parent(pid, child_pid, marked_at)
                 };
                 if inherited {
-                    let child_path = fork
-                        .child()
-                        .executable()
-                        .path()
-                        .to_string_lossy()
-                        .into_owned();
+                    let child_path = fork.child().executable().path().to_string_lossy().into_owned();
                     let child_name = exe_name(&child_path).to_string();
                     log_taint_mark(
                         &home_for_handler,
