@@ -226,6 +226,12 @@ struct ProcessIdentityKey {
     executable_path: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessStartTimeKey {
+    start_tvsec: u64,
+    start_tvusec: u64,
+}
+
 #[derive(Debug, Clone)]
 struct CachedTrustedProcess {
     decision: TrustedProcessDecision,
@@ -308,10 +314,16 @@ struct BinaryCodeSignature {
     cdhash: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TaintEntry {
+    touched_at: u64,
+    process_start: Option<ProcessStartTimeKey>,
+}
+
 #[derive(Debug, Default)]
 struct TaintState {
     ttl_secs: u64,
-    touched: HashMap<i32, u64>,
+    touched: HashMap<i32, TaintEntry>,
 }
 
 impl TaintState {
@@ -328,14 +340,52 @@ impl TaintState {
     }
 
     fn mark(&mut self, pid: i32, ts: u64) {
+        self.mark_with_process_start(pid, ts, None);
+    }
+
+    fn mark_with_process_start(&mut self, pid: i32, ts: u64, process_start: Option<ProcessStartTimeKey>) {
         self.prune_expired(ts);
-        self.touched.insert(pid, ts);
+        self.touched.insert(
+            pid,
+            TaintEntry {
+                touched_at: ts,
+                process_start,
+            },
+        );
     }
 
     fn is_tainted(&self, pid: i32, now: u64) -> bool {
-        self.touched
-            .get(&pid)
-            .is_some_and(|ts| now.saturating_sub(*ts) <= self.ttl_secs)
+        let entry = match self.touched.get(&pid) {
+            Some(entry) => entry,
+            None => return false,
+        };
+
+        if now.saturating_sub(entry.touched_at) > self.ttl_secs {
+            return false;
+        }
+
+        match entry.process_start {
+            Some(expected_start) => process_start_time_for_pid(pid).is_some_and(|actual_start| actual_start == expected_start),
+            None => true,
+        }
+    }
+
+    fn inherit_from_parent(&mut self, parent_pid: i32, child_pid: i32, now: u64) -> bool {
+        if parent_pid <= 0 || child_pid <= 0 || parent_pid == child_pid {
+            return false;
+        }
+        self.prune_expired(now);
+        if !self.is_tainted(parent_pid, now) || self.is_tainted(child_pid, now) {
+            return false;
+        }
+        self.touched.insert(
+            child_pid,
+            TaintEntry {
+                touched_at: now,
+                process_start: process_start_time_for_pid(child_pid),
+            },
+        );
+        true
     }
 
     fn clear_pid(&mut self, pid: i32) {
@@ -344,7 +394,7 @@ impl TaintState {
 
     fn prune_expired(&mut self, now: u64) {
         self.touched
-            .retain(|_, ts| now.saturating_sub(*ts) <= self.ttl_secs);
+            .retain(|_, entry| now.saturating_sub(entry.touched_at) <= self.ttl_secs);
     }
 
     fn len(&self) -> usize {
@@ -2130,6 +2180,14 @@ fn pid_for_record(pid: i32) -> Option<i32> {
     (pid > 0).then_some(pid)
 }
 
+fn process_start_time_for_pid(pid: i32) -> Option<ProcessStartTimeKey> {
+    let info = get_process_bsd_info(pid)?;
+    Some(ProcessStartTimeKey {
+        start_tvsec: info.pbi_start_tvsec,
+        start_tvusec: info.pbi_start_tvusec,
+    })
+}
+
 fn process_identity_key(pid: i32) -> Option<ProcessIdentityKey> {
     let info = get_process_bsd_info(pid)?;
     let executable_path = get_process_path(pid)?;
@@ -2978,6 +3036,30 @@ mod tests {
     }
 
     #[test]
+    fn taint_state_accepts_matching_pid_start_time_identity() {
+        let mut taint = TaintState::new(60);
+        let pid = std::process::id() as i32;
+        let process_start = process_start_time_for_pid(pid).expect("current process start time must be available");
+        taint.mark_with_process_start(pid, 1_000, Some(process_start));
+        assert!(taint.is_tainted(pid, 1_030));
+    }
+
+    #[test]
+    fn taint_state_rejects_pid_start_time_mismatch() {
+        let mut taint = TaintState::new(60);
+        let pid = std::process::id() as i32;
+        taint.mark_with_process_start(
+            pid,
+            1_000,
+            Some(ProcessStartTimeKey {
+                start_tvsec: u64::MAX,
+                start_tvusec: u64::MAX,
+            }),
+        );
+        assert!(!taint.is_tainted(pid, 1_030));
+    }
+
+    #[test]
     fn taint_state_prune_expired_entries_keeps_recent_entries() {
         let mut taint = TaintState::new(60);
         taint.mark(100, 1_000);
@@ -2985,6 +3067,21 @@ mod tests {
         taint.prune_expired(1_200);
         assert!(!taint.is_tainted(100, 1_200));
         assert!(taint.is_tainted(200, 1_200));
+    }
+
+    #[test]
+    fn taint_state_inherits_to_child_pid_from_tainted_parent() {
+        let mut taint = TaintState::new(60);
+        taint.mark(100, 1_000);
+        assert!(taint.inherit_from_parent(100, 200, 1_020));
+        assert!(taint.is_tainted(200, 1_020));
+    }
+
+    #[test]
+    fn taint_state_does_not_inherit_from_clean_parent() {
+        let mut taint = TaintState::new(60);
+        assert!(!taint.inherit_from_parent(100, 200, 1_020));
+        assert!(!taint.is_tainted(200, 1_020));
     }
 
     #[test]
@@ -4476,8 +4573,9 @@ fn main() {
                         && should_mark_taint_on_sensitive_read(path.as_str(), &current_policy, &home_for_handler)
                     {
                         let marked_at = now_ts();
+                        let process_start = process_start_time_for_pid(pid);
                         let mut taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        taint.mark(pid, marked_at);
+                        taint.mark_with_process_start(pid, marked_at, process_start);
                         drop(taint);
                         let ancestor = ai_ancestor.as_deref().unwrap_or("unknown").to_string();
                         log_taint_mark(
@@ -4555,6 +4653,27 @@ fn main() {
                 clear_trust_cache_for_exec(&safe_trust_cache.0, pid);
                 let target_path = exec.target().executable().path().to_string_lossy().into_owned();
                 let target_name = exe_name(&target_path).to_string();
+                let parent_pid = parent_pid_for_pid(pid);
+                let marked_at = now_ts();
+                let inherited = {
+                    let mut taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    parent_pid
+                        .map(|ppid| taint.inherit_from_parent(ppid, pid, marked_at))
+                        .unwrap_or(false)
+                };
+                if inherited {
+                    log_taint_mark(
+                        &home_for_handler,
+                        &TaintMarkRecord {
+                            ts: marked_at,
+                            path: target_path.clone(),
+                            process: target_name.clone(),
+                            ancestor: format!("inherit-from-pid:{}", parent_pid.unwrap_or_default()),
+                            pid,
+                            ppid: parent_pid,
+                        },
+                    );
+                }
                 let mut cache = safe_cache.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let ai_ancestor = find_ai_ancestor(pid, &current_policy, &mut cache);
                 let is_ai_context = ai_ancestor.is_some();
@@ -4584,6 +4703,34 @@ fn main() {
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
                 } else {
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                }
+            },
+            Some(Event::NotifyFork(fork)) => {
+                let child_pid = fork.child().audit_token().pid();
+                let marked_at = now_ts();
+                let inherited = {
+                    let mut taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    taint.inherit_from_parent(pid, child_pid, marked_at)
+                };
+                if inherited {
+                    let child_path = fork
+                        .child()
+                        .executable()
+                        .path()
+                        .to_string_lossy()
+                        .into_owned();
+                    let child_name = exe_name(&child_path).to_string();
+                    log_taint_mark(
+                        &home_for_handler,
+                        &TaintMarkRecord {
+                            ts: marked_at,
+                            path: child_path,
+                            process: child_name,
+                            ancestor: format!("inherit-from-pid:{}", pid),
+                            pid: child_pid,
+                            ppid: pid_for_record(pid),
+                        },
+                    );
                 }
             },
             Some(Event::NotifyExit(_exit)) => {
@@ -5037,6 +5184,7 @@ fn main() {
         .subscribe(&[
             es_event_type_t::ES_EVENT_TYPE_AUTH_OPEN,
             es_event_type_t::ES_EVENT_TYPE_NOTIFY_EXIT,
+            es_event_type_t::ES_EVENT_TYPE_NOTIFY_FORK,
             es_event_type_t::ES_EVENT_TYPE_AUTH_EXEC,
             es_event_type_t::ES_EVENT_TYPE_AUTH_CREATE,
             es_event_type_t::ES_EVENT_TYPE_AUTH_TRUNCATE,
