@@ -39,6 +39,7 @@ const FFLAG_WRITE: i32 = 0x0000_0002;
 const DEFAULT_TAINT_TTL_SECS: u64 = 600;
 const CACHE_WATERMARK_LOG_INTERVAL_SECS: u64 = 10;
 const TRUST_CACHE_PRUNE_INTERVAL_SECS: u64 = 10;
+const POLICY_SELF_CHECK_WARNING_INTERVAL_SECS: u64 = 300;
 const REASON_SENSITIVE_READ_NON_AI: &str = "SENSITIVE_READ_NON_AI";
 const REASON_SENSITIVE_TRANSFER_OUT: &str = "SENSITIVE_TRANSFER_OUT";
 const REASON_TAINT_WRITE_OUT: &str = "TAINT_WRITE_OUT";
@@ -1760,23 +1761,52 @@ fn is_system_temp(path: &str, home: &str) -> bool {
         || path.ends_with(".DS_Store")
 }
 
-fn trusted_identity_configuration_warning(policy: &SecurityPolicy) -> Option<String> {
+fn warning_relevant_trusted_tools(policy: &SecurityPolicy) -> Vec<&str> {
     if policy.trusted_tools.is_empty() {
+        return vec![];
+    }
+
+    let trusted_set = policy
+        .trusted_tools
+        .iter()
+        .map(|tool| tool.as_str())
+        .collect::<HashSet<_>>();
+    let mut relevant = HashSet::new();
+
+    if policy.allow_trusted_tools_in_ai_context {
+        relevant.extend(trusted_set.iter().copied());
+    }
+
+    if policy.allow_vcs_metadata_in_ai_context {
+        for tool in ["git", "jj"] {
+            if trusted_set.contains(tool) {
+                relevant.insert(tool);
+            }
+        }
+    }
+
+    let mut tools = relevant.into_iter().collect::<Vec<_>>();
+    tools.sort_unstable();
+    tools
+}
+
+fn trusted_identity_configuration_warning(policy: &SecurityPolicy) -> Option<String> {
+    let relevant_tools = warning_relevant_trusted_tools(policy);
+    if relevant_tools.is_empty() {
         return None;
     }
 
     if policy.trusted_tool_identities.is_empty() {
         return Some(format!(
-            "[WARN] trusted_tools is configured ({} entries) but trusted_tool_identities is empty; trusted checks will fail-closed. This can deny git/jj metadata writes with TRUST_IDENTITY_MISMATCH. Run nix switch/make to refresh policy defaults or set trusted_tool_identities in ~/.codex/es_policy.json.",
-            policy.trusted_tools.len()
+            "[WARN] trusted checks are active for [{}], but trusted_tool_identities is empty; these tools will fail-closed with TRUST_IDENTITY_MISMATCH. Run nix switch/make to refresh policy defaults or set trusted_tool_identities in ~/.codex/es_policy.json.",
+            relevant_tools.join(", ")
         ));
     }
 
-    let missing_tools = policy
-        .trusted_tools
+    let missing_tools = relevant_tools
         .iter()
-        .filter(|tool| policy.trusted_identity_candidates_for_process(tool.as_str()).is_empty())
-        .cloned()
+        .filter(|tool| policy.trusted_identity_candidates_for_process(tool).is_empty())
+        .map(|tool| (*tool).to_string())
         .collect::<Vec<_>>();
     if missing_tools.is_empty() {
         return None;
@@ -1788,9 +1818,22 @@ fn trusted_identity_configuration_warning(policy: &SecurityPolicy) -> Option<Str
     ))
 }
 
-fn log_policy_self_checks(policy: &SecurityPolicy) {
+fn log_policy_self_checks(policy: &SecurityPolicy, warning_state: &mut Option<(String, u64)>, now: u64) {
     if let Some(warning) = trusted_identity_configuration_warning(policy) {
-        eprintln!("{}", warning);
+        let should_emit = match warning_state {
+            Some((previous, ts))
+                if previous == &warning && now.saturating_sub(*ts) < POLICY_SELF_CHECK_WARNING_INTERVAL_SECS =>
+            {
+                false
+            },
+            _ => true,
+        };
+        if should_emit {
+            eprintln!("{}", warning);
+            *warning_state = Some((warning, now));
+        }
+    } else {
+        *warning_state = None;
     }
 }
 
@@ -3311,11 +3354,28 @@ mod tests {
         let warning = trusted_identity_configuration_warning(&policy).expect("warning expected");
         assert!(warning.contains("trusted_tool_identities"));
         assert!(warning.contains("TRUST_IDENTITY_MISMATCH"));
+        assert!(warning.contains("git"));
+        assert!(!warning.contains("cargo"));
     }
 
     #[test]
-    fn trusted_identity_self_check_warns_when_some_tools_are_uncovered() {
+    fn trusted_identity_self_check_ignores_unused_tools_for_warning_scope() {
         let mut policy = test_policy();
+        policy.trusted_tools = vec!["git".to_string(), "cargo".to_string()];
+        policy.trusted_tool_identities = vec![TrustedToolIdentity {
+            path: "/usr/bin/git".to_string(),
+            signing_identifier: "com.apple.git".to_string(),
+            team_identifier: None,
+            cdhash: None,
+        }];
+
+        assert!(trusted_identity_configuration_warning(&policy).is_none());
+    }
+
+    #[test]
+    fn trusted_identity_self_check_warns_for_missing_tools_when_trusted_gate_enabled() {
+        let mut policy = test_policy();
+        policy.allow_trusted_tools_in_ai_context = true;
         policy.trusted_tools = vec!["git".to_string(), "cargo".to_string()];
         policy.trusted_tool_identities = vec![TrustedToolIdentity {
             path: "/usr/bin/git".to_string(),
@@ -3330,6 +3390,17 @@ mod tests {
     }
 
     #[test]
+    fn trusted_identity_self_check_is_quiet_when_no_trusted_gates_are_active() {
+        let mut policy = test_policy();
+        policy.allow_vcs_metadata_in_ai_context = false;
+        policy.allow_trusted_tools_in_ai_context = false;
+        policy.trusted_tools = vec!["git".to_string()];
+        policy.trusted_tool_identities = vec![];
+
+        assert!(trusted_identity_configuration_warning(&policy).is_none());
+    }
+
+    #[test]
     fn trusted_identity_self_check_is_quiet_when_identities_present() {
         let mut policy = test_policy();
         policy.trusted_tools = vec!["git".to_string()];
@@ -3341,6 +3412,27 @@ mod tests {
         }];
 
         assert!(trusted_identity_configuration_warning(&policy).is_none());
+    }
+
+    #[test]
+    fn policy_self_check_warning_is_throttled_for_duplicate_messages() {
+        let mut policy = test_policy();
+        policy.trusted_tools = vec!["git".to_string()];
+        policy.trusted_tool_identities = vec![];
+        let mut warning_state = None;
+
+        log_policy_self_checks(&policy, &mut warning_state, 1_000);
+        let (first_warning, first_ts) = warning_state.clone().expect("warning state should be set");
+        assert_eq!(first_ts, 1_000);
+
+        log_policy_self_checks(&policy, &mut warning_state, 1_050);
+        let (second_warning, second_ts) = warning_state.clone().expect("warning state should still be set");
+        assert_eq!(first_warning, second_warning);
+        assert_eq!(second_ts, 1_000);
+
+        log_policy_self_checks(&policy, &mut warning_state, 1_401);
+        let (_, third_ts) = warning_state.expect("warning state should remain set");
+        assert_eq!(third_ts, 1_401);
     }
 
     #[derive(Debug)]
@@ -4380,7 +4472,8 @@ fn main() {
     if let Err(err) = save_policy(&policy_path, &initial_policy) {
         eprintln!("[policy] failed to write initial policy snapshot: {}", err);
     }
-    log_policy_self_checks(&initial_policy);
+    let mut startup_policy_warning_state = None;
+    log_policy_self_checks(&initial_policy, &mut startup_policy_warning_state, now_ts());
 
     let initial_taint_ttl = initial_policy.taint_ttl_seconds_or_default();
     let global_policy = Arc::new(Mutex::new(initial_policy));
@@ -4415,6 +4508,7 @@ fn main() {
         let mut last_override_mtime = fs::metadata(&override_path_clone)
             .and_then(|meta| meta.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut policy_warning_state = None;
 
         loop {
             let mut changed = false;
@@ -4488,7 +4582,7 @@ fn main() {
 
             if changed {
                 combined_policy.temporary_overrides = runtime_overrides.clone();
-                log_policy_self_checks(&combined_policy);
+                log_policy_self_checks(&combined_policy, &mut policy_warning_state, now_ts());
                 if let Ok(mut lock) = policy_clone.lock() {
                     *lock = combined_policy.clone();
                     if let Ok(mut c) = cache_clone.lock() {
