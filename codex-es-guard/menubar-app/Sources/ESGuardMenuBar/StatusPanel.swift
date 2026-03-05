@@ -28,6 +28,41 @@ struct StatusPanel: View {
                     }
                 }
                 .padding(.horizontal)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("缓存水位")
+                        .font(.headline)
+
+                    if let metrics = viewModel.cacheMetrics {
+                        HStack {
+                            StatBox(
+                                title: "Ancestor",
+                                value: "\(metrics.ancestorCurrent)/\(metrics.ancestorHigh)",
+                                color: ApplePalette.info
+                            )
+                            StatBox(
+                                title: "Trusted",
+                                value: "\(metrics.trustedCurrent)/\(metrics.trustedHigh)",
+                                color: ApplePalette.accent
+                            )
+                            StatBox(
+                                title: "Taint",
+                                value: "\(metrics.taintCurrent)/\(metrics.taintHigh)",
+                                color: ApplePalette.warning
+                            )
+                        }
+
+                        let date = Date(timeIntervalSince1970: TimeInterval(metrics.ts))
+                        Text("当前值/高水位（更新于 \(date.formatted(date: .omitted, time: .standard))）")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    } else {
+                        Text("暂未收到守护指标日志，等待下一次采样（约 10 秒）")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding(.horizontal)
                 
                 Divider()
                 

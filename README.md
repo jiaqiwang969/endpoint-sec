@@ -201,6 +201,12 @@ es-guard-quarantine /path/to/file
   ],
   "auto_protect_home_digit_children": true,
   "trusted_tools": ["git", "jj", "cargo", "rustup", "rustc", "swift", "nix", "make", "go", "docker"],
+  "trusted_tool_identities": [
+    {
+      "path": "/absolute/path/to/git",
+      "signing_identifier": "com.example.git"
+    }
+  ],
   "ai_agent_patterns": ["codex", "claude", "claude-code"],
   "allow_vcs_metadata_in_ai_context": true,
   "allow_trusted_tools_in_ai_context": false,
@@ -219,7 +225,8 @@ es-guard-quarantine /path/to/file
 | `sensitive_zones` | 敏感目录前缀（受读门禁与外传门禁约束） | `[]` |
 | `sensitive_export_allow_zones` | 允许从敏感目录导出的目的地前缀 | `[]` |
 | `auto_protect_home_digit_children` | 自动保护 HOME 下首层“数字开头”目录（如 `~/01-agent`、`~/0x-lab`） | `true` |
-| `trusted_tools` | 受信任的工具进程名（兼容模式用） | git, jj, cargo, rustup 等 |
+| `trusted_tools` | 受信任工具名（第一层筛选） | git, jj, cargo, rustup 等 |
+| `trusted_tool_identities` | 受信任工具身份白名单（绝对路径 + 签名标识；与 `trusted_tools` 共同生效） | `[]`（首次激活会自动补最小集合） |
 | `ai_agent_patterns` | AI Agent 进程名匹配模式（子字符串匹配） | codex, claude, claude-code |
 | `allow_vcs_metadata_in_ai_context` | 是否允许 AI 的 git/jj 维护 `.git/.jj` 元数据（不包含工作区删除） | `true` |
 | `allow_trusted_tools_in_ai_context` | 是否允许 AI 上下文命中 trusted_tools 后放行 | `false` |
@@ -236,6 +243,9 @@ es-guard-quarantine /path/to/file
 - 所有放行请求都会写入 `~/.codex/es-guard/override-audit.jsonl` 审计日志（成功/失败都记录）
 - 默认兼顾效率与安全：允许 AI 的 git/jj 维护 `.git/.jj` 元数据，但 `git rm/git clean` 这类工作区删除仍会拦截
 - 默认更安全：AI 上下文不再因为 trusted_tools 自动放行；如需兼容可显式开启 `allow_trusted_tools_in_ai_context`
+- `trusted_tools` 与 `trusted_tool_identities` 是双因子校验；命中名称但身份不匹配会 fail-closed
+- 若检测到 `trusted_tool_identities` 为空，或缺少某些 `trusted_tools` 的身份条目，守护进程启动/热重载时会输出自检告警
+- Nix 激活脚本会在 `trusted_tool_identities` 缺失或空数组时，尝试自动写入最小签名身份（git/jj/cargo/xcrun 中可解析签名的工具）
 - 路径匹配使用“目录边界匹配”：`/Users/you/0` 不会匹配 `/Users/you/01-agent`
 - 如需覆盖新建的 `0x-*`/`01-*` 目录，开启 `auto_protect_home_digit_children` 更稳妥
 - `trusted_tools` 和 `ai_agent_patterns` 有内置默认值，无需在 JSON 中指定
@@ -249,6 +259,7 @@ es-guard-quarantine /path/to/file
 | `SENSITIVE_TRANSFER_OUT` | 从敏感目录向非允许区域复制/移动/链接 |
 | `TAINT_WRITE_OUT` | 进程读取敏感数据后，在污点 TTL 内向非允许区域写出 |
 | `EXEC_EXFIL_TOOL` | AI 上下文执行外传工具（如 curl/scp）被拒绝 |
+| `TRUST_IDENTITY_MISMATCH` | 命中 `trusted_tools` 但未通过 `trusted_tool_identities` 身份校验 |
 | `PROTECTED_ZONE_AI_DELETE` | AI 在受保护区发起删除/重命名（原有删除防护） |
 
 ### ES 能力边界与完整 C 方案

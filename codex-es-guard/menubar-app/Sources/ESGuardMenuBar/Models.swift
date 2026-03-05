@@ -227,6 +227,53 @@ struct LogLine: Identifiable {
     let isNoise: Bool
 }
 
+struct GuardCacheMetrics: Equatable {
+    let ts: Int
+    let ancestorCurrent: Int
+    let ancestorHigh: Int
+    let trustedCurrent: Int
+    let trustedHigh: Int
+    let taintCurrent: Int
+    let taintHigh: Int
+
+    static func parse(from text: String) -> GuardCacheMetrics? {
+        let prefix = "[METRIC] cache-watermark "
+        guard text.hasPrefix(prefix) else { return nil }
+
+        let payload = text.dropFirst(prefix.count)
+        var kv: [Substring: Substring] = [:]
+        for token in payload.split(separator: " ") {
+            let parts = token.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { return nil }
+            kv[parts[0]] = parts[1]
+        }
+
+        guard let tsText = kv["ts"], let ts = Int(tsText) else { return nil }
+        guard let ancestor = parseCurrentHighPair(kv["ancestor"]) else { return nil }
+        guard let trusted = parseCurrentHighPair(kv["trusted"]) else { return nil }
+        guard let taint = parseCurrentHighPair(kv["taint"]) else { return nil }
+
+        return GuardCacheMetrics(
+            ts: ts,
+            ancestorCurrent: ancestor.current,
+            ancestorHigh: ancestor.high,
+            trustedCurrent: trusted.current,
+            trustedHigh: trusted.high,
+            taintCurrent: taint.current,
+            taintHigh: taint.high
+        )
+    }
+
+    private static func parseCurrentHighPair(_ value: Substring?) -> (current: Int, high: Int)? {
+        guard let value else { return nil }
+        let parts = value.split(separator: "/", maxSplits: 1)
+        guard parts.count == 2, let current = Int(parts[0]), let high = Int(parts[1]) else {
+            return nil
+        }
+        return (current, high)
+    }
+}
+
 // 图表数据模型
 struct AgentStats: Identifiable {
     let id = UUID()

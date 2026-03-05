@@ -412,6 +412,7 @@ final class ESGuardViewModel: ObservableObject {
     @Published var daemonActionInProgress: Bool = false
     @Published var daemonCurrentAction: DaemonActionKind? = nil
     @Published var logLines: [LogLine] = []
+    @Published var cacheMetrics: GuardCacheMetrics? = nil
     
     // 全局真实统计数据 (不限于内存里的前 N 条)
     @Published var totalIntercepts: Int = 0
@@ -483,6 +484,7 @@ final class ESGuardViewModel: ObservableObject {
         loadRecords()
         loadPolicy()
         loadLastDenial()
+        loadLatestCacheMetrics()
     }
     
     func acknowledgeRecords() {
@@ -691,6 +693,9 @@ final class ESGuardViewModel: ObservableObject {
                 if self.logLines.count > 200 {
                     self.logLines.removeFirst(self.logLines.count - 200)
                 }
+                if let latestMetrics = newLines.compactMap({ GuardCacheMetrics.parse(from: $0.text) }).last {
+                    self.cacheMetrics = latestMetrics
+                }
             }
         }
     }
@@ -780,6 +785,22 @@ final class ESGuardViewModel: ObservableObject {
         } else {
             self.lastDenial = "暂无最新拦截记录"
         }
+    }
+
+    private func loadLatestCacheMetrics() {
+        guard let text = try? String(contentsOfFile: logPath, encoding: .utf8) else {
+            cacheMetrics = nil
+            return
+        }
+
+        for line in text.split(separator: "\n").reversed() {
+            if let metrics = GuardCacheMetrics.parse(from: String(line)) {
+                cacheMetrics = metrics
+                return
+            }
+        }
+
+        cacheMetrics = nil
     }
 
     private func normalizedAbsolutePath(from rawPath: String) -> String? {

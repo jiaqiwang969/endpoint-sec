@@ -229,6 +229,58 @@
                 EXISTING_TRUSTED_IDENTITY_REQUIRE_CDHASH=$(${pkgs.jq}/bin/jq -c '.trusted_identity_require_cdhash // null' "$POLICY_FILE" 2>/dev/null || echo "null")
               fi
 
+              # Fail-closed guard: when trusted_tool_identities is missing/empty,
+              # initialize a minimal signed identity set so git/jj/cargo/xcrun metadata
+              # operations do not get stuck in TRUST_IDENTITY_MISMATCH.
+              DEFAULT_TRUSTED_TOOL_IDENTITIES="[]"
+              if [ "$EXISTING_TRUSTED_TOOL_IDENTITIES" = "null" ] || [ "$EXISTING_TRUSTED_TOOL_IDENTITIES" = "[]" ]; then
+                for TOOL in git jj cargo xcrun; do
+                  TOOL_PATH="$(command -v "$TOOL" 2>/dev/null || true)"
+                  if [ -z "$TOOL_PATH" ]; then
+                    continue
+                  fi
+
+                  CANONICAL_PATH="$TOOL_PATH"
+                  if [ -x /usr/bin/python3 ]; then
+                    CANONICAL_PATH="$(/usr/bin/python3 - "$TOOL_PATH" <<'PY'
+import os
+import sys
+print(os.path.realpath(sys.argv[1]))
+PY
+)"
+                  fi
+                  if [ ! -x "$CANONICAL_PATH" ]; then
+                    continue
+                  fi
+
+                  CODESIGN_REPORT="$(
+                    /usr/bin/codesign -dv --verbose=4 "$CANONICAL_PATH" 2>&1 || true
+                  )"
+                  SIGNING_IDENTIFIER="$(printf '%s\n' "$CODESIGN_REPORT" | /usr/bin/awk -F= '/^Identifier=/{print $2; exit}')"
+                  if [ -z "$SIGNING_IDENTIFIER" ]; then
+                    continue
+                  fi
+                  TEAM_IDENTIFIER="$(printf '%s\n' "$CODESIGN_REPORT" | /usr/bin/awk -F= '/^TeamIdentifier=/{print $2; exit}')"
+
+                  ENTRY="$(${pkgs.jq}/bin/jq -cn \
+                    --arg path "$CANONICAL_PATH" \
+                    --arg signingIdentifier "$SIGNING_IDENTIFIER" \
+                    --arg teamIdentifier "$TEAM_IDENTIFIER" \
+                    '{path: $path, signing_identifier: $signingIdentifier}
+                     + (if ($teamIdentifier | length) > 0 and $teamIdentifier != "not set"
+                        then {team_identifier: $teamIdentifier}
+                        else {}
+                        end)'
+                  )"
+                  DEFAULT_TRUSTED_TOOL_IDENTITIES="$(${pkgs.jq}/bin/jq -cn \
+                    --argjson current "$DEFAULT_TRUSTED_TOOL_IDENTITIES" \
+                    --argjson entry "$ENTRY" \
+                    '$current + [$entry]'
+                  )"
+                done
+                DEFAULT_TRUSTED_TOOL_IDENTITIES="$(${pkgs.jq}/bin/jq -c 'unique_by(.path)' <<<"$DEFAULT_TRUSTED_TOOL_IDENTITIES")"
+              fi
+
               ${pkgs.jq}/bin/jq -n \
                 --argjson zones '${protectedZonesJson}' \
                 --argjson sensitiveZones '${sensitiveZonesJson}' \
@@ -244,6 +296,7 @@
                 --argjson allowTrustedInAi "$EXISTING_ALLOW_TRUSTED_IN_AI" \
                 --argjson autoProtectHomeDigitChildren "$EXISTING_AUTO_PROTECT_HOME_DIGIT_CHILDREN" \
                 --argjson trustedToolIdentities "$EXISTING_TRUSTED_TOOL_IDENTITIES" \
+                --argjson trustedToolIdentitiesDefault "$DEFAULT_TRUSTED_TOOL_IDENTITIES" \
                 --argjson trustedIdentityRequireCdhash "$EXISTING_TRUSTED_IDENTITY_REQUIRE_CDHASH" \
                 --argjson autoProtectHomeDigitChildrenDefault ${autoProtectHomeDigitChildrenDefaultJson} \
                 '({protected_zones: $zones, temporary_overrides: []}
@@ -261,7 +314,10 @@
                       end
                     )}
                   + (if $trustedTools == null then {} else {trusted_tools: $trustedTools} end)
-                  + (if $trustedToolIdentities == null then {} else {trusted_tool_identities: $trustedToolIdentities} end)
+                  + (if $trustedToolIdentities == null or $trustedToolIdentities == []
+                     then {trusted_tool_identities: $trustedToolIdentitiesDefault}
+                     else {trusted_tool_identities: $trustedToolIdentities}
+                     end)
                   + (if $aiPatterns == null then {} else {ai_agent_patterns: $aiPatterns} end)
                   + (if $allowVcsMetaInAi == null then {} else {allow_vcs_metadata_in_ai_context: $allowVcsMetaInAi} end)
                   + (if $allowTrustedInAi == null then {} else {allow_trusted_tools_in_ai_context: $allowTrustedInAi} end)

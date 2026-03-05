@@ -37,6 +37,8 @@ const OVERRIDE_CREATED_BY_SENSITIVE_READ_HELPER: &str = "es-guard-helper-sensiti
 const FFLAG_READ: i32 = 0x0000_0001;
 const FFLAG_WRITE: i32 = 0x0000_0002;
 const DEFAULT_TAINT_TTL_SECS: u64 = 600;
+const CACHE_WATERMARK_LOG_INTERVAL_SECS: u64 = 10;
+const TRUST_CACHE_PRUNE_INTERVAL_SECS: u64 = 10;
 const REASON_SENSITIVE_READ_NON_AI: &str = "SENSITIVE_READ_NON_AI";
 const REASON_SENSITIVE_TRANSFER_OUT: &str = "SENSITIVE_TRANSFER_OUT";
 const REASON_TAINT_WRITE_OUT: &str = "TAINT_WRITE_OUT";
@@ -230,6 +232,58 @@ struct CachedTrustedProcess {
     updated_at: u64,
 }
 
+#[derive(Debug, Default)]
+struct TrustedProcessCache {
+    entries: HashMap<ProcessIdentityKey, CachedTrustedProcess>,
+    last_prune_at: u64,
+}
+
+impl TrustedProcessCache {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn clear_all(&mut self) {
+        self.entries.clear();
+        self.last_prune_at = 0;
+    }
+
+    fn clear_pid(&mut self, pid: i32) {
+        invalidate_trust_cache_for_pid(&mut self.entries, pid);
+    }
+
+    fn maybe_prune(&mut self, now: u64) {
+        if self.last_prune_at != 0 && now.saturating_sub(self.last_prune_at) < TRUST_CACHE_PRUNE_INTERVAL_SECS {
+            return;
+        }
+        prune_trust_cache(&mut self.entries, now);
+        self.last_prune_at = now;
+    }
+
+    fn get(&mut self, key: &ProcessIdentityKey, now: u64) -> Option<CachedTrustedProcess> {
+        if let Some(entry) = self.entries.get(key).cloned() {
+            if now.saturating_sub(entry.updated_at) <= TRUST_CACHE_TTL_SECS {
+                self.maybe_prune(now);
+                return Some(entry);
+            }
+            self.entries.remove(key);
+        }
+        self.maybe_prune(now);
+        None
+    }
+
+    fn insert(&mut self, key: ProcessIdentityKey, decision: TrustedProcessDecision, now: u64) {
+        self.maybe_prune(now);
+        self.entries.insert(
+            key,
+            CachedTrustedProcess {
+                decision,
+                updated_at: now,
+            },
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TrustedProcessDecision {
     Trusted,
@@ -270,9 +324,11 @@ impl TaintState {
 
     fn set_ttl_secs(&mut self, ttl_secs: u64) {
         self.ttl_secs = ttl_secs;
+        self.prune_expired(now_ts());
     }
 
     fn mark(&mut self, pid: i32, ts: u64) {
+        self.prune_expired(ts);
         self.touched.insert(pid, ts);
     }
 
@@ -280,6 +336,35 @@ impl TaintState {
         self.touched
             .get(&pid)
             .is_some_and(|ts| now.saturating_sub(*ts) <= self.ttl_secs)
+    }
+
+    fn clear_pid(&mut self, pid: i32) {
+        self.touched.remove(&pid);
+    }
+
+    fn prune_expired(&mut self, now: u64) {
+        self.touched
+            .retain(|_, ts| now.saturating_sub(*ts) <= self.ttl_secs);
+    }
+
+    fn len(&self) -> usize {
+        self.touched.len()
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct CacheWatermarkHighs {
+    ancestor: usize,
+    trusted: usize,
+    taint: usize,
+}
+
+impl CacheWatermarkHighs {
+    fn update(&mut self, ancestor: usize, trusted: usize, taint: usize) -> (usize, usize, usize) {
+        self.ancestor = self.ancestor.max(ancestor);
+        self.trusted = self.trusted.max(trusted);
+        self.taint = self.taint.max(taint);
+        (self.ancestor, self.trusted, self.taint)
     }
 }
 
@@ -1623,6 +1708,93 @@ fn is_system_temp(path: &str, home: &str) -> bool {
         || path.ends_with(".DS_Store")
 }
 
+fn trusted_identity_configuration_warning(policy: &SecurityPolicy) -> Option<String> {
+    if policy.trusted_tools.is_empty() {
+        return None;
+    }
+
+    if policy.trusted_tool_identities.is_empty() {
+        return Some(format!(
+            "[WARN] trusted_tools is configured ({} entries) but trusted_tool_identities is empty; trusted checks will fail-closed. This can deny git/jj metadata writes with TRUST_IDENTITY_MISMATCH. Run nix switch/make to refresh policy defaults or set trusted_tool_identities in ~/.codex/es_policy.json.",
+            policy.trusted_tools.len()
+        ));
+    }
+
+    let missing_tools = policy
+        .trusted_tools
+        .iter()
+        .filter(|tool| policy.trusted_identity_candidates_for_process(tool.as_str()).is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing_tools.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "[WARN] trusted_tool_identities is missing entries for trusted_tools [{}]; these tools will fail-closed with TRUST_IDENTITY_MISMATCH. Add matching identities or remove them from trusted_tools.",
+        missing_tools.join(", ")
+    ))
+}
+
+fn log_policy_self_checks(policy: &SecurityPolicy) {
+    if let Some(warning) = trusted_identity_configuration_warning(policy) {
+        eprintln!("{}", warning);
+    }
+}
+
+fn is_safe_taint_device_path(path: &str) -> bool {
+    matches!(path, "/dev/null" | "/dev/tty" | "/dev/dtracehelper")
+}
+
+fn format_cache_watermark_log(
+    ts: u64,
+    ancestor_current: usize,
+    ancestor_high: usize,
+    trusted_current: usize,
+    trusted_high: usize,
+    taint_current: usize,
+    taint_high: usize,
+) -> String {
+    format!(
+        "[METRIC] cache-watermark ts={} ancestor={}/{} trusted={}/{} taint={}/{}",
+        ts, ancestor_current, ancestor_high, trusted_current, trusted_high, taint_current, taint_high
+    )
+}
+
+fn emit_cache_watermark_log(
+    ancestor_cache: &Arc<Mutex<HashMap<i32, CachedAncestor>>>,
+    trust_cache: &Arc<Mutex<TrustedProcessCache>>,
+    taint_state: &Arc<Mutex<TaintState>>,
+    highs: &mut CacheWatermarkHighs,
+) {
+    let ancestor_current = {
+        let cache = ancestor_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.len()
+    };
+    let trusted_current = {
+        let cache = trust_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.len()
+    };
+    let taint_current = {
+        let taint = taint_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        taint.len()
+    };
+    let (ancestor_high, trusted_high, taint_high) =
+        highs.update(ancestor_current, trusted_current, taint_current);
+    println!(
+        "{}",
+        format_cache_watermark_log(
+            now_ts(),
+            ancestor_current,
+            ancestor_high,
+            trusted_current,
+            trusted_high,
+            taint_current,
+            taint_high
+        )
+    );
+}
+
 fn log_denial(home: &str, record: &DenialRecord) {
     let guard_dir = match ensure_guard_dirs(home) {
         Ok(dir) => dir,
@@ -1977,6 +2149,7 @@ fn exe_name(path: &str) -> &str {
 /// Returns (is_ai_context, ai_ancestor_name).
 fn find_ai_ancestor(pid: i32, policy: &SecurityPolicy, cache: &mut HashMap<i32, CachedAncestor>) -> Option<String> {
     let ts = now_ts();
+    cache.retain(|_, cached| ts.saturating_sub(cached.updated_at) <= CACHE_TTL_SECS);
     let mut current = pid;
     let mut depth = 0;
 
@@ -2197,16 +2370,30 @@ fn invalidate_trust_cache_for_pid(cache: &mut HashMap<ProcessIdentityKey, Cached
     cache.retain(|key, _| key.pid != pid);
 }
 
-fn clear_trust_cache_for_exec(trust_cache: &Arc<Mutex<HashMap<ProcessIdentityKey, CachedTrustedProcess>>>, pid: i32) {
+fn clear_process_state_for_pid(
+    pid: i32,
+    ancestor_cache: &mut HashMap<i32, CachedAncestor>,
+    trust_cache: &mut TrustedProcessCache,
+    taint_state: &mut TaintState,
+) {
+    if pid <= 0 {
+        return;
+    }
+    ancestor_cache.remove(&pid);
+    trust_cache.clear_pid(pid);
+    taint_state.clear_pid(pid);
+}
+
+fn clear_trust_cache_for_exec(trust_cache: &Arc<Mutex<TrustedProcessCache>>, pid: i32) {
     let mut cache = trust_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    invalidate_trust_cache_for_pid(&mut cache, pid);
+    cache.clear_pid(pid);
 }
 
 fn evaluate_trusted_process(
     pid: i32,
     process_name: &str,
     policy: &SecurityPolicy,
-    trust_cache: &Arc<Mutex<HashMap<ProcessIdentityKey, CachedTrustedProcess>>>,
+    trust_cache: &Arc<Mutex<TrustedProcessCache>>,
 ) -> TrustedProcessDecision {
     let now = now_ts();
 
@@ -2214,8 +2401,7 @@ fn evaluate_trusted_process(
     if let Some(key) = key.as_ref() {
         let cached = {
             let mut cache = trust_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            prune_trust_cache(&mut cache, now);
-            cache.get(key).cloned()
+            cache.get(key, now)
         };
         if let Some(entry) = cached {
             return entry.decision.clone();
@@ -2234,14 +2420,7 @@ fn evaluate_trusted_process(
     let decision = evaluate_trusted_process_from_path(process_name, &executable_path, policy);
     if let Some(key) = key {
         let mut cache = trust_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        prune_trust_cache(&mut cache, now);
-        cache.insert(
-            key,
-            CachedTrustedProcess {
-                decision: decision.clone(),
-                updated_at: now,
-            },
-        );
+        cache.insert(key, decision.clone(), now);
     }
     decision
 }
@@ -2463,6 +2642,7 @@ fn should_deny_tainted_write(
     policy: &SecurityPolicy,
 ) -> bool {
     taint.is_tainted(pid, now)
+        && !is_safe_taint_device_path(target)
         && !policy.is_sensitive_export_allowed(target)
         && !policy.is_sensitive_path(target)
         && !should_allow_vcs_metadata_tainted_write(target, process_name, trusted_process, policy)
@@ -2509,7 +2689,7 @@ fn should_deny(
     home: &str,
     policy: &SecurityPolicy,
     cache: &mut HashMap<i32, CachedAncestor>,
-    trust_cache: &Arc<Mutex<HashMap<ProcessIdentityKey, CachedTrustedProcess>>>,
+    trust_cache: &Arc<Mutex<TrustedProcessCache>>,
 ) -> Option<GateDenyDecision> {
     // 1. Not in protected zone → ALLOW
     if !policy.is_protected(path, home) {
@@ -2798,6 +2978,16 @@ mod tests {
     }
 
     #[test]
+    fn taint_state_prune_expired_entries_keeps_recent_entries() {
+        let mut taint = TaintState::new(60);
+        taint.mark(100, 1_000);
+        taint.mark(200, 1_150);
+        taint.prune_expired(1_200);
+        assert!(!taint.is_tainted(100, 1_200));
+        assert!(taint.is_tainted(200, 1_200));
+    }
+
+    #[test]
     fn tainted_process_write_outside_allow_zone_is_denied() {
         let policy = test_sensitive_policy();
         let mut taint = TaintState::new(600);
@@ -2843,6 +3033,58 @@ mod tests {
             &taint,
             &policy
         ));
+    }
+
+    #[test]
+    fn tainted_write_to_safe_device_paths_is_allowed() {
+        let policy = test_sensitive_policy();
+        let mut taint = TaintState::new(600);
+        taint.mark(100, 1_000);
+
+        for path in ["/dev/null", "/dev/tty", "/dev/dtracehelper"] {
+            assert!(!should_deny_tainted_write(
+                100,
+                path,
+                Some("bash"),
+                &TrustedProcessDecision::NotTrusted,
+                1_100,
+                &taint,
+                &policy
+            ));
+        }
+    }
+
+    #[test]
+    fn tainted_write_to_other_device_paths_is_denied() {
+        let policy = test_sensitive_policy();
+        let mut taint = TaintState::new(600);
+        taint.mark(100, 1_000);
+        assert!(should_deny_tainted_write(
+            100,
+            "/dev/random",
+            Some("bash"),
+            &TrustedProcessDecision::NotTrusted,
+            1_100,
+            &taint,
+            &policy
+        ));
+    }
+
+    #[test]
+    fn cache_watermark_highs_track_peaks() {
+        let mut highs = CacheWatermarkHighs::default();
+        assert_eq!(highs.update(2, 3, 1), (2, 3, 1));
+        assert_eq!(highs.update(1, 4, 0), (2, 4, 1));
+        assert_eq!(highs.update(8, 2, 9), (8, 4, 9));
+    }
+
+    #[test]
+    fn cache_watermark_log_format_is_stable() {
+        let line = format_cache_watermark_log(1_770_000_000, 2, 5, 3, 7, 1, 4);
+        assert_eq!(
+            line,
+            "[METRIC] cache-watermark ts=1770000000 ancestor=2/5 trusted=3/7 taint=1/4"
+        );
     }
 
     #[test]
@@ -2937,6 +3179,47 @@ mod tests {
         let feedback = build_denial_feedback("/Users/jqwang", &record);
         assert!(feedback.contains("identity verification failed"));
         assert!(feedback.contains("trusted_tool_identities"));
+    }
+
+    #[test]
+    fn trusted_identity_self_check_warns_when_identities_missing() {
+        let mut policy = test_policy();
+        policy.trusted_tools = vec!["git".to_string(), "cargo".to_string()];
+        policy.trusted_tool_identities = vec![];
+
+        let warning = trusted_identity_configuration_warning(&policy).expect("warning expected");
+        assert!(warning.contains("trusted_tool_identities"));
+        assert!(warning.contains("TRUST_IDENTITY_MISMATCH"));
+    }
+
+    #[test]
+    fn trusted_identity_self_check_warns_when_some_tools_are_uncovered() {
+        let mut policy = test_policy();
+        policy.trusted_tools = vec!["git".to_string(), "cargo".to_string()];
+        policy.trusted_tool_identities = vec![TrustedToolIdentity {
+            path: "/usr/bin/git".to_string(),
+            signing_identifier: "com.apple.git".to_string(),
+            team_identifier: None,
+            cdhash: None,
+        }];
+
+        let warning = trusted_identity_configuration_warning(&policy).expect("warning expected");
+        assert!(warning.contains("cargo"));
+        assert!(warning.contains("TRUST_IDENTITY_MISMATCH"));
+    }
+
+    #[test]
+    fn trusted_identity_self_check_is_quiet_when_identities_present() {
+        let mut policy = test_policy();
+        policy.trusted_tools = vec!["git".to_string()];
+        policy.trusted_tool_identities = vec![TrustedToolIdentity {
+            path: "/usr/bin/git".to_string(),
+            signing_identifier: "com.apple.git".to_string(),
+            team_identifier: Some("not-real-team".to_string()),
+            cdhash: None,
+        }];
+
+        assert!(trusted_identity_configuration_warning(&policy).is_none());
     }
 
     #[derive(Debug)]
@@ -3804,6 +4087,129 @@ mod tests {
     }
 
     #[test]
+    fn trusted_process_cache_get_removes_expired_entry_without_full_prune() {
+        let key = ProcessIdentityKey {
+            pid: 321,
+            start_tvsec: 11,
+            start_tvusec: 22,
+            executable_path: "/usr/bin/git".to_string(),
+        };
+        let mut cache = TrustedProcessCache {
+            entries: HashMap::from([(
+                key.clone(),
+                CachedTrustedProcess {
+                    decision: TrustedProcessDecision::Trusted,
+                    updated_at: 1_000,
+                },
+            )]),
+            last_prune_at: 1_301,
+        };
+
+        let now = 1_301;
+        let decision = cache.get(&key, now);
+        assert!(decision.is_none());
+        assert!(!cache.entries.contains_key(&key));
+    }
+
+    #[test]
+    fn trusted_process_cache_periodic_prune_compacts_other_expired_entries() {
+        let fresh_key = ProcessIdentityKey {
+            pid: 111,
+            start_tvsec: 11,
+            start_tvusec: 22,
+            executable_path: "/usr/bin/git".to_string(),
+        };
+        let stale_key = ProcessIdentityKey {
+            pid: 222,
+            start_tvsec: 33,
+            start_tvusec: 44,
+            executable_path: "/usr/bin/xcrun".to_string(),
+        };
+        let now = 2_000;
+        let mut cache = TrustedProcessCache {
+            entries: HashMap::from([
+                (
+                    fresh_key.clone(),
+                    CachedTrustedProcess {
+                        decision: TrustedProcessDecision::Trusted,
+                        updated_at: now,
+                    },
+                ),
+                (
+                    stale_key.clone(),
+                    CachedTrustedProcess {
+                        decision: TrustedProcessDecision::Trusted,
+                        updated_at: now.saturating_sub(TRUST_CACHE_TTL_SECS + 1),
+                    },
+                ),
+            ]),
+            last_prune_at: now.saturating_sub(TRUST_CACHE_PRUNE_INTERVAL_SECS),
+        };
+
+        let decision = cache.get(&fresh_key, now);
+        assert!(decision.is_some());
+        assert!(!cache.entries.contains_key(&stale_key));
+    }
+
+    #[test]
+    fn clear_process_state_for_pid_removes_ancestor_trust_and_taint() {
+        let mut ancestor_cache = HashMap::new();
+        ancestor_cache.insert(
+            123,
+            CachedAncestor {
+                ai_ancestor: Some("codex".to_string()),
+                updated_at: 100,
+            },
+        );
+        ancestor_cache.insert(
+            456,
+            CachedAncestor {
+                ai_ancestor: None,
+                updated_at: 100,
+            },
+        );
+
+        let mut trust_cache = TrustedProcessCache::default();
+        trust_cache.entries.insert(
+            ProcessIdentityKey {
+                pid: 123,
+                start_tvsec: 11,
+                start_tvusec: 22,
+                executable_path: "/usr/bin/git".to_string(),
+            },
+            CachedTrustedProcess {
+                decision: TrustedProcessDecision::Trusted,
+                updated_at: 100,
+            },
+        );
+        trust_cache.entries.insert(
+            ProcessIdentityKey {
+                pid: 456,
+                start_tvsec: 33,
+                start_tvusec: 44,
+                executable_path: "/usr/bin/git".to_string(),
+            },
+            CachedTrustedProcess {
+                decision: TrustedProcessDecision::Trusted,
+                updated_at: 100,
+            },
+        );
+
+        let mut taint = TaintState::new(600);
+        taint.mark(123, 1_000);
+        taint.mark(456, 1_000);
+
+        clear_process_state_for_pid(123, &mut ancestor_cache, &mut trust_cache, &mut taint);
+
+        assert!(!ancestor_cache.contains_key(&123));
+        assert!(ancestor_cache.contains_key(&456));
+        assert!(trust_cache.entries.keys().all(|key| key.pid != 123));
+        assert!(trust_cache.entries.keys().any(|key| key.pid == 456));
+        assert!(!taint.is_tainted(123, 1_001));
+        assert!(taint.is_tainted(456, 1_001));
+    }
+
+    #[test]
     fn validate_override_request_origin_rejects_non_helper_process() {
         let policy = test_policy();
         let mut child = std::process::Command::new("sleep")
@@ -3853,14 +4259,14 @@ fn main() {
     if let Err(err) = save_policy(&policy_path, &initial_policy) {
         eprintln!("[policy] failed to write initial policy snapshot: {}", err);
     }
+    log_policy_self_checks(&initial_policy);
 
     let initial_taint_ttl = initial_policy.taint_ttl_seconds_or_default();
     let global_policy = Arc::new(Mutex::new(initial_policy));
 
     // Process ancestry cache (cleared on policy reload)
     let ancestor_cache: Arc<Mutex<HashMap<i32, CachedAncestor>>> = Arc::new(Mutex::new(HashMap::new()));
-    let trusted_process_cache: Arc<Mutex<HashMap<ProcessIdentityKey, CachedTrustedProcess>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let trusted_process_cache: Arc<Mutex<TrustedProcessCache>> = Arc::new(Mutex::new(TrustedProcessCache::default()));
     let taint_state = Arc::new(Mutex::new(TaintState::new(initial_taint_ttl)));
 
     // Policy hot-reload thread (1s polling)
@@ -3961,13 +4367,14 @@ fn main() {
 
             if changed {
                 combined_policy.temporary_overrides = runtime_overrides.clone();
+                log_policy_self_checks(&combined_policy);
                 if let Ok(mut lock) = policy_clone.lock() {
                     *lock = combined_policy.clone();
                     if let Ok(mut c) = cache_clone.lock() {
                         c.clear();
                     }
                     if let Ok(mut trust_cache) = trust_cache_clone.lock() {
-                        trust_cache.clear();
+                        trust_cache.clear_all();
                     }
                 }
                 if let Ok(mut taint) = taint_clone.lock() {
@@ -3986,6 +4393,22 @@ fn main() {
             }
 
             thread::sleep(Duration::from_secs(1));
+        }
+    });
+
+    let cache_metrics_clone = ancestor_cache.clone();
+    let trust_metrics_clone = trusted_process_cache.clone();
+    let taint_metrics_clone = taint_state.clone();
+    thread::spawn(move || {
+        let mut highs = CacheWatermarkHighs::default();
+        loop {
+            emit_cache_watermark_log(
+                &cache_metrics_clone,
+                &trust_metrics_clone,
+                &taint_metrics_clone,
+                &mut highs,
+            );
+            thread::sleep(Duration::from_secs(CACHE_WATERMARK_LOG_INTERVAL_SECS));
         }
     });
 
@@ -4162,6 +4585,16 @@ fn main() {
                 } else {
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
                 }
+            },
+            Some(Event::NotifyExit(_exit)) => {
+                let mut cache = safe_cache.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut trust_cache = safe_trust_cache
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                clear_process_state_for_pid(pid, &mut cache, &mut trust_cache, &mut taint);
+                taint.prune_expired(now_ts());
             },
             Some(Event::AuthCreate(create)) => {
                 let dest_path = match create.destination() {
@@ -4603,6 +5036,7 @@ fn main() {
     client
         .subscribe(&[
             es_event_type_t::ES_EVENT_TYPE_AUTH_OPEN,
+            es_event_type_t::ES_EVENT_TYPE_NOTIFY_EXIT,
             es_event_type_t::ES_EVENT_TYPE_AUTH_EXEC,
             es_event_type_t::ES_EVENT_TYPE_AUTH_CREATE,
             es_event_type_t::ES_EVENT_TYPE_AUTH_TRUNCATE,
