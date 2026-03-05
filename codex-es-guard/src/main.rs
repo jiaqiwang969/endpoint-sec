@@ -10,7 +10,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -39,6 +40,12 @@ const FFLAG_WRITE: i32 = 0x0000_0002;
 const DEFAULT_TAINT_TTL_SECS: u64 = 600;
 const CACHE_WATERMARK_LOG_INTERVAL_SECS: u64 = 10;
 const TRUST_CACHE_PRUNE_INTERVAL_SECS: u64 = 10;
+const SIGNATURE_CACHE_TTL_SECS: u64 = 3600;
+const SIGNATURE_ERROR_CACHE_TTL_SECS: u64 = 30;
+const SIGNATURE_CACHE_PRUNE_INTERVAL_SECS: u64 = 60;
+const SIGNATURE_REFRESH_QUEUE_BOUND: usize = 1024;
+const LOG_EVENT_QUEUE_BOUND: usize = 2048;
+const LOG_QUEUE_FULL_WARN_INTERVAL_SECS: u64 = 5;
 const POLICY_SELF_CHECK_WARNING_INTERVAL_SECS: u64 = 300;
 const REASON_SENSITIVE_READ_NON_AI: &str = "SENSITIVE_READ_NON_AI";
 const REASON_SENSITIVE_TRANSFER_OUT: &str = "SENSITIVE_TRANSFER_OUT";
@@ -46,6 +53,10 @@ const REASON_TAINT_WRITE_OUT: &str = "TAINT_WRITE_OUT";
 const REASON_EXEC_EXFIL_TOOL: &str = "EXEC_EXFIL_TOOL";
 const REASON_PROTECTED_ZONE_AI_DELETE: &str = "PROTECTED_ZONE_AI_DELETE";
 const REASON_TRUST_IDENTITY_MISMATCH: &str = "TRUST_IDENTITY_MISMATCH";
+const TRUST_SIGNATURE_PENDING_PREFIX: &str = "signature verification pending";
+
+static LOG_EVENT_TX: OnceLock<mpsc::SyncSender<GuardLogMessage>> = OnceLock::new();
+static LOG_QUEUE_FULL_LAST_WARN_TS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Deserialize)]
 struct OverrideRequest {
@@ -239,9 +250,22 @@ struct CachedTrustedProcess {
     updated_at: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CachedBinarySignature {
+    signature: Result<BinaryCodeSignature, String>,
+    updated_at: u64,
+}
+
 #[derive(Debug, Default)]
 struct TrustedProcessCache {
     entries: HashMap<ProcessIdentityKey, CachedTrustedProcess>,
+    last_prune_at: u64,
+}
+
+#[derive(Debug, Default)]
+struct BinarySignatureCache {
+    entries: HashMap<String, CachedBinarySignature>,
+    in_flight: HashSet<String>,
     last_prune_at: u64,
 }
 
@@ -288,6 +312,63 @@ impl TrustedProcessCache {
                 updated_at: now,
             },
         );
+    }
+}
+
+impl BinarySignatureCache {
+    fn entry_ttl_secs(entry: &CachedBinarySignature) -> u64 {
+        if entry.signature.is_err() {
+            SIGNATURE_ERROR_CACHE_TTL_SECS
+        } else {
+            SIGNATURE_CACHE_TTL_SECS
+        }
+    }
+
+    fn clear_all(&mut self) {
+        self.entries.clear();
+        self.in_flight.clear();
+        self.last_prune_at = 0;
+    }
+
+    fn maybe_prune(&mut self, now: u64) {
+        if self.last_prune_at != 0 && now.saturating_sub(self.last_prune_at) < SIGNATURE_CACHE_PRUNE_INTERVAL_SECS {
+            return;
+        }
+        self.entries
+            .retain(|_, entry| now.saturating_sub(entry.updated_at) <= Self::entry_ttl_secs(entry));
+        self.last_prune_at = now;
+    }
+
+    fn get(&mut self, canonical_path: &str, now: u64) -> Option<Result<BinaryCodeSignature, String>> {
+        if let Some(entry) = self.entries.get(canonical_path).cloned() {
+            if now.saturating_sub(entry.updated_at) <= Self::entry_ttl_secs(&entry) {
+                self.maybe_prune(now);
+                return Some(entry.signature);
+            }
+            self.entries.remove(canonical_path);
+        }
+        self.maybe_prune(now);
+        None
+    }
+
+    fn insert(&mut self, canonical_path: String, signature: Result<BinaryCodeSignature, String>, now: u64) {
+        self.maybe_prune(now);
+        self.entries.insert(
+            canonical_path.clone(),
+            CachedBinarySignature {
+                signature,
+                updated_at: now,
+            },
+        );
+        self.in_flight.remove(canonical_path.as_str());
+    }
+
+    fn should_enqueue_refresh(&mut self, canonical_path: &str) -> bool {
+        self.in_flight.insert(canonical_path.to_string())
+    }
+
+    fn cancel_in_flight_refresh(&mut self, canonical_path: &str) {
+        self.in_flight.remove(canonical_path);
     }
 }
 
@@ -690,7 +771,7 @@ fn verify_regular_file(file: &File, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct DenialRecord {
     ts: u64,
     op: String,
@@ -737,7 +818,7 @@ struct OverrideAuditRecord {
     requester_process: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct TaintMarkRecord {
     ts: u64,
     path: String,
@@ -746,6 +827,12 @@ struct TaintMarkRecord {
     pid: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     ppid: Option<i32>,
+}
+
+#[derive(Debug)]
+enum GuardLogMessage {
+    Denial(DenialRecord),
+    TaintMark(TaintMarkRecord),
 }
 
 impl SecurityPolicy {
@@ -1889,7 +1976,67 @@ fn emit_cache_watermark_log(
     );
 }
 
+fn maybe_warn_log_queue_full(kind: &str) {
+    let now = now_ts();
+    let last_warn = LOG_QUEUE_FULL_LAST_WARN_TS.load(Ordering::Relaxed);
+    if now.saturating_sub(last_warn) < LOG_QUEUE_FULL_WARN_INTERVAL_SECS {
+        return;
+    }
+    if LOG_QUEUE_FULL_LAST_WARN_TS
+        .compare_exchange(last_warn, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        eprintln!("[log] async queue full; dropping {} event", kind);
+    }
+}
+
+fn process_log_message_sync(home: &str, message: GuardLogMessage) {
+    match message {
+        GuardLogMessage::Denial(record) => log_denial_sync(home, &record),
+        GuardLogMessage::TaintMark(record) => log_taint_mark_sync(home, &record),
+    }
+}
+
+fn enqueue_log_message_or_fallback(home: &str, message: GuardLogMessage) {
+    if let Some(tx) = LOG_EVENT_TX.get() {
+        let kind = match &message {
+            GuardLogMessage::Denial(_) => "denial",
+            GuardLogMessage::TaintMark(_) => "taint",
+        };
+        match tx.try_send(message) {
+            Ok(()) => {},
+            Err(mpsc::TrySendError::Full(_)) => maybe_warn_log_queue_full(kind),
+            Err(mpsc::TrySendError::Disconnected(message)) => process_log_message_sync(home, message),
+        }
+        return;
+    }
+
+    process_log_message_sync(home, message);
+}
+
+fn init_async_log_worker(home: &str) {
+    let (tx, rx) = mpsc::sync_channel::<GuardLogMessage>(LOG_EVENT_QUEUE_BOUND);
+    if LOG_EVENT_TX.set(tx).is_err() {
+        return;
+    }
+
+    let worker_home = home.to_string();
+    thread::spawn(move || {
+        while let Ok(message) = rx.recv() {
+            process_log_message_sync(worker_home.as_str(), message);
+        }
+    });
+}
+
 fn log_denial(home: &str, record: &DenialRecord) {
+    enqueue_log_message_or_fallback(home, GuardLogMessage::Denial(record.clone()));
+}
+
+fn log_taint_mark(home: &str, record: &TaintMarkRecord) {
+    enqueue_log_message_or_fallback(home, GuardLogMessage::TaintMark(record.clone()));
+}
+
+fn log_denial_sync(home: &str, record: &DenialRecord) {
     let guard_dir = match ensure_guard_dirs(home) {
         Ok(dir) => dir,
         Err(err) => {
@@ -1922,7 +2069,7 @@ fn log_denial(home: &str, record: &DenialRecord) {
     }
 }
 
-fn log_taint_mark(home: &str, record: &TaintMarkRecord) {
+fn log_taint_mark_sync(home: &str, record: &TaintMarkRecord) {
     let guard_dir = match ensure_guard_dirs(home) {
         Ok(dir) => dir,
         Err(err) => {
@@ -2376,32 +2523,13 @@ fn normalized_expected_trusted_identity_path(entry: &TrustedToolIdentity) -> Opt
     normalize_absolute_path(entry.path.as_str()).map(|path| trim_trailing_slashes(&path).to_string())
 }
 
-fn evaluate_trusted_process_from_path(
+fn trusted_identity_decision_from_signature(
     process_name: &str,
-    executable_path: &str,
-    policy: &SecurityPolicy,
+    canonical_path: &str,
+    actual_signature: &BinaryCodeSignature,
+    expected_identities: &[&TrustedToolIdentity],
+    require_cdhash: bool,
 ) -> TrustedProcessDecision {
-    if !policy.is_trusted_tool(process_name) {
-        return TrustedProcessDecision::NotTrusted;
-    }
-
-    let expected_identities = policy.trusted_identity_candidates_for_process(process_name);
-    if expected_identities.is_empty() {
-        return TrustedProcessDecision::IdentityMismatch(format!(
-            "trusted tool {} has no trusted_tool_identities entry",
-            process_name
-        ));
-    }
-
-    let canonical_path = match canonicalize_executable_path_strict(executable_path) {
-        Ok(path) => path,
-        Err(err) => return TrustedProcessDecision::IdentityMismatch(err),
-    };
-    let actual_signature = match read_binary_signature(&canonical_path) {
-        Ok(signature) => signature,
-        Err(err) => return TrustedProcessDecision::IdentityMismatch(err),
-    };
-
     let matched = expected_identities.iter().any(|entry| {
         let expected_path = match normalized_expected_trusted_identity_path(entry) {
             Some(path) => path,
@@ -2418,7 +2546,7 @@ fn evaluate_trusted_process_from_path(
         }
 
         let expected_cdhash = entry.cdhash.as_ref().map(|value| value.to_lowercase());
-        if policy.trusted_identity_require_cdhash && expected_cdhash.is_none() {
+        if require_cdhash && expected_cdhash.is_none() {
             return false;
         }
         if let Some(expected) = expected_cdhash {
@@ -2456,11 +2584,173 @@ fn evaluate_trusted_process_from_path(
         actual_signature.signing_identifier,
         actual_signature
             .team_identifier
+            .clone()
             .unwrap_or_else(|| "not set".to_string()),
         expected_paths,
         expected_signing_ids,
         expected_team_ids
     ))
+}
+
+#[cfg(test)]
+fn evaluate_trusted_process_from_path(
+    process_name: &str,
+    executable_path: &str,
+    policy: &SecurityPolicy,
+) -> TrustedProcessDecision {
+    if !policy.is_trusted_tool(process_name) {
+        return TrustedProcessDecision::NotTrusted;
+    }
+
+    let expected_identities = policy.trusted_identity_candidates_for_process(process_name);
+    if expected_identities.is_empty() {
+        return TrustedProcessDecision::IdentityMismatch(format!(
+            "trusted tool {} has no trusted_tool_identities entry",
+            process_name
+        ));
+    }
+
+    let canonical_path = match canonicalize_executable_path_strict(executable_path) {
+        Ok(path) => path,
+        Err(err) => return TrustedProcessDecision::IdentityMismatch(err),
+    };
+    let actual_signature = match read_binary_signature(&canonical_path) {
+        Ok(signature) => signature,
+        Err(err) => return TrustedProcessDecision::IdentityMismatch(err),
+    };
+    trusted_identity_decision_from_signature(
+        process_name,
+        canonical_path.as_str(),
+        &actual_signature,
+        expected_identities.as_slice(),
+        policy.trusted_identity_require_cdhash,
+    )
+}
+
+fn request_signature_refresh_if_needed(
+    canonical_path: &str,
+    signature_cache: &Arc<Mutex<BinarySignatureCache>>,
+    signature_refresh_tx: &mpsc::SyncSender<String>,
+) {
+    let should_enqueue = {
+        let mut cache = signature_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.should_enqueue_refresh(canonical_path)
+    };
+    if !should_enqueue {
+        return;
+    }
+
+    if let Err(err) = signature_refresh_tx.try_send(canonical_path.to_string()) {
+        let mut cache = signature_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.cancel_in_flight_refresh(canonical_path);
+        match err {
+            mpsc::TrySendError::Full(_) => {
+                eprintln!(
+                    "[trust] signature refresh queue is full; skipping enqueue for {}",
+                    canonical_path
+                );
+            },
+            mpsc::TrySendError::Disconnected(_) => {
+                eprintln!(
+                    "[trust] signature refresh worker disconnected; unable to verify {}",
+                    canonical_path
+                );
+            },
+        }
+    }
+}
+
+fn warm_signature_cache_for_policy(
+    policy: &SecurityPolicy,
+    signature_cache: &Arc<Mutex<BinarySignatureCache>>,
+    signature_refresh_tx: &mpsc::SyncSender<String>,
+) {
+    let mut prewarm_paths = HashSet::new();
+    for entry in policy.trusted_tool_identities.iter() {
+        if let Some(path) = normalized_expected_trusted_identity_path(entry) {
+            prewarm_paths.insert(path);
+        }
+    }
+
+    for path in prewarm_paths.into_iter() {
+        request_signature_refresh_if_needed(path.as_str(), signature_cache, signature_refresh_tx);
+    }
+}
+
+fn spawn_signature_refresh_worker(
+    signature_refresh_rx: mpsc::Receiver<String>,
+    signature_cache: Arc<Mutex<BinarySignatureCache>>,
+) {
+    thread::spawn(move || {
+        while let Ok(canonical_path) = signature_refresh_rx.recv() {
+            let signature = read_binary_signature(canonical_path.as_str());
+            let now = now_ts();
+            let mut cache = signature_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert(canonical_path, signature, now);
+        }
+    });
+}
+
+fn evaluate_trusted_process_from_path_nonblocking(
+    process_name: &str,
+    executable_path: &str,
+    policy: &SecurityPolicy,
+    signature_cache: &Arc<Mutex<BinarySignatureCache>>,
+    signature_refresh_tx: &mpsc::SyncSender<String>,
+) -> TrustedProcessDecision {
+    if !policy.is_trusted_tool(process_name) {
+        return TrustedProcessDecision::NotTrusted;
+    }
+
+    let expected_identities = policy.trusted_identity_candidates_for_process(process_name);
+    if expected_identities.is_empty() {
+        return TrustedProcessDecision::IdentityMismatch(format!(
+            "trusted tool {} has no trusted_tool_identities entry",
+            process_name
+        ));
+    }
+
+    let canonical_path = match canonicalize_executable_path_strict(executable_path) {
+        Ok(path) => path,
+        Err(err) => return TrustedProcessDecision::IdentityMismatch(err),
+    };
+
+    let now = now_ts();
+    let cached_signature = {
+        let mut cache = signature_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.get(canonical_path.as_str(), now)
+    };
+
+    let actual_signature = match cached_signature {
+        Some(Ok(signature)) => signature,
+        Some(Err(err)) => return TrustedProcessDecision::IdentityMismatch(err),
+        None => {
+            request_signature_refresh_if_needed(
+                canonical_path.as_str(),
+                signature_cache,
+                signature_refresh_tx,
+            );
+            return TrustedProcessDecision::IdentityMismatch(format!(
+                "{}: {}",
+                TRUST_SIGNATURE_PENDING_PREFIX, canonical_path
+            ));
+        },
+    };
+
+    trusted_identity_decision_from_signature(
+        process_name,
+        canonical_path.as_str(),
+        &actual_signature,
+        expected_identities.as_slice(),
+        policy.trusted_identity_require_cdhash,
+    )
+}
+
+fn trust_decision_is_signature_pending(decision: &TrustedProcessDecision) -> bool {
+    matches!(
+        decision,
+        TrustedProcessDecision::IdentityMismatch(reason) if reason.starts_with(TRUST_SIGNATURE_PENDING_PREFIX)
+    )
 }
 
 fn prune_trust_cache(cache: &mut HashMap<ProcessIdentityKey, CachedTrustedProcess>, now: u64) {
@@ -2495,6 +2785,8 @@ fn evaluate_trusted_process(
     process_name: &str,
     policy: &SecurityPolicy,
     trust_cache: &Arc<Mutex<TrustedProcessCache>>,
+    signature_cache: &Arc<Mutex<BinarySignatureCache>>,
+    signature_refresh_tx: &mpsc::SyncSender<String>,
 ) -> TrustedProcessDecision {
     let now = now_ts();
 
@@ -2518,8 +2810,17 @@ fn evaluate_trusted_process(
             ))
         },
     };
-    let decision = evaluate_trusted_process_from_path(process_name, &executable_path, policy);
+    let decision = evaluate_trusted_process_from_path_nonblocking(
+        process_name,
+        &executable_path,
+        policy,
+        signature_cache,
+        signature_refresh_tx,
+    );
     if let Some(key) = key {
+        if trust_decision_is_signature_pending(&decision) {
+            return decision;
+        }
         let mut cache = trust_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.insert(key, decision.clone(), now);
     }
@@ -2795,6 +3096,8 @@ fn should_deny(
     policy: &SecurityPolicy,
     cache: &mut HashMap<i32, CachedAncestor>,
     trust_cache: &Arc<Mutex<TrustedProcessCache>>,
+    signature_cache: &Arc<Mutex<BinarySignatureCache>>,
+    signature_refresh_tx: &mpsc::SyncSender<String>,
 ) -> Option<GateDenyDecision> {
     // 1. Not in protected zone → ALLOW
     if !policy.is_protected(path, home) {
@@ -2813,7 +3116,14 @@ fn should_deny(
     };
 
     let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
-    let trusted_process = evaluate_trusted_process(pid, process_name.as_str(), policy, trust_cache);
+    let trusted_process = evaluate_trusted_process(
+        pid,
+        process_name.as_str(),
+        policy,
+        trust_cache,
+        signature_cache,
+        signature_refresh_tx,
+    );
 
     // 4. Keep git/jj commit internals workable while still blocking `git rm` on working tree files.
     if should_allow_vcs_metadata_unlink_in_ai_context(path, Some(process_name.as_str()), &trusted_process, policy) {
@@ -4365,6 +4675,101 @@ mod tests {
     }
 
     #[test]
+    fn binary_signature_cache_get_removes_expired_entry_without_full_prune() {
+        let path = "/usr/bin/git".to_string();
+        let now: u64 = 5_000;
+        let mut cache = BinarySignatureCache {
+            entries: HashMap::from([(
+                path.clone(),
+                CachedBinarySignature {
+                    signature: Ok(BinaryCodeSignature {
+                        signing_identifier: "com.apple.git".to_string(),
+                        team_identifier: Some("APPLE123".to_string()),
+                        cdhash: Some("abcd".to_string()),
+                    }),
+                    updated_at: now.saturating_sub(SIGNATURE_CACHE_TTL_SECS + 1),
+                },
+            )]),
+            in_flight: HashSet::new(),
+            last_prune_at: now,
+        };
+
+        let signature = cache.get(path.as_str(), now);
+        assert!(signature.is_none());
+        assert!(!cache.entries.contains_key(path.as_str()));
+    }
+
+    #[test]
+    fn binary_signature_cache_in_flight_refresh_is_debounced_and_released() {
+        let path = "/usr/bin/git";
+        let now = 100;
+        let mut cache = BinarySignatureCache::default();
+
+        assert!(cache.should_enqueue_refresh(path));
+        assert!(!cache.should_enqueue_refresh(path));
+
+        cache.cancel_in_flight_refresh(path);
+        assert!(cache.should_enqueue_refresh(path));
+
+        cache.insert(
+            path.to_string(),
+            Ok(BinaryCodeSignature {
+                signing_identifier: "com.apple.git".to_string(),
+                team_identifier: Some("APPLE123".to_string()),
+                cdhash: Some("abcd".to_string()),
+            }),
+            now,
+        );
+        assert!(cache.should_enqueue_refresh(path));
+    }
+
+    #[test]
+    fn binary_signature_cache_expires_error_entries_faster_than_success_entries() {
+        let now: u64 = 8_000;
+        let ok_path = "/usr/bin/git".to_string();
+        let err_path = "/usr/bin/xcrun".to_string();
+        let stale_age = SIGNATURE_ERROR_CACHE_TTL_SECS + 1;
+        let mut cache = BinarySignatureCache {
+            entries: HashMap::from([
+                (
+                    ok_path.clone(),
+                    CachedBinarySignature {
+                        signature: Ok(BinaryCodeSignature {
+                            signing_identifier: "com.apple.git".to_string(),
+                            team_identifier: Some("APPLE123".to_string()),
+                            cdhash: Some("abcd".to_string()),
+                        }),
+                        updated_at: now.saturating_sub(stale_age),
+                    },
+                ),
+                (
+                    err_path.clone(),
+                    CachedBinarySignature {
+                        signature: Err("codesign failed".to_string()),
+                        updated_at: now.saturating_sub(stale_age),
+                    },
+                ),
+            ]),
+            in_flight: HashSet::new(),
+            last_prune_at: 0,
+        };
+
+        assert!(cache.get(err_path.as_str(), now).is_none());
+        assert!(cache.entries.contains_key(ok_path.as_str()));
+        assert!(!cache.entries.contains_key(err_path.as_str()));
+    }
+
+    #[test]
+    fn signature_pending_decision_uses_stable_prefix_marker() {
+        let pending =
+            TrustedProcessDecision::IdentityMismatch(format!("{}: /usr/bin/git", TRUST_SIGNATURE_PENDING_PREFIX));
+        assert!(trust_decision_is_signature_pending(&pending));
+        assert!(!trust_decision_is_signature_pending(
+            &TrustedProcessDecision::IdentityMismatch("codesign failed".to_string())
+        ));
+    }
+
+    #[test]
     fn clear_process_state_for_pid_removes_ancestor_trust_and_taint() {
         let mut ancestor_cache = HashMap::new();
         ancestor_cache.insert(
@@ -4477,16 +4882,34 @@ fn main() {
 
     let initial_taint_ttl = initial_policy.taint_ttl_seconds_or_default();
     let global_policy = Arc::new(Mutex::new(initial_policy));
+    init_async_log_worker(&home);
 
     // Process ancestry cache (cleared on policy reload)
     let ancestor_cache: Arc<Mutex<HashMap<i32, CachedAncestor>>> = Arc::new(Mutex::new(HashMap::new()));
     let trusted_process_cache: Arc<Mutex<TrustedProcessCache>> = Arc::new(Mutex::new(TrustedProcessCache::default()));
+    let binary_signature_cache: Arc<Mutex<BinarySignatureCache>> =
+        Arc::new(Mutex::new(BinarySignatureCache::default()));
+    let (signature_refresh_tx, signature_refresh_rx) = mpsc::sync_channel::<String>(SIGNATURE_REFRESH_QUEUE_BOUND);
     let taint_state = Arc::new(Mutex::new(TaintState::new(initial_taint_ttl)));
+    spawn_signature_refresh_worker(signature_refresh_rx, binary_signature_cache.clone());
+    {
+        let policy_snapshot = global_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        warm_signature_cache_for_policy(
+            &policy_snapshot,
+            &binary_signature_cache,
+            &signature_refresh_tx,
+        );
+    }
 
     // Policy hot-reload thread (1s polling)
     let policy_clone = global_policy.clone();
     let cache_clone = ancestor_cache.clone();
     let trust_cache_clone = trusted_process_cache.clone();
+    let signature_cache_clone = binary_signature_cache.clone();
+    let signature_refresh_tx_clone = signature_refresh_tx.clone();
     let taint_clone = taint_state.clone();
     let path_clone = policy_path.clone();
     let override_path_clone = runtime_override_path.clone();
@@ -4592,6 +5015,14 @@ fn main() {
                         trust_cache.clear_all();
                     }
                 }
+                if let Ok(mut signature_cache) = signature_cache_clone.lock() {
+                    signature_cache.clear_all();
+                }
+                warm_signature_cache_for_policy(
+                    &combined_policy,
+                    &signature_cache_clone,
+                    &signature_refresh_tx_clone,
+                );
                 if let Ok(mut taint) = taint_clone.lock() {
                     taint.set_ttl_secs(combined_policy.taint_ttl_seconds_or_default());
                 }
@@ -4630,9 +5061,11 @@ fn main() {
     let safe_policy = AssertUnwindSafe(global_policy);
     let safe_cache = AssertUnwindSafe(ancestor_cache);
     let safe_trust_cache = AssertUnwindSafe(trusted_process_cache);
+    let safe_signature_cache = AssertUnwindSafe(binary_signature_cache);
     let safe_taint = AssertUnwindSafe(taint_state);
     let home_for_handler = home.clone();
     let guard_pid = std::process::id() as i32;
+    let signature_refresh_tx_for_handler = signature_refresh_tx.clone();
 
     let handler = move |client: &mut Client<'_>, message: Message| {
         let current_policy = safe_policy
@@ -4724,6 +5157,8 @@ fn main() {
                         process_name.as_str(),
                         &current_policy,
                         &safe_trust_cache.0,
+                        &safe_signature_cache.0,
+                        &signature_refresh_tx_for_handler,
                     );
                     let deny_taint_write = {
                         let taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4882,6 +5317,8 @@ fn main() {
                     process_name.as_str(),
                     &current_policy,
                     &safe_trust_cache.0,
+                    &safe_signature_cache.0,
+                    &signature_refresh_tx_for_handler,
                 );
                 let deny_taint = {
                     let taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4936,6 +5373,8 @@ fn main() {
                     process_name.as_str(),
                     &current_policy,
                     &safe_trust_cache.0,
+                    &safe_signature_cache.0,
+                    &signature_refresh_tx_for_handler,
                 );
                 let deny_taint = {
                     let taint = safe_taint.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -5140,6 +5579,8 @@ fn main() {
                     &current_policy,
                     &mut cache,
                     &safe_trust_cache.0,
+                    &safe_signature_cache.0,
+                    &signature_refresh_tx_for_handler,
                 ) {
                     let zone = current_policy.matched_zone(&path, &home_for_handler);
                     println!(
@@ -5217,6 +5658,8 @@ fn main() {
                         process_name.as_str(),
                         &current_policy,
                         &safe_trust_cache.0,
+                        &safe_signature_cache.0,
+                        &signature_refresh_tx_for_handler,
                     );
                     if should_allow_vcs_metadata_rename_in_ai_context(
                         &source_path,
