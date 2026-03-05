@@ -296,7 +296,7 @@ PY
                   --argjson discovered "$DISCOVERED_TRUSTED_TOOL_IDENTITIES" \
                   --argjson existingTools "$EXISTING_IDENTITY_TOOLS" \
                   '$discovered
-                   | map(select(($existingTools | index(.tool)) == null))
+                   | map(select(.tool as $tool | ($existingTools | index($tool)) == null))
                    | map(del(.tool))'
                 )"
                 MERGED_TRUSTED_TOOL_IDENTITIES="$(${pkgs.jq}/bin/jq -cn \
