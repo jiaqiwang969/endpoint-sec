@@ -1,5 +1,5 @@
 {
-  description = "macOS Endpoint Security Rust bindings + codex-es-guard daemon";
+  description = "macOS Endpoint Security Rust bindings + agentsmith-rs daemon";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
@@ -12,13 +12,13 @@
         (system: f (import nixpkgs { inherit system; }));
 
       buildGuard = pkgs: pkgs.rustPlatform.buildRustPackage {
-        pname = "codex-es-guard";
+        pname = "agentsmith-rs";
         version = "0.1.0";
         src = ./.;
 
         cargoLock.lockFile = ./Cargo.lock;
 
-        cargoBuildFlags = [ "-p" "codex-es-guard" ];
+        cargoBuildFlags = [ "-p" "agentsmith-rs" ];
         doCheck = false;
 
         buildInputs = [ pkgs.libiconv ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
@@ -27,7 +27,7 @@
 
         nativeBuildInputs = [ pkgs.pkg-config ];
 
-        # EndpointSecurity.framework is linked by endpoint-sec-sys via #[link].
+        # EndpointSecurity.framework is linked by agentsmith-rs-sys via #[link].
         # We only need to add the system framework search path for the target,
         # NOT for build scripts (which would fail trying to find it).
         preConfigure = ''
@@ -41,10 +41,10 @@
         '';
 
         postInstall = ''
-          install -Dm644 codex-es-guard/es.plist $out/share/codex-es-guard/es.plist
-          install -Dm755 codex-es-guard/es-guard-override $out/bin/es-guard-override
-          install -Dm755 codex-es-guard/es-guard-quarantine $out/bin/es-guard-quarantine
-          install -Dm755 codex-es-guard/es-guard-egress $out/bin/es-guard-egress
+          install -Dm644 agentsmith-rs/agentsmith.plist $out/share/agentsmith-rs/agentsmith.plist
+          install -Dm755 agentsmith-rs/agentsmith-override $out/bin/agentsmith-override
+          install -Dm755 agentsmith-rs/agentsmith-quarantine $out/bin/agentsmith-quarantine
+          install -Dm755 agentsmith-rs/agentsmith-egress $out/bin/agentsmith-egress
         '';
 
         meta = {
@@ -57,23 +57,23 @@
     {
       packages = forDarwinSystems (pkgs: {
         default = buildGuard pkgs;
-        codex-es-guard = buildGuard pkgs;
+        agentsmith-rs = buildGuard pkgs;
       });
 
       darwinModules.default = { config, lib, pkgs, ... }:
         let
-          cfg = config.services.codex-es-guard;
-          daemonLabel = "dev.codex-es-guard";
-          signedBin = "/usr/local/bin/codex-es-guard";
+          cfg = config.services.agentsmith-rs;
+          daemonLabel = "dev.agentsmith-rs";
+          signedBin = "/usr/local/bin/agentsmith-rs";
           homeDir = if pkgs.stdenv.isDarwin then "/Users/${cfg.user}" else "/home/${cfg.user}";
         in {
-          options.services.codex-es-guard = {
-            enable = lib.mkEnableOption "codex-es-guard file protection daemon";
+          options.services.agentsmith-rs = {
+            enable = lib.mkEnableOption "agentsmith-rs file protection daemon";
 
             package = lib.mkOption {
               type = lib.types.package;
               default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-              description = "The codex-es-guard package to use.";
+              description = "The agentsmith-rs package to use.";
             };
 
             user = lib.mkOption {
@@ -98,7 +98,7 @@
             sensitiveExportAllowZones = lib.mkOption {
               type = lib.types.listOf lib.types.str;
               default = [];
-              example = [ "/Users/me/.codex/es-guard/quarantine" ];
+              example = [ "/Users/me/.agentsmith-rs/guard/quarantine" ];
               description = "Allowed destination prefixes for exporting files from sensitive zones.";
             };
 
@@ -145,14 +145,14 @@
           };
 
           config = lib.mkIf cfg.enable {
-            launchd.daemons.codex-es-guard = {
+            launchd.daemons.agentsmith-rs = {
               serviceConfig = {
                 Label = daemonLabel;
                 ProgramArguments = [ signedBin ];
                 RunAtLoad = true;
                 KeepAlive = true;
-                StandardOutPath = "/tmp/codex-es-guard.log";
-                StandardErrorPath = "/tmp/codex-es-guard.err";
+                StandardOutPath = "/tmp/agentsmith-rs.log";
+                StandardErrorPath = "/tmp/agentsmith-rs.err";
                 EnvironmentVariables = {
                   HOME = homeDir;
                 };
@@ -161,7 +161,7 @@
 
             system.activationScripts.postActivation.text = let
               # Nix is the source of truth for static guard zones and DLP gate knobs.
-              # temporary_overrides is runtime-only and managed by codex-es-guard root helper.
+              # temporary_overrides is runtime-only and managed by agentsmith-rs root helper.
               protectedZonesJson = builtins.toJSON cfg.protectedZones;
               sensitiveZonesJson = builtins.toJSON cfg.sensitiveZones;
               sensitiveExportAllowZonesJson = builtins.toJSON cfg.sensitiveExportAllowZones;
@@ -173,10 +173,16 @@
               autoProtectHomeDigitChildrenDefaultJson =
                 if cfg.autoProtectHomeDigitChildrenDefault then "true" else "false";
             in ''
-              # === codex-es-guard activation ===
-              ES_BIN="${cfg.package}/bin/codex-es-guard"
-              ES_PLIST="${cfg.package}/share/codex-es-guard/es.plist"
+              # === agentsmith-rs activation ===
+              ES_BIN="${cfg.package}/bin/agentsmith-rs"
+              ES_PLIST="${cfg.package}/share/agentsmith-rs/agentsmith.plist"
               SIGNED="${signedBin}"
+              NEW_POLICY_DIR="${homeDir}/.agentsmith-rs"
+              NEW_POLICY_FILE="$NEW_POLICY_DIR/policy.json"
+              NEW_GUARD_DIR="$NEW_POLICY_DIR/guard"
+              OLD_POLICY_DIR="${homeDir}/.codex"
+              OLD_POLICY_FILE="$OLD_POLICY_DIR/es_policy.json"
+              OLD_GUARD_DIR="$OLD_POLICY_DIR/es-guard"
 
               # Copy and codesign (Nix store is read-only)
               if [ -f "$ES_BIN" ]; then
@@ -184,31 +190,51 @@
                 cp -f "$ES_BIN" "$SIGNED"
                 chmod 755 "$SIGNED"
                 /usr/bin/codesign --entitlements "$ES_PLIST" --force -s - "$SIGNED" 2>/dev/null || true
-                echo "codex-es-guard: signed at $SIGNED"
+                echo "agentsmith-rs: signed at $SIGNED"
 
                 # Install helper script
-                cp -f "${cfg.package}/bin/es-guard-override" /usr/local/bin/es-guard-override
-                chmod 755 /usr/local/bin/es-guard-override
-                cp -f "${cfg.package}/bin/es-guard-quarantine" /usr/local/bin/es-guard-quarantine
-                chmod 755 /usr/local/bin/es-guard-quarantine
-                cp -f "${cfg.package}/bin/es-guard-egress" /usr/local/bin/es-guard-egress
-                chmod 755 /usr/local/bin/es-guard-egress
+                cp -f "${cfg.package}/bin/agentsmith-override" /usr/local/bin/agentsmith-override
+                chmod 755 /usr/local/bin/agentsmith-override
+                cp -f "${cfg.package}/bin/agentsmith-quarantine" /usr/local/bin/agentsmith-quarantine
+                chmod 755 /usr/local/bin/agentsmith-quarantine
+                cp -f "${cfg.package}/bin/agentsmith-egress" /usr/local/bin/agentsmith-egress
+                chmod 755 /usr/local/bin/agentsmith-egress
 
                 # Restart daemon so it picks up the freshly signed binary
                 /bin/launchctl kickstart -k system/${daemonLabel} 2>/dev/null || true
-                echo "codex-es-guard: daemon restarted"
+                echo "agentsmith-rs: daemon restarted"
               fi
 
               # Root-owned runtime override store (authoritative).
-              RUNTIME_OVERRIDE_DIR="/var/db/codex-es-guard"
+              RUNTIME_OVERRIDE_DIR="/var/db/agentsmith-rs"
               mkdir -p "$RUNTIME_OVERRIDE_DIR"
               chown root:wheel "$RUNTIME_OVERRIDE_DIR"
               chmod 700 "$RUNTIME_OVERRIDE_DIR"
 
+              # One-time migration from legacy Codex guard paths.
+              mkdir -p "$NEW_POLICY_DIR" "$NEW_GUARD_DIR"
+              chown ${cfg.user}:staff "$NEW_POLICY_DIR" "$NEW_GUARD_DIR"
+              chmod 700 "$NEW_POLICY_DIR" "$NEW_GUARD_DIR"
+
+              if [ -f "$OLD_POLICY_FILE" ] && [ ! -f "$NEW_POLICY_FILE" ]; then
+                cp -f "$OLD_POLICY_FILE" "$NEW_POLICY_FILE"
+                chown ${cfg.user}:staff "$NEW_POLICY_FILE"
+                chmod 600 "$NEW_POLICY_FILE"
+              fi
+
+              if [ -d "$OLD_GUARD_DIR" ]; then
+                if command -v rsync >/dev/null 2>&1; then
+                  rsync -a --ignore-existing "$OLD_GUARD_DIR"/ "$NEW_GUARD_DIR"/ || true
+                else
+                  cp -R -n "$OLD_GUARD_DIR"/. "$NEW_GUARD_DIR"/ 2>/dev/null || true
+                fi
+                chown ${cfg.user}:staff "$NEW_GUARD_DIR" || true
+              fi
+
               # Sync static policy from Nix config (always update).
               # temporary_overrides field is mirror-only and filled by daemon.
-              POLICY_DIR="${homeDir}/.codex"
-              POLICY_FILE="$POLICY_DIR/es_policy.json"
+              POLICY_DIR="$NEW_POLICY_DIR"
+              POLICY_FILE="$NEW_POLICY_FILE"
               mkdir -p "$POLICY_DIR"
               chown ${cfg.user}:staff "$POLICY_DIR"
 
@@ -349,15 +375,15 @@ PY
                   + (if $auditOnlyMode == null then {} else {audit_only_mode: $auditOnlyMode} end))' \
                 > "$POLICY_FILE"
               chown ${cfg.user}:staff "$POLICY_FILE"
-              echo "codex-es-guard: policy synced ($(echo '${protectedZonesJson}' | ${pkgs.jq}/bin/jq length) zones)"
+              echo "agentsmith-rs: policy synced ($(echo '${protectedZonesJson}' | ${pkgs.jq}/bin/jq length) zones)"
 
               # Ensure log directory
-              mkdir -p "${homeDir}/.codex/es-guard"
-              chown ${cfg.user}:staff "${homeDir}/.codex/es-guard"
-              chmod 700 "${homeDir}/.codex/es-guard"
-              mkdir -p "${homeDir}/.codex/es-guard/override-requests"
-              chown ${cfg.user}:staff "${homeDir}/.codex/es-guard/override-requests"
-              chmod 700 "${homeDir}/.codex/es-guard/override-requests"
+              mkdir -p "$NEW_GUARD_DIR"
+              chown ${cfg.user}:staff "$NEW_GUARD_DIR"
+              chmod 700 "$NEW_GUARD_DIR"
+              mkdir -p "$NEW_GUARD_DIR/override-requests"
+              chown ${cfg.user}:staff "$NEW_GUARD_DIR/override-requests"
+              chmod 700 "$NEW_GUARD_DIR/override-requests"
             '';
           };
         };

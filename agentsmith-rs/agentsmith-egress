@@ -1,0 +1,257 @@
+#!/bin/bash
+# agentsmith-egress: manage outbound allowlist rules for agentsmith-rs Plan C
+# Usage:
+#   agentsmith-egress --print-rules [--allowlist FILE] [--user USER] [--anchor NAME]
+#   agentsmith-egress --apply --allowlist FILE [--user USER] [--anchor NAME]
+#   agentsmith-egress --flush [--anchor NAME]
+
+set -euo pipefail
+umask 077
+
+MODE="print"
+ALLOWLIST_FILE=""
+TARGET_USER=""
+ANCHOR_NAME="com.apple/agentsmith-rs-egress"
+
+STATE_DIR="/var/db/agentsmith-rs"
+TABLE_NAME="codex_guard_allow"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  agentsmith-egress --print-rules [--allowlist FILE] [--user USER] [--anchor NAME]
+  agentsmith-egress --apply --allowlist FILE [--user USER] [--anchor NAME]
+  agentsmith-egress --flush [--anchor NAME]
+
+Options:
+  --print-rules        Print rendered PF rules (default mode)
+  --apply              Apply PF anchor rules using an explicit allowlist file
+  --flush              Flush PF anchor rules and remove persisted state
+  --allowlist FILE     Path to allowlist text file (required for --apply)
+  --user USER          Restrict rules to this macOS user (default: current user)
+  --anchor NAME        PF anchor name (default: com.apple/agentsmith-rs-egress)
+  --help               Show this help
+
+Allowlist file format:
+  - One domain/IP/CIDR per line
+  - Empty lines and lines starting with "#" are ignored
+EOF
+}
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Error: $MODE requires root privileges (try sudo)." >&2
+        exit 1
+    fi
+}
+
+sanitize_anchor_for_filename() {
+    echo "$1" | tr '/: ' '___'
+}
+
+is_ip_or_cidr() {
+    local value="$1"
+    if [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+        return 0
+    fi
+    if [[ "$value" =~ ^[0-9A-Fa-f:]+(/[0-9]{1,3})?$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+resolve_domain() {
+    local domain="$1"
+    if command -v dig >/dev/null 2>&1; then
+        dig +short A "$domain" 2>/dev/null || true
+        dig +short AAAA "$domain" 2>/dev/null || true
+        return 0
+    fi
+    if command -v host >/dev/null 2>&1; then
+        host -t A "$domain" 2>/dev/null | awk '/has address/ {print $4}' || true
+        host -t AAAA "$domain" 2>/dev/null | awk '/has IPv6 address/ {print $5}' || true
+        return 0
+    fi
+    return 1
+}
+
+collect_allow_targets() {
+    local allowlist_file="$1"
+    if [ ! -f "$allowlist_file" ]; then
+        echo "Error: allowlist file not found: $allowlist_file" >&2
+        return 1
+    fi
+
+    local raw_line trimmed
+    local -a resolved=()
+
+    while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+        trimmed="${raw_line#"${raw_line%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+        if [ -z "$trimmed" ]; then
+            continue
+        fi
+        if [[ "$trimmed" == \#* ]]; then
+            continue
+        fi
+
+        if is_ip_or_cidr "$trimmed"; then
+            resolved+=("$trimmed")
+            continue
+        fi
+
+        local -a looked_up=()
+        while IFS= read -r resolved_ip; do
+            if [ -n "$resolved_ip" ] && is_ip_or_cidr "$resolved_ip"; then
+                looked_up+=("$resolved_ip")
+            fi
+        done < <(resolve_domain "$trimmed")
+
+        if [ "${#looked_up[@]}" -eq 0 ]; then
+            echo "Warning: no IP resolved for domain: $trimmed" >&2
+            continue
+        fi
+        resolved+=("${looked_up[@]}")
+    done < "$allowlist_file"
+
+    if [ "${#resolved[@]}" -eq 0 ]; then
+        echo "Error: allowlist resolved to zero IP targets: $allowlist_file" >&2
+        return 1
+    fi
+
+    printf '%s\n' "${resolved[@]}" | awk '!seen[$0]++'
+}
+
+render_rules() {
+    local table_file="$1"
+    local user_name="$2"
+    cat <<EOF
+table <${TABLE_NAME}> persist file "${table_file}"
+pass out quick proto { tcp udp } from any to { 127.0.0.1, ::1 } user ${user_name}
+pass out quick proto { tcp udp } from any to any port 53 user ${user_name}
+pass out quick proto { tcp udp } from any to <${TABLE_NAME}> user ${user_name}
+block drop out quick user ${user_name}
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --print-rules)
+            MODE="print"
+            ;;
+        --apply)
+            MODE="apply"
+            ;;
+        --flush)
+            MODE="flush"
+            ;;
+        --allowlist)
+            shift
+            if [ $# -eq 0 ]; then
+                echo "Error: --allowlist requires a file path" >&2
+                usage
+                exit 1
+            fi
+            ALLOWLIST_FILE="$1"
+            ;;
+        --user)
+            shift
+            if [ $# -eq 0 ]; then
+                echo "Error: --user requires a value" >&2
+                usage
+                exit 1
+            fi
+            TARGET_USER="$1"
+            ;;
+        --anchor)
+            shift
+            if [ $# -eq 0 ]; then
+                echo "Error: --anchor requires a value" >&2
+                usage
+                exit 1
+            fi
+            ANCHOR_NAME="$1"
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Error: unknown option: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+if [ -z "$TARGET_USER" ]; then
+    TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+fi
+
+if [ -z "$TARGET_USER" ]; then
+    echo "Error: failed to determine target user; pass --user explicitly." >&2
+    exit 1
+fi
+
+ANCHOR_SAFE="$(sanitize_anchor_for_filename "$ANCHOR_NAME")"
+TABLE_FILE="${STATE_DIR}/egress-${ANCHOR_SAFE}.table"
+RULES_FILE="${STATE_DIR}/egress-${ANCHOR_SAFE}.pf"
+
+case "$MODE" in
+    print)
+        if [ -n "$ALLOWLIST_FILE" ] && [ -f "$ALLOWLIST_FILE" ]; then
+            TMP_TABLE="$(mktemp)"
+            trap 'rm -f "$TMP_TABLE"' EXIT
+            collect_allow_targets "$ALLOWLIST_FILE" > "$TMP_TABLE"
+            render_rules "$TMP_TABLE" "$TARGET_USER"
+            rm -f "$TMP_TABLE"
+            trap - EXIT
+            exit 0
+        fi
+        if [ -f "$RULES_FILE" ]; then
+            cat "$RULES_FILE"
+            exit 0
+        fi
+        cat <<EOF
+# No applied rules found. Example:
+#   agentsmith-egress --apply --allowlist /path/to/allowlist.txt --user ${TARGET_USER}
+# Guardrail: --apply is refused unless --allowlist FILE is provided explicitly.
+$(render_rules "/var/db/agentsmith-rs/egress-${ANCHOR_SAFE}.table" "$TARGET_USER")
+EOF
+        ;;
+    apply)
+        if [ -z "$ALLOWLIST_FILE" ]; then
+            echo "Error: --apply requires --allowlist FILE (explicit allowlist is mandatory)." >&2
+            exit 1
+        fi
+        require_root
+        mkdir -p "$STATE_DIR"
+        chmod 700 "$STATE_DIR"
+
+        TMP_TABLE="$(mktemp "${STATE_DIR}/.egress-table.XXXXXX")"
+        TMP_RULES="$(mktemp "${STATE_DIR}/.egress-rules.XXXXXX")"
+        trap 'rm -f "$TMP_TABLE" "$TMP_RULES"' EXIT
+
+        collect_allow_targets "$ALLOWLIST_FILE" > "$TMP_TABLE"
+        mv -f "$TMP_TABLE" "$TABLE_FILE"
+
+        render_rules "$TABLE_FILE" "$TARGET_USER" > "$TMP_RULES"
+        mv -f "$TMP_RULES" "$RULES_FILE"
+
+        /sbin/pfctl -E >/dev/null 2>&1 || true
+        /sbin/pfctl -a "$ANCHOR_NAME" -f "$RULES_FILE"
+        echo "Applied egress rules: anchor=${ANCHOR_NAME} user=${TARGET_USER} allowlist=${ALLOWLIST_FILE}"
+        trap - EXIT
+        ;;
+    flush)
+        require_root
+        /sbin/pfctl -a "$ANCHOR_NAME" -F all >/dev/null 2>&1 || true
+        rm -f "$TABLE_FILE" "$RULES_FILE"
+        echo "Flushed egress rules: anchor=${ANCHOR_NAME}"
+        ;;
+    *)
+        echo "Error: unknown mode: $MODE" >&2
+        exit 1
+        ;;
+esac

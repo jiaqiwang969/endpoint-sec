@@ -3,17 +3,17 @@ version = "0.4.3"
 authors = ["HarfangLab Rust Team"]
 license = "MIT OR Apache-2.0"
 edition = "2021"
-repository = "https://github.com/HarfangLab/endpoint-sec"
+repository = "https://github.com/jiaqiwang969/AgentSmith-RS"
 rust-version = "1.76"
 
 [workspace]
-members = ["endpoint-sec/", "endpoint-sec-sys/", "codex-es-guard/"]
+members = ["agentsmith-rs-core/", "agentsmith-rs-sys/", "agentsmith-rs/"]
 resolver = "2"
 
 [workspace.dependencies]
 # In workspace
-endpoint-sec = { version = "0.4.0", path = "./endpoint-sec" }
-endpoint-sec-sys = { version = "0.4.0", path = "./endpoint-sec-sys" }
+agentsmith-rs-core = { version = "0.4.0", path = "./agentsmith-rs-core" }
+agentsmith-rs-sys = { version = "0.4.0", path = "./agentsmith-rs-sys" }
 
 # External - Required
 block2 = "0.6"

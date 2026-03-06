@@ -3,6 +3,38 @@
 version = 3
 
 [[package]]
+name = "agentsmith-rs"
+version = "0.1.0"
+dependencies = [
+ "agentsmith-rs-core",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "agentsmith-rs-core"
+version = "0.4.3"
+dependencies = [
+ "agentsmith-rs-sys",
+ "libc",
+ "mach2",
+ "static_assertions",
+ "sysinfo",
+ "trybuild",
+]
+
+[[package]]
+name = "agentsmith-rs-sys"
+version = "0.4.3"
+dependencies = [
+ "block2",
+ "libc",
+ "mach2",
+ "objc2",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22,16 +54,6 @@ name = "cfg-if"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
-
-[[package]]
-name = "codex-es-guard"
-version = "0.1.0"
-dependencies = [
- "endpoint-sec",
- "libc",
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "core-foundation-sys"
@@ -87,28 +109,6 @@ name = "either"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7fcaabb2fef8c910e7f4c7ce9f67a1283a1715879a7c230ca9d6d1ae31f16d91"
-
-[[package]]
-name = "endpoint-sec"
-version = "0.4.3"
-dependencies = [
- "endpoint-sec-sys",
- "libc",
- "mach2",
- "static_assertions",
- "sysinfo",
- "trybuild",
-]
-
-[[package]]
-name = "endpoint-sec-sys"
-version = "0.4.3"
-dependencies = [
- "block2",
- "libc",
- "mach2",
- "objc2",
-]
 
 [[package]]
 name = "equivalent"

@@ -1,0 +1,321 @@
+#!/bin/bash
+# agentsmith-override: request temporary file deletion/move override via root helper queue
+# Usage:
+#   agentsmith-override [--minutes N] <path>
+#   agentsmith-override --sensitive-read [--minutes N] <path>
+#   agentsmith-override --remove <path>
+#   agentsmith-override --clear
+#   agentsmith-override --list
+
+set -euo pipefail
+umask 077
+
+POLICY="$HOME/.agentsmith-rs/policy.json"
+FEEDBACK="$HOME/.agentsmith-rs/guard/last_denial.txt"
+REQUEST_DIR="$HOME/.agentsmith-rs/guard/override-requests"
+DEFAULT_MINUTES="${AGENTSMITH_OVERRIDE_MINUTES:-3}"
+MAX_MINUTES="${AGENTSMITH_OVERRIDE_MAX_MINUTES:-30}"
+WAIT_SECS="${AGENTSMITH_OVERRIDE_WAIT_SECS:-8}"
+MAX_PATH_LEN="${AGENTSMITH_OVERRIDE_MAX_PATH_LEN:-4096}"
+
+usage() {
+    echo "Usage:"
+    echo "  agentsmith-override [--minutes N] <path>"
+    echo "  agentsmith-override --sensitive-read [--minutes N] <path>"
+    echo "  agentsmith-override --remove <path>"
+    echo "  agentsmith-override --clear"
+    echo "  agentsmith-override --list"
+    echo ""
+    echo "Tip: safer first step is agentsmith-quarantine <path> (move to ./temp)."
+    if [ -f "$FEEDBACK" ]; then
+        echo ""
+        echo "Last denial:"
+        cat "$FEEDBACK"
+    fi
+}
+
+normalize_path() {
+    local raw="$1"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$raw" <<'PYNORM'
+import os
+import sys
+
+target = sys.argv[1]
+if os.path.exists(target) or os.path.islink(target):
+    print(os.path.realpath(target))
+else:
+    print(os.path.abspath(target))
+PYNORM
+    else
+        echo "$raw"
+    fi
+}
+
+make_request_id() {
+    local rand
+    rand="$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 8 || true)"
+    if [ -z "$rand" ]; then
+        rand="fallback"
+    fi
+    echo "$(date +%s)-$$-${rand}"
+}
+
+wait_for_response() {
+    local response_file="$1"
+    local timeout_secs="$2"
+    local expected_id="$3"
+    local deadline=$((SECONDS + timeout_secs))
+
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if [ -f "$response_file" ]; then
+            local response_id status message expires
+            response_id="$(jq -r '.id // empty' "$response_file" 2>/dev/null || echo "")"
+            status="$(jq -r '.status // "error"' "$response_file" 2>/dev/null || echo "error")"
+            message="$(jq -r '.message // ""' "$response_file" 2>/dev/null || echo "")"
+            expires="$(jq -r '.expires_at // empty' "$response_file" 2>/dev/null || true)"
+            rm -f "$response_file"
+            if [ -z "$response_id" ] || [ "$response_id" != "$expected_id" ]; then
+                echo "error"$'\n'"response id mismatch"$'\n'
+                return 0
+            fi
+            echo "$status"$'\n'"$message"$'\n'"$expires"
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+minutes=""
+target=""
+action="grant"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --minutes|-m)
+            shift
+            if [ $# -eq 0 ]; then
+                echo "Error: --minutes requires a value" >&2
+                usage
+                exit 1
+            fi
+            minutes="$1"
+            ;;
+        --no-expire)
+            minutes="0"
+            ;;
+        --sensitive-read)
+            action="grant-sensitive-read"
+            ;;
+        --remove)
+            action="remove"
+            shift
+            if [ $# -eq 0 ]; then
+                echo "Error: --remove requires a path" >&2
+                usage
+                exit 1
+            fi
+            target="$1"
+            ;;
+        --clear)
+            action="clear"
+            ;;
+        --list)
+            action="list"
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        -* )
+            echo "Error: unknown option: $1" >&2
+            usage
+            exit 1
+            ;;
+        *)
+            if [ -n "$target" ]; then
+                echo "Error: only one target path is allowed" >&2
+                usage
+                exit 1
+            fi
+            target="$1"
+            ;;
+    esac
+    shift
+done
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "Error: jq is required but not found in PATH" >&2
+    exit 1
+fi
+
+case "$action" in
+    list)
+        if [ ! -f "$POLICY" ]; then
+            echo "[]"
+            exit 0
+        fi
+        jq -c '.temporary_overrides // []' "$POLICY"
+        exit 0
+        ;;
+    clear)
+        ;;
+    remove|grant|grant-sensitive-read)
+        if [ -z "$target" ]; then
+            echo "Error: missing target path" >&2
+            usage
+            exit 1
+        fi
+        target="$(normalize_path "$target")"
+        if [[ "$target" != /* ]]; then
+            echo "Error: target must resolve to an absolute path" >&2
+            exit 1
+        fi
+        if [ "$target" = "/" ]; then
+            echo "Error: refusing to override root path '/'" >&2
+            exit 1
+        fi
+        if ! [[ "$MAX_PATH_LEN" =~ ^[0-9]+$ ]]; then
+            echo "Error: AGENTSMITH_OVERRIDE_MAX_PATH_LEN must be a non-negative integer" >&2
+            exit 1
+        fi
+        if [ "${#target}" -gt "$MAX_PATH_LEN" ]; then
+            echo "Error: target path too long (max $MAX_PATH_LEN chars)" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Error: unknown action" >&2
+        exit 1
+        ;;
+esac
+
+if [ "$action" != "grant" ] && [ "$action" != "grant-sensitive-read" ] && [ -n "$minutes" ]; then
+    echo "Error: --minutes/--no-expire is only valid for grant/sensitive-read mode" >&2
+    exit 1
+fi
+
+if [ "$action" = "grant" ] || [ "$action" = "grant-sensitive-read" ]; then
+    if [ -z "$minutes" ]; then
+        minutes="$DEFAULT_MINUTES"
+    fi
+
+    if ! [[ "$minutes" =~ ^[0-9]+$ ]]; then
+        echo "Error: minutes must be a non-negative integer" >&2
+        exit 1
+    fi
+    if ! [[ "$MAX_MINUTES" =~ ^[0-9]+$ ]]; then
+        echo "Error: AGENTSMITH_OVERRIDE_MAX_MINUTES must be a non-negative integer" >&2
+        exit 1
+    fi
+    if [ "$minutes" -gt 0 ] && [ "$minutes" -gt "$MAX_MINUTES" ]; then
+        echo "Error: minutes exceeds max allowed ($MAX_MINUTES)" >&2
+        exit 1
+    fi
+    if [ "$minutes" -eq 0 ]; then
+        echo "Error: no-expire override is disabled; please use a short TTL (1-$MAX_MINUTES minutes)" >&2
+        exit 1
+    fi
+fi
+
+if { [ "$action" = "clear" ] || [ "$action" = "list" ]; } && [ -n "$target" ]; then
+    echo "Error: $action does not take a target path" >&2
+    exit 1
+fi
+
+mkdir -p "$REQUEST_DIR"
+chmod 700 "$REQUEST_DIR" 2>/dev/null || true
+
+request_id="$(make_request_id)"
+requester_pid="$$"
+request_file="$REQUEST_DIR/${request_id}.request.json"
+response_file="$REQUEST_DIR/${request_id}.response.json"
+tmp_request="$(mktemp "$REQUEST_DIR/.request.${request_id}.XXXXXX")"
+
+trap 'rm -f "$tmp_request" "$request_file"' EXIT
+
+case "$action" in
+    grant)
+        jq -n \
+            --arg id "$request_id" \
+            --arg action "grant" \
+            --arg path "$target" \
+            --argjson minutes "$minutes" \
+            --argjson requester_pid "$requester_pid" \
+            '{id: $id, action: $action, path: $path, minutes: $minutes, requester_pid: $requester_pid}' > "$tmp_request"
+        ;;
+    grant-sensitive-read)
+        jq -n \
+            --arg id "$request_id" \
+            --arg action "grant-sensitive-read" \
+            --arg path "$target" \
+            --argjson minutes "$minutes" \
+            --argjson requester_pid "$requester_pid" \
+            '{id: $id, action: $action, path: $path, minutes: $minutes, requester_pid: $requester_pid}' > "$tmp_request"
+        ;;
+    remove)
+        jq -n \
+            --arg id "$request_id" \
+            --arg action "remove" \
+            --arg path "$target" \
+            --argjson requester_pid "$requester_pid" \
+            '{id: $id, action: $action, path: $path, requester_pid: $requester_pid}' > "$tmp_request"
+        ;;
+    clear)
+        jq -n \
+            --arg id "$request_id" \
+            --arg action "clear" \
+            --argjson requester_pid "$requester_pid" \
+            '{id: $id, action: $action, requester_pid: $requester_pid}' > "$tmp_request"
+        ;;
+esac
+
+mv "$tmp_request" "$request_file"
+trap - EXIT
+
+if ! response_payload="$(wait_for_response "$response_file" "$WAIT_SECS" "$request_id")"; then
+    rm -f "$request_file"
+    echo "Error: override helper timeout. Ensure agentsmith-rs daemon is running." >&2
+    exit 1
+fi
+
+status="$(printf '%s\n' "$response_payload" | sed -n '1p')"
+message="$(printf '%s\n' "$response_payload" | sed -n '2p')"
+expires="$(printf '%s\n' "$response_payload" | sed -n '3p')"
+
+if [ "$status" != "ok" ]; then
+    echo "Error: ${message:-override request rejected}" >&2
+    exit 1
+fi
+
+case "$action" in
+    grant)
+        if [ -n "$expires" ]; then
+            echo "Override granted for $minutes minute(s): $target"
+            echo "Expires at: $expires"
+        else
+            echo "Override granted for $minutes minute(s): $target"
+        fi
+        echo "Waiting for policy reload (2s)..."
+        sleep 2
+        echo "Ready. You can now retry the operation."
+        ;;
+    grant-sensitive-read)
+        if [ -n "$expires" ]; then
+            echo "Sensitive-read override granted for $minutes minute(s): $target"
+            echo "Expires at: $expires"
+        else
+            echo "Sensitive-read override granted for $minutes minute(s): $target"
+        fi
+        echo "Waiting for policy reload (2s)..."
+        sleep 2
+        echo "Ready. You can now retry the operation."
+        ;;
+    remove)
+        echo "Override removed (if present): $target"
+        ;;
+    clear)
+        echo "All overrides cleared"
+        ;;
+esac
