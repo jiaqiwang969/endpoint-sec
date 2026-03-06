@@ -46,6 +46,7 @@ const SIGNATURE_CACHE_PRUNE_INTERVAL_SECS: u64 = 60;
 const SIGNATURE_REFRESH_QUEUE_BOUND: usize = 1024;
 const LOG_EVENT_QUEUE_BOUND: usize = 2048;
 const LOG_QUEUE_FULL_WARN_INTERVAL_SECS: u64 = 5;
+const AUDIT_ONLY_LOG_MAX_BYTES: u64 = 1_000_000;
 const RUNTIME_HEALTH_LOG_INTERVAL_SECS: u64 = 10;
 const CALLBACK_LATENCY_BUCKETS_US: [u64; 12] = [
     100, 250, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 250_000, 500_000,
@@ -132,6 +133,9 @@ struct SecurityPolicy {
 
     #[serde(default = "default_true")]
     exec_gate_enabled: bool,
+
+    #[serde(default)]
+    audit_only_mode: bool,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     taint_ttl_seconds: Option<u64>,
@@ -941,6 +945,7 @@ struct TaintMarkRecord {
 #[derive(Debug)]
 enum GuardLogMessage {
     Denial(DenialRecord),
+    AuditOnly(DenialRecord),
     TaintMark(TaintMarkRecord),
 }
 
@@ -2146,6 +2151,7 @@ fn maybe_warn_log_queue_full(kind: &str) {
 fn process_log_message_sync(home: &str, message: GuardLogMessage) {
     match message {
         GuardLogMessage::Denial(record) => log_denial_sync(home, &record),
+        GuardLogMessage::AuditOnly(record) => log_audit_only_sync(home, &record),
         GuardLogMessage::TaintMark(record) => log_taint_mark_sync(home, &record),
     }
 }
@@ -2160,6 +2166,7 @@ fn enqueue_log_message_or_fallback(home: &str, message: GuardLogMessage) {
     if let Some(tx) = LOG_EVENT_TX.get() {
         let kind = match &message {
             GuardLogMessage::Denial(_) => "denial",
+            GuardLogMessage::AuditOnly(_) => "audit-only",
             GuardLogMessage::TaintMark(_) => "taint",
         };
         LOG_QUEUE_PENDING.fetch_add(1, Ordering::Relaxed);
@@ -2201,8 +2208,26 @@ fn log_denial(home: &str, record: &DenialRecord) {
     enqueue_log_message_or_fallback(home, GuardLogMessage::Denial(record.clone()));
 }
 
+fn log_audit_only(home: &str, record: &DenialRecord) {
+    enqueue_log_message_or_fallback(home, GuardLogMessage::AuditOnly(record.clone()));
+}
+
 fn log_taint_mark(home: &str, record: &TaintMarkRecord) {
     enqueue_log_message_or_fallback(home, GuardLogMessage::TaintMark(record.clone()));
+}
+
+fn record_denial_or_audit_only(home: &str, policy: &SecurityPolicy, record: DenialRecord) -> bool {
+    if policy.audit_only_mode {
+        println!(
+            "[AUDIT] allow op={} reason={} process={} ancestor={} path={}",
+            record.op, record.reason, record.process, record.ancestor, record.path
+        );
+        log_audit_only(home, &record);
+        return false;
+    }
+
+    log_denial(home, &record);
+    true
 }
 
 fn log_denial_sync(home: &str, record: &DenialRecord) {
@@ -2234,6 +2259,30 @@ fn log_denial_sync(home: &str, record: &DenialRecord) {
     if let Ok(mut file) = open_truncate_no_follow(&feedback_path, DEFAULT_FILE_MODE) {
         if verify_regular_file(&file, &feedback_path).is_ok() {
             let _ = file.write_all(feedback.as_bytes());
+        }
+    }
+}
+
+fn log_audit_only_sync(home: &str, record: &DenialRecord) {
+    let guard_dir = match ensure_guard_dirs(home) {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("[log] cannot use guard dir: {}", err);
+            return;
+        },
+    };
+
+    let log_path = guard_dir.join("audit-only.jsonl");
+    if let Ok(json) = serde_json::to_string(record) {
+        if let Ok(mut file) = open_append_no_follow(&log_path, DEFAULT_FILE_MODE) {
+            if verify_regular_file(&file, &log_path).is_ok() {
+                if let Ok(meta) = file.metadata() {
+                    if meta.len() > AUDIT_ONLY_LOG_MAX_BYTES {
+                        let _ = file.set_len(0);
+                    }
+                }
+                let _ = writeln!(file, "{}", json);
+            }
         }
     }
 }
@@ -3351,6 +3400,7 @@ mod tests {
         assert!(policy.read_gate_enabled);
         assert!(policy.transfer_gate_enabled);
         assert!(policy.exec_gate_enabled);
+        assert!(!policy.audit_only_mode);
         assert!(policy.trusted_tool_identities.is_empty());
         assert!(!policy.trusted_identity_require_cdhash);
         assert_eq!(
@@ -3370,6 +3420,26 @@ mod tests {
         )
         .expect("policy json");
         assert_eq!(policy.taint_ttl_seconds_or_default(), 42);
+    }
+
+    #[test]
+    fn policy_audit_only_mode_defaults_to_false() {
+        let policy: SecurityPolicy =
+            serde_json::from_str(r#"{"protected_zones":[],"temporary_overrides":[]}"#).expect("policy json");
+        assert!(!policy.audit_only_mode);
+    }
+
+    #[test]
+    fn policy_audit_only_mode_can_be_enabled() {
+        let policy: SecurityPolicy = serde_json::from_str(
+            r#"{
+                "protected_zones":[],
+                "temporary_overrides":[],
+                "audit_only_mode":true
+            }"#,
+        )
+        .expect("policy json");
+        assert!(policy.audit_only_mode);
     }
 
     #[test]
@@ -3998,6 +4068,7 @@ mod tests {
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
+            audit_only_mode: false,
             taint_ttl_seconds: None,
             trusted_identity_require_cdhash: false,
         }
@@ -4042,6 +4113,7 @@ mod tests {
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
+            audit_only_mode: false,
             taint_ttl_seconds: None,
             trusted_identity_require_cdhash: false,
         };
@@ -4077,6 +4149,7 @@ mod tests {
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
+            audit_only_mode: false,
             taint_ttl_seconds: None,
             trusted_identity_require_cdhash: false,
         };
@@ -4279,6 +4352,7 @@ mod tests {
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
+            audit_only_mode: false,
             taint_ttl_seconds: None,
             trusted_identity_require_cdhash: false,
         };
@@ -4327,6 +4401,7 @@ mod tests {
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
+            audit_only_mode: false,
             taint_ttl_seconds: None,
             trusted_identity_require_cdhash: false,
         };
@@ -4358,6 +4433,7 @@ mod tests {
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
+            audit_only_mode: false,
             taint_ttl_seconds: None,
             trusted_identity_require_cdhash: false,
         };
@@ -4392,6 +4468,7 @@ mod tests {
             read_gate_enabled: true,
             transfer_gate_enabled: true,
             exec_gate_enabled: true,
+            audit_only_mode: false,
             taint_ttl_seconds: None,
             trusted_identity_require_cdhash: false,
         };
@@ -5330,22 +5407,23 @@ fn main() {
                             "[DENY] open(read) by {} (via {}): {}",
                             process_name, ancestor, path
                         );
-                        log_denial(
-                            &home_for_handler,
-                            &DenialRecord {
-                                ts: now_ts(),
-                                op: "open".into(),
-                                path: path.clone(),
-                                dest: None,
-                                zone,
-                                process: process_name.clone(),
-                                ancestor,
-                                reason: REASON_SENSITIVE_READ_NON_AI.to_string(),
-                                pid: pid_for_record(pid),
-                                ppid: parent_pid_for_pid(pid),
-                            },
-                        );
-                        let _ = client.respond_flags_result(&message, 0, false);
+                        let record = DenialRecord {
+                            ts: now_ts(),
+                            op: "open".into(),
+                            path: path.clone(),
+                            dest: None,
+                            zone,
+                            process: process_name.clone(),
+                            ancestor,
+                            reason: REASON_SENSITIVE_READ_NON_AI.to_string(),
+                            pid: pid_for_record(pid),
+                            ppid: parent_pid_for_pid(pid),
+                        };
+                        if record_denial_or_audit_only(&home_for_handler, &current_policy, record) {
+                            let _ = client.respond_flags_result(&message, 0, false);
+                        } else {
+                            let _ = client.respond_flags_result(&message, fflag as u32, false);
+                        }
                         return;
                     }
 
@@ -5411,22 +5489,23 @@ fn main() {
 
                 if deny_taint_write {
                     println!("[DENY] open(write-taint) by {}: {}", process_name, path);
-                    log_denial(
-                        &home_for_handler,
-                        &DenialRecord {
-                            ts: now_ts(),
-                            op: "open".into(),
-                            path: path.clone(),
-                            dest: None,
-                            zone: "taint".to_string(),
-                            process: process_name.clone(),
-                            ancestor: "tainted".to_string(),
-                            reason: denial_reason.to_string(),
-                            pid: pid_for_record(pid),
-                            ppid: parent_pid_for_pid(pid),
-                        },
-                    );
-                    let _ = client.respond_flags_result(&message, 0, false);
+                    let record = DenialRecord {
+                        ts: now_ts(),
+                        op: "open".into(),
+                        path: path.clone(),
+                        dest: None,
+                        zone: "taint".to_string(),
+                        process: process_name.clone(),
+                        ancestor: "tainted".to_string(),
+                        reason: denial_reason.to_string(),
+                        pid: pid_for_record(pid),
+                        ppid: parent_pid_for_pid(pid),
+                    };
+                    if record_denial_or_audit_only(&home_for_handler, &current_policy, record) {
+                        let _ = client.respond_flags_result(&message, 0, false);
+                    } else {
+                        let _ = client.respond_flags_result(&message, fflag as u32, false);
+                    }
                 } else {
                     let _ = client.respond_flags_result(&message, fflag as u32, false);
                 }
@@ -5467,22 +5546,23 @@ fn main() {
                         "[DENY] exec by {} (via {}): {}",
                         target_name, ancestor, target_path
                     );
-                    log_denial(
-                        &home_for_handler,
-                        &DenialRecord {
-                            ts: now_ts(),
-                            op: "exec".into(),
-                            path: target_path,
-                            dest: None,
-                            zone: "exec-blocklist".to_string(),
-                            process: target_name,
-                            ancestor,
-                            reason: REASON_EXEC_EXFIL_TOOL.to_string(),
-                            pid: pid_for_record(pid),
-                            ppid: parent_pid_for_pid(pid),
-                        },
-                    );
-                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    let record = DenialRecord {
+                        ts: now_ts(),
+                        op: "exec".into(),
+                        path: target_path,
+                        dest: None,
+                        zone: "exec-blocklist".to_string(),
+                        process: target_name,
+                        ancestor,
+                        reason: REASON_EXEC_EXFIL_TOOL.to_string(),
+                        pid: pid_for_record(pid),
+                        ppid: parent_pid_for_pid(pid),
+                    };
+                    if record_denial_or_audit_only(&home_for_handler, &current_policy, record) {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    } else {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                    }
                 } else {
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
                 }
@@ -5566,22 +5646,23 @@ fn main() {
 
                 if deny_taint {
                     println!("[DENY] create(taint) by {}: {}", process_name, dest_path);
-                    log_denial(
-                        &home_for_handler,
-                        &DenialRecord {
-                            ts: now_ts(),
-                            op: "create".into(),
-                            path: dest_path,
-                            dest: None,
-                            zone: "taint".to_string(),
-                            process: process_name,
-                            ancestor: "tainted".to_string(),
-                            reason: denial_reason.to_string(),
-                            pid: pid_for_record(pid),
-                            ppid: parent_pid_for_pid(pid),
-                        },
-                    );
-                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    let record = DenialRecord {
+                        ts: now_ts(),
+                        op: "create".into(),
+                        path: dest_path,
+                        dest: None,
+                        zone: "taint".to_string(),
+                        process: process_name,
+                        ancestor: "tainted".to_string(),
+                        reason: denial_reason.to_string(),
+                        pid: pid_for_record(pid),
+                        ppid: parent_pid_for_pid(pid),
+                    };
+                    if record_denial_or_audit_only(&home_for_handler, &current_policy, record) {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    } else {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                    }
                 } else {
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
                 }
@@ -5625,22 +5706,23 @@ fn main() {
                         "[DENY] truncate(taint) by {}: {}",
                         process_name, target_path
                     );
-                    log_denial(
-                        &home_for_handler,
-                        &DenialRecord {
-                            ts: now_ts(),
-                            op: "truncate".into(),
-                            path: target_path,
-                            dest: None,
-                            zone: "taint".to_string(),
-                            process: process_name,
-                            ancestor: "tainted".to_string(),
-                            reason: denial_reason.to_string(),
-                            pid: pid_for_record(pid),
-                            ppid: parent_pid_for_pid(pid),
-                        },
-                    );
-                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    let record = DenialRecord {
+                        ts: now_ts(),
+                        op: "truncate".into(),
+                        path: target_path,
+                        dest: None,
+                        zone: "taint".to_string(),
+                        process: process_name,
+                        ancestor: "tainted".to_string(),
+                        reason: denial_reason.to_string(),
+                        pid: pid_for_record(pid),
+                        ppid: parent_pid_for_pid(pid),
+                    };
+                    if record_denial_or_audit_only(&home_for_handler, &current_policy, record) {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    } else {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                    }
                 } else {
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
                 }
@@ -5663,22 +5745,23 @@ fn main() {
                         "[DENY] copyfile by {}: {} -> {}",
                         process_name, source_path, dest_path
                     );
-                    log_denial(
-                        &home_for_handler,
-                        &DenialRecord {
-                            ts: now_ts(),
-                            op: "copyfile".into(),
-                            path: source_path,
-                            dest: Some(dest_path),
-                            zone,
-                            process: process_name,
-                            ancestor: "n/a".to_string(),
-                            reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
-                            pid: pid_for_record(pid),
-                            ppid: parent_pid_for_pid(pid),
-                        },
-                    );
-                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    let record = DenialRecord {
+                        ts: now_ts(),
+                        op: "copyfile".into(),
+                        path: source_path,
+                        dest: Some(dest_path),
+                        zone,
+                        process: process_name,
+                        ancestor: "n/a".to_string(),
+                        reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
+                        pid: pid_for_record(pid),
+                        ppid: parent_pid_for_pid(pid),
+                    };
+                    if record_denial_or_audit_only(&home_for_handler, &current_policy, record) {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    } else {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                    }
                 } else {
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
                 }
@@ -5697,22 +5780,23 @@ fn main() {
                         "[DENY] clone by {}: {} -> {}",
                         process_name, source_path, dest_path
                     );
-                    log_denial(
-                        &home_for_handler,
-                        &DenialRecord {
-                            ts: now_ts(),
-                            op: "clone".into(),
-                            path: source_path,
-                            dest: Some(dest_path),
-                            zone,
-                            process: process_name,
-                            ancestor: "n/a".to_string(),
-                            reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
-                            pid: pid_for_record(pid),
-                            ppid: parent_pid_for_pid(pid),
-                        },
-                    );
-                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    let record = DenialRecord {
+                        ts: now_ts(),
+                        op: "clone".into(),
+                        path: source_path,
+                        dest: Some(dest_path),
+                        zone,
+                        process: process_name,
+                        ancestor: "n/a".to_string(),
+                        reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
+                        pid: pid_for_record(pid),
+                        ppid: parent_pid_for_pid(pid),
+                    };
+                    if record_denial_or_audit_only(&home_for_handler, &current_policy, record) {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    } else {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                    }
                 } else {
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
                 }
@@ -5731,22 +5815,23 @@ fn main() {
                         "[DENY] link by {}: {} -> {}",
                         process_name, source_path, dest_path
                     );
-                    log_denial(
-                        &home_for_handler,
-                        &DenialRecord {
-                            ts: now_ts(),
-                            op: "link".into(),
-                            path: source_path,
-                            dest: Some(dest_path),
-                            zone,
-                            process: process_name,
-                            ancestor: "n/a".to_string(),
-                            reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
-                            pid: pid_for_record(pid),
-                            ppid: parent_pid_for_pid(pid),
-                        },
-                    );
-                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    let record = DenialRecord {
+                        ts: now_ts(),
+                        op: "link".into(),
+                        path: source_path,
+                        dest: Some(dest_path),
+                        zone,
+                        process: process_name,
+                        ancestor: "n/a".to_string(),
+                        reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
+                        pid: pid_for_record(pid),
+                        ppid: parent_pid_for_pid(pid),
+                    };
+                    if record_denial_or_audit_only(&home_for_handler, &current_policy, record) {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    } else {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                    }
                 } else {
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
                 }
@@ -5769,22 +5854,23 @@ fn main() {
                         "[DENY] exchangedata by {}: {} <-> {}",
                         process_name, path1, path2
                     );
-                    log_denial(
-                        &home_for_handler,
-                        &DenialRecord {
-                            ts: now_ts(),
-                            op: "exchangedata".into(),
-                            path: source_path,
-                            dest: Some(dest_path),
-                            zone,
-                            process: process_name,
-                            ancestor: "n/a".to_string(),
-                            reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
-                            pid: pid_for_record(pid),
-                            ppid: parent_pid_for_pid(pid),
-                        },
-                    );
-                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    let record = DenialRecord {
+                        ts: now_ts(),
+                        op: "exchangedata".into(),
+                        path: source_path,
+                        dest: Some(dest_path),
+                        zone,
+                        process: process_name,
+                        ancestor: "n/a".to_string(),
+                        reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
+                        pid: pid_for_record(pid),
+                        ppid: parent_pid_for_pid(pid),
+                    };
+                    if record_denial_or_audit_only(&home_for_handler, &current_policy, record) {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    } else {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                    }
                 } else {
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
                 }
@@ -5808,22 +5894,23 @@ fn main() {
                         "[DENY] unlink by {} (via {}): {}",
                         decision.process, decision.ancestor, path
                     );
-                    log_denial(
-                        &home_for_handler,
-                        &DenialRecord {
-                            ts: now_ts(),
-                            op: "unlink".into(),
-                            path: path.to_string(),
-                            dest: None,
-                            zone,
-                            process: decision.process,
-                            ancestor: decision.ancestor,
-                            reason: decision.reason.to_string(),
-                            pid: pid_for_record(pid),
-                            ppid: parent_pid_for_pid(pid),
-                        },
-                    );
-                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    let record = DenialRecord {
+                        ts: now_ts(),
+                        op: "unlink".into(),
+                        path: path.to_string(),
+                        dest: None,
+                        zone,
+                        process: decision.process,
+                        ancestor: decision.ancestor,
+                        reason: decision.reason.to_string(),
+                        pid: pid_for_record(pid),
+                        ppid: parent_pid_for_pid(pid),
+                    };
+                    if record_denial_or_audit_only(&home_for_handler, &current_policy, record) {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    } else {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                    }
                 } else {
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
                 }
@@ -5847,22 +5934,23 @@ fn main() {
                         "[DENY] rename(sensitive) by {}: {} -> {}",
                         process_name, source_path, dest_path_str
                     );
-                    log_denial(
-                        &home_for_handler,
-                        &DenialRecord {
-                            ts: now_ts(),
-                            op: "rename".into(),
-                            path: source_path.clone(),
-                            dest: Some(dest_path_str),
-                            zone,
-                            process: process_name,
-                            ancestor: "n/a".to_string(),
-                            reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
-                            pid: pid_for_record(pid),
-                            ppid: parent_pid_for_pid(pid),
-                        },
-                    );
-                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    let record = DenialRecord {
+                        ts: now_ts(),
+                        op: "rename".into(),
+                        path: source_path.clone(),
+                        dest: Some(dest_path_str),
+                        zone,
+                        process: process_name,
+                        ancestor: "n/a".to_string(),
+                        reason: REASON_SENSITIVE_TRANSFER_OUT.to_string(),
+                        pid: pid_for_record(pid),
+                        ppid: parent_pid_for_pid(pid),
+                    };
+                    if record_denial_or_audit_only(&home_for_handler, &current_policy, record) {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    } else {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                    }
                     return;
                 }
 
@@ -5935,22 +6023,23 @@ fn main() {
                         "[DENY] rename by {} (via {}): {} -> {}",
                         decision.process, decision.ancestor, source_path, dest_path_str
                     );
-                    log_denial(
-                        &home_for_handler,
-                        &DenialRecord {
-                            ts: now_ts(),
-                            op: "rename".into(),
-                            path: source_path,
-                            dest: Some(dest_path_str),
-                            zone,
-                            process: decision.process,
-                            ancestor: decision.ancestor,
-                            reason: decision.reason.to_string(),
-                            pid: pid_for_record(pid),
-                            ppid: parent_pid_for_pid(pid),
-                        },
-                    );
-                    let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    let record = DenialRecord {
+                        ts: now_ts(),
+                        op: "rename".into(),
+                        path: source_path,
+                        dest: Some(dest_path_str),
+                        zone,
+                        process: decision.process,
+                        ancestor: decision.ancestor,
+                        reason: decision.reason.to_string(),
+                        pid: pid_for_record(pid),
+                        ppid: parent_pid_for_pid(pid),
+                    };
+                    if record_denial_or_audit_only(&home_for_handler, &current_policy, record) {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_DENY, false);
+                    } else {
+                        let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
+                    }
                 } else {
                     let _ = client.respond_auth_result(&message, es_auth_result_t::ES_AUTH_RESULT_ALLOW, false);
                 }

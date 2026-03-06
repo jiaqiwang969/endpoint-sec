@@ -425,6 +425,10 @@ final class ESGuardViewModel: ObservableObject {
     // 偏好设置
     @AppStorage("autoRevokeMinutes") var autoRevokeMinutes: Int = 3
     @AppStorage("lastAcknowledgedRecordId") var lastAcknowledgedRecordId: String = ""
+
+    var isSilentMode: Bool {
+        policy.auditOnlyMode
+    }
     
     var hasUnacknowledgedRecords: Bool {
         guard let first = records.first else { return false }
@@ -1180,6 +1184,34 @@ final class ESGuardViewModel: ObservableObject {
             successClearAfter: 6.0
         ) {
             $0.autoProtectHomeDigitChildren = enabled
+        }
+    }
+
+    func activateGuardMode() {
+        mutatePolicyOnDisk(
+            successMessage: guardRunning
+                ? "已切换到拦截模式：命中策略将真实阻断"
+                : "已设置为拦截模式，守护进程启动后生效",
+            successClearAfter: 6.0
+        ) {
+            $0.auditOnlyMode = false
+        }
+        if !guardRunning {
+            startDaemon()
+        }
+    }
+
+    func activateSilentMode() {
+        mutatePolicyOnDisk(
+            successMessage: guardRunning
+                ? "已切换到静默模式：只记录命中，不执行阻断"
+                : "已设置为静默模式，守护进程启动后生效",
+            successClearAfter: 6.0
+        ) {
+            $0.auditOnlyMode = true
+        }
+        if !guardRunning {
+            startDaemon()
         }
     }
 

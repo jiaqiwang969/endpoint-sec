@@ -22,19 +22,25 @@ struct DashboardView: View {
                             Circle()
                                 .fill(
                                     viewModel.guardRunning
-                                        ? (viewModel.hasUnacknowledgedRecords ? ApplePalette.warning : ApplePalette.success)
+                                        ? (viewModel.isSilentMode
+                                            ? ApplePalette.info
+                                            : (viewModel.hasUnacknowledgedRecords ? ApplePalette.warning : ApplePalette.success))
                                         : ApplePalette.danger
                                 )
                                 .frame(width: 8, height: 8)
                             Text(
                                 viewModel.guardRunning
-                                    ? (viewModel.hasUnacknowledgedRecords ? "有新拦截" : "守护中")
+                                    ? (viewModel.isSilentMode
+                                        ? "静默采集"
+                                        : (viewModel.hasUnacknowledgedRecords ? "有新拦截" : "守护中"))
                                     : "守护已停止"
                             )
                             .font(.caption)
                             .foregroundColor(
                                 viewModel.guardRunning
-                                    ? (viewModel.hasUnacknowledgedRecords ? ApplePalette.warning : .secondary)
+                                    ? (viewModel.isSilentMode
+                                        ? ApplePalette.info
+                                        : (viewModel.hasUnacknowledgedRecords ? ApplePalette.warning : .secondary))
                                     : ApplePalette.danger
                             )
                         }
@@ -48,12 +54,14 @@ struct DashboardView: View {
                 HStack(spacing: 8) {
                     DaemonCapsuleControl(
                         guardRunning: viewModel.guardRunning,
+                        silentMode: viewModel.isSilentMode,
                         actionInProgress: viewModel.daemonActionInProgress,
                         currentAction: viewModel.daemonCurrentAction,
-                        onStart: { viewModel.startDaemon() },
+                        onStart: { viewModel.activateGuardMode() },
+                        onSilent: { viewModel.activateSilentMode() },
                         onStop: { viewModel.stopDaemon() }
                     )
-                    .help("胶囊开关：启动或停止 launchd 中的 codex-es-guard")
+                    .help("模式切换：开启=拦截，静默=仅记录不阻断，关闭=停止守护")
 
                     Button(action: {
                         viewModel.restartDaemon()
@@ -170,20 +178,31 @@ private extension DashboardView {
 
 private struct DaemonCapsuleControl: View {
     let guardRunning: Bool
+    let silentMode: Bool
     let actionInProgress: Bool
     let currentAction: DaemonActionKind?
     let onStart: () -> Void
+    let onSilent: () -> Void
     let onStop: () -> Void
 
     var body: some View {
         HStack(spacing: 4) {
             capsuleButton(
                 title: "开启",
-                isActive: guardRunning,
+                isActive: guardRunning && !silentMode,
                 tint: ApplePalette.success,
                 showProgress: actionInProgress && currentAction == .starting,
-                disabled: guardRunning || actionInProgress,
+                disabled: (guardRunning && !silentMode) || actionInProgress,
                 action: onStart
+            )
+
+            capsuleButton(
+                title: "静默",
+                isActive: guardRunning && silentMode,
+                tint: ApplePalette.info,
+                showProgress: false,
+                disabled: (guardRunning && silentMode) || actionInProgress,
+                action: onSilent
             )
 
             capsuleButton(

@@ -219,6 +219,7 @@
               EXISTING_AUTO_PROTECT_HOME_DIGIT_CHILDREN="null"
               EXISTING_TRUSTED_TOOL_IDENTITIES="null"
               EXISTING_TRUSTED_IDENTITY_REQUIRE_CDHASH="null"
+              EXISTING_AUDIT_ONLY_MODE="null"
               if [ -f "$POLICY_FILE" ]; then
                 EXISTING_TRUSTED_TOOLS=$(${pkgs.jq}/bin/jq -c '.trusted_tools // null' "$POLICY_FILE" 2>/dev/null || echo "null")
                 EXISTING_AI_PATTERNS=$(${pkgs.jq}/bin/jq -c '.ai_agent_patterns // null' "$POLICY_FILE" 2>/dev/null || echo "null")
@@ -227,6 +228,7 @@
                 EXISTING_AUTO_PROTECT_HOME_DIGIT_CHILDREN=$(${pkgs.jq}/bin/jq -c '.auto_protect_home_digit_children // null' "$POLICY_FILE" 2>/dev/null || echo "null")
                 EXISTING_TRUSTED_TOOL_IDENTITIES=$(${pkgs.jq}/bin/jq -c '.trusted_tool_identities // null' "$POLICY_FILE" 2>/dev/null || echo "null")
                 EXISTING_TRUSTED_IDENTITY_REQUIRE_CDHASH=$(${pkgs.jq}/bin/jq -c '.trusted_identity_require_cdhash // null' "$POLICY_FILE" 2>/dev/null || echo "null")
+                EXISTING_AUDIT_ONLY_MODE=$(${pkgs.jq}/bin/jq -c '.audit_only_mode // null' "$POLICY_FILE" 2>/dev/null || echo "null")
               fi
 
               # Trusted identity bootstrap + top-up:
@@ -322,6 +324,7 @@ PY
                 --argjson autoProtectHomeDigitChildren "$EXISTING_AUTO_PROTECT_HOME_DIGIT_CHILDREN" \
                 --argjson trustedToolIdentities "$MERGED_TRUSTED_TOOL_IDENTITIES" \
                 --argjson trustedIdentityRequireCdhash "$EXISTING_TRUSTED_IDENTITY_REQUIRE_CDHASH" \
+                --argjson auditOnlyMode "$EXISTING_AUDIT_ONLY_MODE" \
                 --argjson autoProtectHomeDigitChildrenDefault ${autoProtectHomeDigitChildrenDefaultJson} \
                 '({protected_zones: $zones, temporary_overrides: []}
                   + {sensitive_zones: $sensitiveZones}
@@ -342,7 +345,8 @@ PY
                   + (if $aiPatterns == null then {} else {ai_agent_patterns: $aiPatterns} end)
                   + (if $allowVcsMetaInAi == null then {} else {allow_vcs_metadata_in_ai_context: $allowVcsMetaInAi} end)
                   + (if $allowTrustedInAi == null then {} else {allow_trusted_tools_in_ai_context: $allowTrustedInAi} end)
-                  + (if $trustedIdentityRequireCdhash == null then {} else {trusted_identity_require_cdhash: $trustedIdentityRequireCdhash} end))' \
+                  + (if $trustedIdentityRequireCdhash == null then {} else {trusted_identity_require_cdhash: $trustedIdentityRequireCdhash} end)
+                  + (if $auditOnlyMode == null then {} else {audit_only_mode: $auditOnlyMode} end))' \
                 > "$POLICY_FILE"
               chown ${cfg.user}:staff "$POLICY_FILE"
               echo "codex-es-guard: policy synced ($(echo '${protectedZonesJson}' | ${pkgs.jq}/bin/jq length) zones)"

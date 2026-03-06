@@ -142,6 +142,7 @@ struct SecurityPolicy: Codable {
     var readGateEnabled: Bool
     var transferGateEnabled: Bool
     var execGateEnabled: Bool
+    var auditOnlyMode: Bool
     var taintTTLSeconds: Int?
     
     enum CodingKeys: String, CodingKey {
@@ -159,6 +160,7 @@ struct SecurityPolicy: Codable {
         case readGateEnabled = "read_gate_enabled"
         case transferGateEnabled = "transfer_gate_enabled"
         case execGateEnabled = "exec_gate_enabled"
+        case auditOnlyMode = "audit_only_mode"
         case taintTTLSeconds = "taint_ttl_seconds"
     }
 
@@ -177,6 +179,7 @@ struct SecurityPolicy: Codable {
         readGateEnabled: Bool = true,
         transferGateEnabled: Bool = true,
         execGateEnabled: Bool = true,
+        auditOnlyMode: Bool = false,
         taintTTLSeconds: Int? = nil
     ) {
         self.protectedZones = protectedZones
@@ -193,6 +196,7 @@ struct SecurityPolicy: Codable {
         self.readGateEnabled = readGateEnabled
         self.transferGateEnabled = transferGateEnabled
         self.execGateEnabled = execGateEnabled
+        self.auditOnlyMode = auditOnlyMode
         self.taintTTLSeconds = taintTTLSeconds
     }
 
@@ -213,6 +217,7 @@ struct SecurityPolicy: Codable {
         readGateEnabled = try container.decodeIfPresent(Bool.self, forKey: .readGateEnabled) ?? true
         transferGateEnabled = try container.decodeIfPresent(Bool.self, forKey: .transferGateEnabled) ?? true
         execGateEnabled = try container.decodeIfPresent(Bool.self, forKey: .execGateEnabled) ?? true
+        auditOnlyMode = try container.decodeIfPresent(Bool.self, forKey: .auditOnlyMode) ?? false
         taintTTLSeconds = try container.decodeIfPresent(Int.self, forKey: .taintTTLSeconds)
     }
 
