@@ -13,7 +13,6 @@ private struct RecordsSnapshot {
     let totalDeletes: Int
     let totalMoves: Int
     let records: [DenialRecord]
-    let agentStats: [AgentStats]
 }
 
 private struct LaunchctlServiceStatus {
@@ -86,8 +85,6 @@ private func parseDenialsSnapshot(
 
     var deletes = 0
     var moves = 0
-    var statsDict: [String: (del: Int, mov: Int)] = [:]
-
     for line in lines {
         guard let lineData = String(line).data(using: .utf8),
               let record = try? decoder.decode(DenialRecord.self, from: lineData) else {
@@ -99,28 +96,19 @@ private func parseDenialsSnapshot(
         }
 
         allParsed.append(record)
-        let key = record.ancestor
-        let current = statsDict[key] ?? (0, 0)
         if record.op == "unlink" {
             deletes += 1
-            statsDict[key] = (current.del + 1, current.mov)
         } else if record.op == "rename" {
             moves += 1
-            statsDict[key] = (current.del, current.mov + 1)
         }
     }
 
     let uiRecords = Array(allParsed.reversed().prefix(500))
-    let agentStats = statsDict.map { key, value in
-        AgentStats(agentName: key, deleteCount: value.del, moveCount: value.mov)
-    }.sorted(by: { $0.total > $1.total })
-
     return RecordsSnapshot(
         totalIntercepts: allParsed.count,
         totalDeletes: deletes,
         totalMoves: moves,
-        records: uiRecords,
-        agentStats: agentStats
+        records: uiRecords
     )
 }
 
@@ -418,7 +406,6 @@ final class AgentSmithViewModel: ObservableObject {
     @Published var totalIntercepts: Int = 0
     @Published var totalDeletes: Int = 0
     @Published var totalMoves: Int = 0
-    @Published var agentStats: [AgentStats] = []
     @Published var hiddenNoiseCount: Int = 0
     @Published var suppressNoiseRecords: Bool = true
     
@@ -717,7 +704,6 @@ final class AgentSmithViewModel: ObservableObject {
                     guard let self = self else { return }
                     guard token == self.recordsLoadToken else { return }
                     self.records = []
-                    self.agentStats = []
                     self.totalIntercepts = 0
                     self.totalDeletes = 0
                     self.totalMoves = 0
@@ -756,7 +742,6 @@ final class AgentSmithViewModel: ObservableObject {
                 self.totalIntercepts = snapshot.totalIntercepts
                 self.totalDeletes = snapshot.totalDeletes
                 self.totalMoves = snapshot.totalMoves
-                self.agentStats = snapshot.agentStats
                 self.hiddenNoiseCount = hiddenNoiseCount
                 self.isFirstLoad = false
             }

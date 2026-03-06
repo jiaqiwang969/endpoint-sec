@@ -278,13 +278,3 @@ struct GuardCacheMetrics: Equatable {
         return (current, high)
     }
 }
-
-// 图表数据模型
-struct AgentStats: Identifiable {
-    let id = UUID()
-    let agentName: String
-    let deleteCount: Int
-    let moveCount: Int
-    
-    var total: Int { deleteCount + moveCount }
-}

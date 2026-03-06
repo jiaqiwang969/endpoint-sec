@@ -1,5 +1,4 @@
 import SwiftUI
-import Charts
 
 struct StatusPanel: View {
     @ObservedObject var viewModel: AgentSmithViewModel
@@ -200,67 +199,6 @@ struct StatusPanel: View {
                 }
                 .padding(.horizontal)
 
-                Divider()
-                
-                // ----------------------------------------------------
-                // 数据图表模块
-                // ----------------------------------------------------
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("AI Agent 行为画像 (全局)")
-                        .font(.headline)
-                    
-                    if viewModel.agentStats.isEmpty {
-                        Text("没有足够的数据来生成图表")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .padding()
-                    } else {
-                        // 使用 SwiftUI Charts 绘制横向条形图
-                        Chart(viewModel.agentStats) { stat in
-                            // 删除操作 (红色)
-                            BarMark(
-                                x: .value("Count", stat.deleteCount),
-                                y: .value("Agent", stat.agentName)
-                            )
-                            .foregroundStyle(ApplePalette.danger)
-                            .annotation(position: .overlay, alignment: .center) {
-                                if stat.deleteCount > 0 {
-                                    Text("\(stat.deleteCount)")
-                                        .font(.system(size: 9))
-                                        .foregroundColor(.white)
-                                }
-                            }
-                            
-                            // 移动操作 (蓝色)
-                            BarMark(
-                                x: .value("Count", stat.moveCount),
-                                y: .value("Agent", stat.agentName)
-                            )
-                            .foregroundStyle(ApplePalette.info)
-                            .annotation(position: .overlay, alignment: .center) {
-                                if stat.moveCount > 0 {
-                                    Text("\(stat.moveCount)")
-                                        .font(.system(size: 9))
-                                        .foregroundColor(.white)
-                                }
-                            }
-                        }
-                        .chartLegend(.hidden)
-                        // 让图表高度跟随 Agent 数量自适应
-                        .frame(height: max(CGFloat(viewModel.agentStats.count * 30), 80))
-                        .padding(.top, 4)
-                        
-                        // 图例
-                        HStack {
-                            Circle().fill(ApplePalette.danger).frame(width: 6, height: 6)
-                            Text("尝试删除").font(.system(size: 10)).foregroundColor(.secondary)
-                            Circle().fill(ApplePalette.info).frame(width: 6, height: 6)
-                            Text("尝试移动").font(.system(size: 10)).foregroundColor(.secondary)
-                        }
-                    }
-                }
-                .padding(.horizontal)
-                
                 Spacer()
             }
             .padding(.top, 8)
