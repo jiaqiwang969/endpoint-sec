@@ -47,6 +47,8 @@ const SIGNATURE_REFRESH_QUEUE_BOUND: usize = 1024;
 const LOG_EVENT_QUEUE_BOUND: usize = 2048;
 const LOG_QUEUE_FULL_WARN_INTERVAL_SECS: u64 = 5;
 const AUDIT_ONLY_LOG_MAX_BYTES: u64 = 1_000_000;
+const AUDIT_ONLY_COALESCE_WINDOW_SECS: u64 = 10;
+const AUDIT_ONLY_COALESCE_MAX_PENDING_KEYS: usize = 512;
 const RUNTIME_HEALTH_LOG_INTERVAL_SECS: u64 = 10;
 const CALLBACK_LATENCY_BUCKETS_US: [u64; 12] = [
     100, 250, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 250_000, 500_000,
@@ -68,6 +70,7 @@ static SIGNATURE_QUEUE_DROPPED_DISCONNECTED: AtomicU64 = AtomicU64::new(0);
 static LOG_QUEUE_PENDING: AtomicU64 = AtomicU64::new(0);
 static LOG_QUEUE_DROPPED_FULL: AtomicU64 = AtomicU64::new(0);
 static LOG_QUEUE_DROPPED_DISCONNECTED: AtomicU64 = AtomicU64::new(0);
+static AUDIT_ONLY_COALESCER: OnceLock<Mutex<AuditOnlyCoalescer>> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 struct OverrideRequest {
@@ -916,6 +919,119 @@ impl DenialRecord {
             ppid: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct AuditOnlySignature {
+    op: String,
+    path: String,
+    dest: Option<String>,
+    zone: String,
+    process: String,
+    ancestor: String,
+    reason: String,
+}
+
+impl From<&DenialRecord> for AuditOnlySignature {
+    fn from(record: &DenialRecord) -> Self {
+        Self {
+            op: record.op.clone(),
+            path: record.path.clone(),
+            dest: record.dest.clone(),
+            zone: record.zone.clone(),
+            process: record.process.clone(),
+            ancestor: record.ancestor.clone(),
+            reason: record.reason.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AuditOnlyAggregateEntry {
+    sample: DenialRecord,
+    first_ts: u64,
+    last_ts: u64,
+    count: u32,
+}
+
+impl AuditOnlyAggregateEntry {
+    fn new(sample: DenialRecord) -> Self {
+        let ts = sample.ts;
+        Self {
+            sample,
+            first_ts: ts,
+            last_ts: ts,
+            count: 1,
+        }
+    }
+
+    fn merge_same_signature(&mut self, ts: u64) {
+        self.count = self.count.saturating_add(1);
+        self.last_ts = self.last_ts.max(ts);
+    }
+}
+
+#[derive(Debug, Default)]
+struct AuditOnlyCoalescer {
+    pending: HashMap<AuditOnlySignature, AuditOnlyAggregateEntry>,
+}
+
+impl AuditOnlyCoalescer {
+    fn ingest(&mut self, record: DenialRecord) -> Vec<AuditOnlyAggregateEntry> {
+        let mut ready = self.take_ready(record.ts, false);
+        let signature = AuditOnlySignature::from(&record);
+        if let Some(entry) = self.pending.get_mut(&signature) {
+            entry.merge_same_signature(record.ts);
+        } else {
+            self.pending.insert(signature, AuditOnlyAggregateEntry::new(record));
+        }
+
+        if self.pending.len() > AUDIT_ONLY_COALESCE_MAX_PENDING_KEYS {
+            if let Some(oldest_signature) = self
+                .pending
+                .iter()
+                .min_by_key(|(_, entry)| entry.first_ts)
+                .map(|(signature, _)| signature.clone())
+            {
+                if let Some(entry) = self.pending.remove(&oldest_signature) {
+                    ready.push(entry);
+                }
+            }
+        }
+
+        ready
+    }
+
+    fn take_ready(&mut self, now: u64, force_all: bool) -> Vec<AuditOnlyAggregateEntry> {
+        let due_signatures: Vec<AuditOnlySignature> = self
+            .pending
+            .iter()
+            .filter_map(|(signature, entry)| {
+                let due = force_all || now.saturating_sub(entry.first_ts) >= AUDIT_ONLY_COALESCE_WINDOW_SECS;
+                due.then(|| signature.clone())
+            })
+            .collect();
+
+        let mut ready = Vec::with_capacity(due_signatures.len());
+        for signature in due_signatures {
+            if let Some(entry) = self.pending.remove(&signature) {
+                ready.push(entry);
+            }
+        }
+        ready
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AuditOnlyLogLine<'a> {
+    #[serde(flatten)]
+    record: &'a DenialRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_ts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_ts: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2205,6 +2321,64 @@ fn log_denial(home: &str, record: &DenialRecord) {
     enqueue_log_message_or_fallback(home, GuardLogMessage::Denial(record.clone()));
 }
 
+fn audit_only_coalescer() -> &'static Mutex<AuditOnlyCoalescer> {
+    AUDIT_ONLY_COALESCER.get_or_init(|| Mutex::new(AuditOnlyCoalescer::default()))
+}
+
+fn serialize_audit_only_entry(entry: &AuditOnlyAggregateEntry) -> Option<String> {
+    let is_aggregated = entry.count > 1;
+    let line = AuditOnlyLogLine {
+        record: &entry.sample,
+        count: is_aggregated.then_some(entry.count),
+        first_ts: is_aggregated.then_some(entry.first_ts),
+        last_ts: is_aggregated.then_some(entry.last_ts),
+    };
+    serde_json::to_string(&line).ok()
+}
+
+fn write_audit_only_entries(home: &str, entries: Vec<AuditOnlyAggregateEntry>) {
+    if entries.is_empty() {
+        return;
+    }
+
+    let guard_dir = match ensure_guard_dirs(home) {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("[log] cannot use guard dir: {}", err);
+            return;
+        },
+    };
+
+    let log_path = guard_dir.join("audit-only.jsonl");
+    let lines: Vec<String> = entries.iter().filter_map(serialize_audit_only_entry).collect();
+    if lines.is_empty() {
+        return;
+    }
+
+    if let Ok(mut file) = open_append_no_follow(&log_path, DEFAULT_FILE_MODE) {
+        if verify_regular_file(&file, &log_path).is_ok() {
+            if let Ok(meta) = file.metadata() {
+                if meta.len() > AUDIT_ONLY_LOG_MAX_BYTES {
+                    let _ = file.set_len(0);
+                }
+            }
+            for line in lines {
+                let _ = writeln!(file, "{}", line);
+            }
+        }
+    }
+}
+
+fn flush_audit_only_coalescer(home: &str, now: u64, force_all: bool) {
+    let ready = {
+        let mut coalescer = audit_only_coalescer()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        coalescer.take_ready(now, force_all)
+    };
+    write_audit_only_entries(home, ready);
+}
+
 fn log_audit_only(home: &str, record: &DenialRecord) {
     enqueue_log_message_or_fallback(home, GuardLogMessage::AuditOnly(record.clone()));
 }
@@ -2215,10 +2389,6 @@ fn log_taint_mark(home: &str, record: &TaintMarkRecord) {
 
 fn record_denial_or_audit_only(home: &str, policy: &SecurityPolicy, record: DenialRecord) -> bool {
     if policy.audit_only_mode {
-        println!(
-            "[AUDIT] allow op={} reason={} process={} ancestor={} path={}",
-            record.op, record.reason, record.process, record.ancestor, record.path
-        );
         log_audit_only(home, &record);
         return false;
     }
@@ -2261,27 +2431,13 @@ fn log_denial_sync(home: &str, record: &DenialRecord) {
 }
 
 fn log_audit_only_sync(home: &str, record: &DenialRecord) {
-    let guard_dir = match ensure_guard_dirs(home) {
-        Ok(dir) => dir,
-        Err(err) => {
-            eprintln!("[log] cannot use guard dir: {}", err);
-            return;
-        },
+    let ready = {
+        let mut coalescer = audit_only_coalescer()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        coalescer.ingest(record.clone())
     };
-
-    let log_path = guard_dir.join("audit-only.jsonl");
-    if let Ok(json) = serde_json::to_string(record) {
-        if let Ok(mut file) = open_append_no_follow(&log_path, DEFAULT_FILE_MODE) {
-            if verify_regular_file(&file, &log_path).is_ok() {
-                if let Ok(meta) = file.metadata() {
-                    if meta.len() > AUDIT_ONLY_LOG_MAX_BYTES {
-                        let _ = file.set_len(0);
-                    }
-                }
-                let _ = writeln!(file, "{}", json);
-            }
-        }
-    }
+    write_audit_only_entries(home, ready);
 }
 
 fn log_taint_mark_sync(home: &str, record: &TaintMarkRecord) {
@@ -3910,6 +4066,75 @@ mod tests {
     }
 
     #[test]
+    fn audit_only_coalescer_aggregates_same_signature_within_window() {
+        let mut coalescer = AuditOnlyCoalescer::default();
+
+        let mut first = DenialRecord::for_test_reason(REASON_SENSITIVE_READ_NON_AI);
+        first.ts = 1;
+        first.path = "/Users/jqwang/.codex/config.toml".to_string();
+        first.process = "zsh".to_string();
+        first.ancestor = "none".to_string();
+
+        let mut second = first.clone();
+        second.ts = 5;
+        second.pid = Some(2001);
+        second.ppid = Some(2000);
+
+        assert!(coalescer.ingest(first).is_empty());
+        assert!(coalescer.ingest(second).is_empty());
+
+        let ready = coalescer.take_ready(11, false);
+        assert_eq!(ready.len(), 1);
+        let entry = &ready[0];
+        assert_eq!(entry.count, 2);
+        assert_eq!(entry.first_ts, 1);
+        assert_eq!(entry.last_ts, 5);
+    }
+
+    #[test]
+    fn audit_only_coalescer_keeps_distinct_signatures_separate() {
+        let mut coalescer = AuditOnlyCoalescer::default();
+
+        let mut first = DenialRecord::for_test_reason(REASON_SENSITIVE_READ_NON_AI);
+        first.ts = 1;
+        first.path = "/Users/jqwang/.codex/config.toml".to_string();
+
+        let mut second = first.clone();
+        second.ts = 2;
+        second.path = "/Users/jqwang/.codex/history.jsonl".to_string();
+
+        assert!(coalescer.ingest(first).is_empty());
+        assert!(coalescer.ingest(second).is_empty());
+
+        let mut ready = coalescer.take_ready(100, true);
+        ready.sort_by(|left, right| left.sample.path.cmp(&right.sample.path));
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[0].count, 1);
+        assert_eq!(ready[1].count, 1);
+    }
+
+    #[test]
+    fn audit_only_log_line_includes_count_only_for_aggregated_entries() {
+        let mut sample = DenialRecord::for_test_reason(REASON_SENSITIVE_READ_NON_AI);
+        sample.ts = 7;
+        sample.path = "/Users/jqwang/.codex/config.toml".to_string();
+
+        let single = AuditOnlyAggregateEntry::new(sample.clone());
+        let single_json = serialize_audit_only_entry(&single).expect("single audit json");
+        assert!(!single_json.contains("\"count\""));
+        assert!(!single_json.contains("\"first_ts\""));
+        assert!(!single_json.contains("\"last_ts\""));
+
+        let mut aggregated = AuditOnlyAggregateEntry::new(sample);
+        aggregated.merge_same_signature(8);
+        aggregated.merge_same_signature(10);
+        let aggregated_json = serialize_audit_only_entry(&aggregated).expect("aggregated audit json");
+        assert!(aggregated_json.contains("\"count\":3"));
+        assert!(aggregated_json.contains("\"first_ts\":7"));
+        assert!(aggregated_json.contains("\"last_ts\":10"));
+    }
+
+    #[test]
     fn denial_feedback_for_sensitive_read_has_read_specific_guidance() {
         let record = DenialRecord::for_test_reason(REASON_SENSITIVE_READ_NON_AI);
         let feedback = build_denial_feedback("/Users/jqwang", &record);
@@ -5346,8 +5571,10 @@ fn main() {
             thread::sleep(Duration::from_secs(CACHE_WATERMARK_LOG_INTERVAL_SECS));
         }
     });
+    let home_for_audit_flush = home.clone();
     thread::spawn(move || loop {
         emit_runtime_health_log(callback_latency_metrics_clone.as_ref());
+        flush_audit_only_coalescer(home_for_audit_flush.as_str(), now_ts(), false);
         thread::sleep(Duration::from_secs(RUNTIME_HEALTH_LOG_INTERVAL_SECS));
     });
 
@@ -5400,10 +5627,12 @@ fn main() {
                     if should_deny {
                         let ancestor = ai_ancestor.unwrap_or_else(|| "none".to_string());
                         let zone = current_policy.matched_sensitive_zone(path.as_str());
-                        println!(
-                            "[DENY] open(read) by {} (via {}): {}",
-                            process_name, ancestor, path
-                        );
+                        if !current_policy.audit_only_mode {
+                            println!(
+                                "[DENY] open(read) by {} (via {}): {}",
+                                process_name, ancestor, path
+                            );
+                        }
                         let record = DenialRecord {
                             ts: now_ts(),
                             op: "open".into(),
@@ -5485,7 +5714,9 @@ fn main() {
                 };
 
                 if deny_taint_write {
-                    println!("[DENY] open(write-taint) by {}: {}", process_name, path);
+                    if !current_policy.audit_only_mode {
+                        println!("[DENY] open(write-taint) by {}: {}", process_name, path);
+                    }
                     let record = DenialRecord {
                         ts: now_ts(),
                         op: "open".into(),
@@ -5539,10 +5770,12 @@ fn main() {
 
                 if should_deny {
                     let ancestor = ai_ancestor.unwrap_or_else(|| "none".to_string());
-                    println!(
-                        "[DENY] exec by {} (via {}): {}",
-                        target_name, ancestor, target_path
-                    );
+                    if !current_policy.audit_only_mode {
+                        println!(
+                            "[DENY] exec by {} (via {}): {}",
+                            target_name, ancestor, target_path
+                        );
+                    }
                     let record = DenialRecord {
                         ts: now_ts(),
                         op: "exec".into(),
@@ -5642,7 +5875,9 @@ fn main() {
                 };
 
                 if deny_taint {
-                    println!("[DENY] create(taint) by {}: {}", process_name, dest_path);
+                    if !current_policy.audit_only_mode {
+                        println!("[DENY] create(taint) by {}: {}", process_name, dest_path);
+                    }
                     let record = DenialRecord {
                         ts: now_ts(),
                         op: "create".into(),
@@ -5699,10 +5934,12 @@ fn main() {
                 };
 
                 if deny_taint {
-                    println!(
-                        "[DENY] truncate(taint) by {}: {}",
-                        process_name, target_path
-                    );
+                    if !current_policy.audit_only_mode {
+                        println!(
+                            "[DENY] truncate(taint) by {}: {}",
+                            process_name, target_path
+                        );
+                    }
                     let record = DenialRecord {
                         ts: now_ts(),
                         op: "truncate".into(),
@@ -5738,10 +5975,12 @@ fn main() {
                 if should_deny {
                     let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
                     let zone = current_policy.matched_sensitive_zone(&source_path);
-                    println!(
-                        "[DENY] copyfile by {}: {} -> {}",
-                        process_name, source_path, dest_path
-                    );
+                    if !current_policy.audit_only_mode {
+                        println!(
+                            "[DENY] copyfile by {}: {} -> {}",
+                            process_name, source_path, dest_path
+                        );
+                    }
                     let record = DenialRecord {
                         ts: now_ts(),
                         op: "copyfile".into(),
@@ -5773,10 +6012,12 @@ fn main() {
                 if should_deny {
                     let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
                     let zone = current_policy.matched_sensitive_zone(&source_path);
-                    println!(
-                        "[DENY] clone by {}: {} -> {}",
-                        process_name, source_path, dest_path
-                    );
+                    if !current_policy.audit_only_mode {
+                        println!(
+                            "[DENY] clone by {}: {} -> {}",
+                            process_name, source_path, dest_path
+                        );
+                    }
                     let record = DenialRecord {
                         ts: now_ts(),
                         op: "clone".into(),
@@ -5808,10 +6049,12 @@ fn main() {
                 if should_deny {
                     let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
                     let zone = current_policy.matched_sensitive_zone(&source_path);
-                    println!(
-                        "[DENY] link by {}: {} -> {}",
-                        process_name, source_path, dest_path
-                    );
+                    if !current_policy.audit_only_mode {
+                        println!(
+                            "[DENY] link by {}: {} -> {}",
+                            process_name, source_path, dest_path
+                        );
+                    }
                     let record = DenialRecord {
                         ts: now_ts(),
                         op: "link".into(),
@@ -5847,10 +6090,12 @@ fn main() {
                 if let Some((source_path, dest_path)) = deny_pair {
                     let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
                     let zone = current_policy.matched_sensitive_zone(&source_path);
-                    println!(
-                        "[DENY] exchangedata by {}: {} <-> {}",
-                        process_name, path1, path2
-                    );
+                    if !current_policy.audit_only_mode {
+                        println!(
+                            "[DENY] exchangedata by {}: {} <-> {}",
+                            process_name, path1, path2
+                        );
+                    }
                     let record = DenialRecord {
                         ts: now_ts(),
                         op: "exchangedata".into(),
@@ -5887,10 +6132,12 @@ fn main() {
                     &signature_refresh_tx_for_handler,
                 ) {
                     let zone = current_policy.matched_zone(&path, &home_for_handler);
-                    println!(
-                        "[DENY] unlink by {} (via {}): {}",
-                        decision.process, decision.ancestor, path
-                    );
+                    if !current_policy.audit_only_mode {
+                        println!(
+                            "[DENY] unlink by {} (via {}): {}",
+                            decision.process, decision.ancestor, path
+                        );
+                    }
                     let record = DenialRecord {
                         ts: now_ts(),
                         op: "unlink".into(),
@@ -5927,10 +6174,12 @@ fn main() {
                 if should_deny_sensitive_transfer(&source_path, &dest_path_str, &current_policy) {
                     let process_name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid:{}", pid));
                     let zone = current_policy.matched_sensitive_zone(&source_path);
-                    println!(
-                        "[DENY] rename(sensitive) by {}: {} -> {}",
-                        process_name, source_path, dest_path_str
-                    );
+                    if !current_policy.audit_only_mode {
+                        println!(
+                            "[DENY] rename(sensitive) by {}: {} -> {}",
+                            process_name, source_path, dest_path_str
+                        );
+                    }
                     let record = DenialRecord {
                         ts: now_ts(),
                         op: "rename".into(),
@@ -6016,10 +6265,12 @@ fn main() {
 
                 if let Some(decision) = deny_reason {
                     let zone = current_policy.matched_zone(&source_path, &home_for_handler);
-                    println!(
-                        "[DENY] rename by {} (via {}): {} -> {}",
-                        decision.process, decision.ancestor, source_path, dest_path_str
-                    );
+                    if !current_policy.audit_only_mode {
+                        println!(
+                            "[DENY] rename by {} (via {}): {} -> {}",
+                            decision.process, decision.ancestor, source_path, dest_path_str
+                        );
+                    }
                     let record = DenialRecord {
                         ts: now_ts(),
                         op: "rename".into(),
